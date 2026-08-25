@@ -8,6 +8,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 {
     private readonly L2tpOptions _options;
     private readonly WindowsVpnProfileInspector _profileInspector;
+    private readonly WindowsDefaultRouteInspector _routeInspector;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly CancellationTokenSource _shutdown = new();
 
@@ -20,6 +21,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     {
         _options = options;
         _profileInspector = new WindowsVpnProfileInspector();
+        _routeInspector = new WindowsDefaultRouteInspector();
     }
 
     public VpnContext? Current => Volatile.Read(ref _current);
@@ -42,7 +44,30 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             var profile = await _profileInspector.InspectAsync(_options.EntryName, cancellationToken);
             WindowsVpnProfileInspector.ValidateForProxy(profile);
 
-            var result = await Task.Run(ConnectCore, cancellationToken);
+            // Capture the actual system default-route state as a second independent guard.
+            // Even if profile metadata is wrong or Windows behaves unexpectedly, a route
+            // change caused by dialing this VPN causes an immediate disconnect.
+            var routesBefore = await _routeInspector.CaptureIPv4Async(cancellationToken);
+            ConnectionResult? result = null;
+
+            try
+            {
+                result = await Task.Run(ConnectCore, cancellationToken);
+                var routesAfter = await _routeInspector.CaptureIPv4Async(cancellationToken);
+                WindowsDefaultRouteInspector.EnsureUnchanged(routesBefore, routesAfter);
+            }
+            catch
+            {
+                if (result is not null)
+                {
+                    result.Context.MarkDisconnected();
+                    result.Context.Dispose();
+                    _ = RasNative.RasHangUpW(result.Handle);
+                }
+
+                throw;
+            }
+
             _rasConnection = result.Handle;
             _current = result.Context;
             _monitorTask = MonitorAsync(result.Handle, result.Context, _shutdown.Token);
