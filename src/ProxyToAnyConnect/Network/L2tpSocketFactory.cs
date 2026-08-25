@@ -28,7 +28,14 @@ internal sealed class L2tpSocketFactory
         var context = _connectionManager.Current;
         if (context is null || !context.IsAlive)
         {
-            throw new VpnUnavailableException("L2TP connection is not available.");
+            try
+            {
+                context = await _connectionManager.ConnectAsync(cancellationToken);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or IOException)
+            {
+                throw new VpnUnavailableException("Unable to establish the configured L2TP connection.", ex);
+            }
         }
 
         using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
@@ -47,8 +54,8 @@ internal sealed class L2tpSocketFactory
 
             try
             {
-                // This is the central no-DIRECT invariant: every outbound TCP socket
-                // is explicitly bound to the IPv4 address assigned by this RAS/L2TP session.
+                // Central no-DIRECT invariant: every outbound TCP socket is explicitly
+                // bound to the IPv4 address assigned by the current RAS/L2TP session.
                 socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
                 await socket.ConnectAsync(new IPEndPoint(address, port), linkedCancellation.Token);
 
