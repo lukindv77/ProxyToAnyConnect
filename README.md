@@ -14,7 +14,7 @@ Local HTTP/HTTPS proxy for Windows 11 x64 that establishes and monitors a config
 ## Initial platform
 
 - Windows 11 x64
-- C# / .NET 8 (`net8.0-windows`)
+- C# / .NET 10 (`net10.0-windows`)
 - HTTP proxy listener: loopback only
 - HTTP and HTTPS `CONNECT`
 - IPv4 first
@@ -29,7 +29,7 @@ Chrome / other client
         v
 ProxyToAnyConnect
         |
-        | outbound socket bound to L2TP context
+        | outbound socket bound to the active L2TP context
         v
 Windows L2TP
         |
@@ -38,5 +38,7 @@ Internet
 ```
 
 If L2TP is unavailable, proxy requests fail. The application must never retry through the normal Wi-Fi/Ethernet route.
+
+The L2TP profile must operate in split-tunnel mode: starting the VPN must not replace the normal Windows default route. ProxyToAnyConnect will explicitly bind its own outbound sockets to the L2TP context while unrelated applications continue to use the normal route.
 
 See [`docs/architecture.md`](docs/architecture.md) for the current architecture.
