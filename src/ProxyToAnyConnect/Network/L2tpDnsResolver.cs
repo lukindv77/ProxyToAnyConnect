@@ -73,6 +73,7 @@ internal sealed class L2tpDnsResolver
         {
             using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
             socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
+            WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, context.InterfaceIndex);
             await socket.ConnectAsync(new IPEndPoint(dnsServer, 53), timeout.Token);
             await socket.SendAsync(query, SocketFlags.None, timeout.Token);
 
