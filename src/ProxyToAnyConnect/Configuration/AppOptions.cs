@@ -49,6 +49,58 @@ internal sealed class AppOptions
         {
             throw new InvalidOperationException("l2tp.monitorIntervalMilliseconds is outside the allowed range.");
         }
+
+        ValidateVerification(L2tp.Verification);
+    }
+
+    private static void ValidateVerification(VerificationOptions verification)
+    {
+        if (string.IsNullOrWhiteSpace(verification.PublicAddress))
+        {
+            throw new InvalidOperationException(
+                "l2tp.verification.publicAddress is required and must contain the expected public IPv4 or a domain name.");
+        }
+
+        if (IPAddress.TryParse(verification.PublicAddress, out var publicIp))
+        {
+            if (publicIp.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            {
+                throw new InvalidOperationException(
+                    "l2tp.verification.publicAddress supports IPv4 or a domain name; IPv6 is not supported yet.");
+            }
+        }
+        else if (Uri.CheckHostName(verification.PublicAddress) != UriHostNameType.Dns)
+        {
+            throw new InvalidOperationException(
+                "l2tp.verification.publicAddress must be an IPv4 address or a valid DNS host name.");
+        }
+
+        if (string.IsNullOrWhiteSpace(verification.ProbeHost) ||
+            Uri.CheckHostName(verification.ProbeHost) != UriHostNameType.Dns)
+        {
+            throw new InvalidOperationException("l2tp.verification.probeHost must be a DNS host name.");
+        }
+
+        if (verification.ProbePort is < 1 or > 65535)
+        {
+            throw new InvalidOperationException("l2tp.verification.probePort must be between 1 and 65535.");
+        }
+
+        if (string.IsNullOrWhiteSpace(verification.ProbePath) ||
+            !verification.ProbePath.StartsWith('/', StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("l2tp.verification.probePath must start with '/'.");
+        }
+
+        if (verification.TimeoutSeconds is < 1 or > 60)
+        {
+            throw new InvalidOperationException("l2tp.verification.timeoutSeconds must be between 1 and 60.");
+        }
+
+        if (verification.MaxResponseBytes is < 1024 or > 1024 * 1024)
+        {
+            throw new InvalidOperationException("l2tp.verification.maxResponseBytes is outside the allowed range.");
+        }
     }
 }
 
@@ -71,4 +123,32 @@ internal sealed class L2tpOptions
 
     [JsonPropertyName("monitorIntervalMilliseconds")]
     public int MonitorIntervalMilliseconds { get; init; } = 1000;
+
+    [JsonPropertyName("verification")]
+    public VerificationOptions Verification { get; init; } = new();
+}
+
+internal sealed class VerificationOptions
+{
+    // Expected public identity of traffic exiting through L2TP.
+    // If this is an IPv4 address, the active public-IP probe must return the same address.
+    // If this is a DNS name, IP-dependent equality checks are deliberately skipped.
+    [JsonPropertyName("publicAddress")]
+    public string PublicAddress { get; init; } = string.Empty;
+
+    // HTTPS endpoint returning the caller's public IPv4 as plain text.
+    [JsonPropertyName("probeHost")]
+    public string ProbeHost { get; init; } = "api.ipify.org";
+
+    [JsonPropertyName("probePort")]
+    public int ProbePort { get; init; } = 443;
+
+    [JsonPropertyName("probePath")]
+    public string ProbePath { get; init; } = "/";
+
+    [JsonPropertyName("timeoutSeconds")]
+    public int TimeoutSeconds { get; init; } = 10;
+
+    [JsonPropertyName("maxResponseBytes")]
+    public int MaxResponseBytes { get; init; } = 65536;
 }
