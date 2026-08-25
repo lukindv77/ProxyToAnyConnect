@@ -28,3 +28,27 @@ jobs:
       - name: Self-tests
         shell: pwsh
         run: ./tests/ProxyToAnyConnect.SelfTests/bin/x64/Release/net10.0-windows/win-x64/ProxyToAnyConnect.SelfTests.exe
+
+      - name: Publish self-contained win-x64
+        if: github.event_name == 'push'
+        run: >-
+          dotnet publish src/ProxyToAnyConnect/ProxyToAnyConnect.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          --output artifacts/ProxyToAnyConnect-win-x64
+
+      - name: Create ZIP
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: Compress-Archive -Path ./artifacts/ProxyToAnyConnect-win-x64/* -DestinationPath ./artifacts/ProxyToAnyConnect-win-x64.zip -Force
+
+      - name: Upload Windows artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProxyToAnyConnect-win-x64
+          path: artifacts/ProxyToAnyConnect-win-x64.zip
+          if-no-files-found: error
