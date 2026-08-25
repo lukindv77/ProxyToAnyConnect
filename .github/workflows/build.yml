@@ -24,3 +24,6 @@ jobs:
 
       - name: Build
         run: dotnet build ProxyToAnyConnect.sln --configuration Release --no-restore
+
+      - name: Self-tests
+        run: dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release --no-build
