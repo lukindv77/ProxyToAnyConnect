@@ -1,0 +1,79 @@
+using System.Net.Sockets;
+using ProxyToAnyConnect.Network;
+using ProxyToAnyConnect.Vpn;
+
+namespace ProxyToAnyConnect.SelfTests;
+
+internal static class Program
+{
+    public static int Main()
+    {
+        var tests = new (string Name, Action Test)[]
+        {
+            ("L2TP split-tunnel profile is accepted", AcceptsSplitTunnelL2tp),
+            ("Full-tunnel profile is rejected", RejectsFullTunnel),
+            ("Non-L2TP profile is rejected", RejectsNonL2tp),
+            ("Zero interface index is rejected", RejectsZeroInterfaceIndex)
+        };
+
+        var failed = 0;
+        foreach (var (name, test) in tests)
+        {
+            try
+            {
+                test();
+                Console.WriteLine($"PASS: {name}");
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                Console.Error.WriteLine($"FAIL: {name}: {ex}");
+            }
+        }
+
+        Console.WriteLine($"Self-tests complete. Passed: {tests.Length - failed}; Failed: {failed}.");
+        return failed == 0 ? 0 : 1;
+    }
+
+    private static void AcceptsSplitTunnelL2tp()
+    {
+        WindowsVpnProfileInspector.ValidateForProxy(
+            new VpnProfileInfo("Test", "L2tp", SplitTunneling: true, AllUserConnection: false));
+    }
+
+    private static void RejectsFullTunnel()
+    {
+        AssertThrows<InvalidOperationException>(() =>
+            WindowsVpnProfileInspector.ValidateForProxy(
+                new VpnProfileInfo("Test", "L2tp", SplitTunneling: false, AllUserConnection: false)));
+    }
+
+    private static void RejectsNonL2tp()
+    {
+        AssertThrows<InvalidOperationException>(() =>
+            WindowsVpnProfileInspector.ValidateForProxy(
+                new VpnProfileInfo("Test", "Sstp", SplitTunneling: true, AllUserConnection: false)));
+    }
+
+    private static void RejectsZeroInterfaceIndex()
+    {
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        AssertThrows<ArgumentOutOfRangeException>(() =>
+            WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, 0));
+    }
+
+    private static void AssertThrows<TException>(Action action)
+        where TException : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (TException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException($"Expected exception {typeof(TException).Name} was not thrown.");
+    }
+}
