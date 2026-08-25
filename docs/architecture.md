@@ -16,8 +16,8 @@ The application is intentionally not a system-wide VPN client. Applications that
 - HTTP proxying is supported.
 - HTTPS is supported through the standard HTTP `CONNECT` method; TLS is end-to-end and is not intercepted.
 - There is no DIRECT fallback inside the proxy.
-- DNS resolution for proxied hostnames is performed through sockets bound to the current L2TP IPv4.
-- Every proxy-originated TCP connection is bound to the current L2TP IPv4 before `connect()`.
+- DNS resolution for proxied hostnames is performed through sockets bound to the current L2TP IPv4 and interface.
+- Every proxy-originated TCP connection is bound to the current L2TP IPv4 and explicitly constrained to the current L2TP interface before `connect()`.
 - If the L2TP context disappears, its lifetime token is cancelled and active proxy tunnels are terminated.
 - If no L2TP context exists, an incoming proxy request may trigger a new `RasDial`; if dialing fails, the request fails closed.
 
@@ -25,9 +25,14 @@ The application is intentionally not a system-wide VPN client. Applications that
 
 ProxyToAnyConnect must not intentionally change the Windows default route.
 
-The Windows RAS profile used by the application must be configured for split tunneling ("Use default gateway on remote network" disabled). This is necessary because `RasDial` honors the routing policy stored in the Windows VPN profile.
+Before every new `RasDial`, `WindowsVpnProfileInspector` queries the named Windows VPN profile and rejects it unless:
 
-A future preflight guard must inspect/verify this profile property before dialing and reject a full-tunnel profile. Until that guard is implemented, correct split-tunnel configuration of the named Windows RAS profile is an explicit deployment prerequisite.
+- `TunnelType` is `L2tp`;
+- `SplitTunneling` is `true`.
+
+The inspection uses the Windows `VpnClient` PowerShell provider (`Get-VpnConnection`) as the current supported profile API. If the profile is full-tunnel, the application refuses to dial it. This prevents ProxyToAnyConnect itself from activating a profile that would intentionally replace the normal default route for other applications.
+
+A Windows integration test must still verify the actual route table before and after `RasDial` on the target environment.
 
 ## Data flow
 
@@ -46,10 +51,11 @@ ProxyServer
 L2tpSocketFactory
       |
       +-- require live VpnContext
-      +-- otherwise RasConnectionManager.ConnectAsync()
+      +-- otherwise validate VPN profile and RasDial
       +-- resolve hostname using L2TP-bound DNS socket
       +-- create TCP socket
       +-- bind(source = L2TP assigned IPv4)
+      +-- IP_UNICAST_IF = L2TP InterfaceIndex
       +-- connect(target IPv4)
       v
 Windows L2TP/RAS interface
@@ -60,21 +66,29 @@ Internet
 
 ## Current components
 
+### `WindowsVpnProfileInspector`
+
+Reads the configured Windows VPN profile before dialing. It fails closed unless the profile is L2TP with split tunneling enabled.
+
 ### `RasConnectionManager`
 
-Owns the RAS connection handle. It obtains stored connection parameters for the configured Windows RAS entry, calls `RasDialW`, obtains the client IPv4 using `RasGetProjectionInfoW(RASP_PppIp)`, creates a `VpnContext`, and monitors that projection for loss/change.
+Owns the RAS connection handle. It validates the profile, obtains stored connection parameters for the configured Windows RAS entry, calls `RasDialW`, obtains the client IPv4 using `RasGetProjectionInfoW(RASP_PppIp)`, creates a `VpnContext`, and monitors that projection for loss/change.
 
 ### `VpnContext`
 
 Contains the current L2TP entry name, assigned IPv4, Windows network-interface name/index, VPN DNS server list, and a cancellation token representing the lifetime of this exact VPN context.
 
+### `WindowsSocketInterfaceBinder`
+
+Applies Winsock `IP_UNICAST_IF` to an IPv4 socket using the current L2TP `InterfaceIndex`. This is socket-local and does not alter the Windows default route.
+
 ### `L2tpDnsResolver`
 
-Performs IPv4 A-record DNS queries using UDP sockets explicitly bound to the current L2TP IPv4. It does not call the Windows system hostname resolver for proxied hostnames.
+Performs IPv4 A-record DNS queries using UDP sockets explicitly bound to the current L2TP IPv4 and `InterfaceIndex`. It does not call the Windows system hostname resolver for proxied hostnames.
 
 ### `L2tpSocketFactory`
 
-The only intended factory for outbound proxy TCP sockets. It has no DIRECT mode. It binds each socket to the current L2TP IPv4 before connecting.
+The only intended factory for outbound proxy TCP sockets. It has no DIRECT mode. Each socket is source-bound to the current L2TP IPv4 and receives `IP_UNICAST_IF` for the L2TP interface before connecting.
 
 ### `ProxyServer`
 
@@ -90,10 +104,21 @@ Listens only on loopback. Implements HTTP forwarding and HTTPS `CONNECT`. Active
 - Multi-VPN load balancing or fallback.
 - Embedding VPN credentials in repository configuration.
 
+## Automated checks
+
+The solution contains `ProxyToAnyConnect.SelfTests`, a dependency-free .NET 10 console test project. GitHub Actions builds the solution on `windows-latest` and runs the self-tests.
+
+Current self-tests cover:
+
+- accepting L2TP + split-tunnel profiles;
+- rejecting full-tunnel profiles;
+- rejecting non-L2TP profiles;
+- rejecting an invalid zero interface index.
+
 ## Next hardening work
 
-1. Verify the Windows VPN/RAS profile is split-tunnel before `RasDial`.
-2. Add explicit `IP_UNICAST_IF`/interface binding in addition to source-IP binding.
-3. Add automatic tests for HTTP parsing, CONNECT behavior and DNS packet parsing.
-4. Add integration tests on Windows with a test RAS/VPN environment.
-5. Add structured logs and a Windows Service host mode.
+1. Add Windows integration verification of the route table before and after `RasDial`.
+2. Add tests for HTTP parsing and HTTPS `CONNECT` behavior.
+3. Add tests for DNS packet parsing and CNAME handling.
+4. Add structured logs and a Windows Service host mode.
+5. Add a reproducible installer/publish workflow for Windows 11 x64.
