@@ -31,17 +31,15 @@ internal static class Program
             var options = await AppOptions.LoadAsync(configPath, shutdown.Token);
             await using var rasConnectionManager = new RasConnectionManager(options.L2tp);
 
-            // Dial immediately at startup. Failure is fail-closed for proxy traffic but does
-            // not terminate the local proxy: a later request will attempt RasDial again.
             try
             {
                 var vpn = await rasConnectionManager.ConnectAsync(shutdown.Token);
-                PrintVpnContext(vpn);
+                PrintVpnContext(vpn, rasConnectionManager.LastVerification);
             }
-            catch (Exception ex) when (ex is InvalidOperationException or IOException)
+            catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException)
             {
-                Console.Error.WriteLine($"Initial L2TP connection failed: {ex.Message}");
-                Console.Error.WriteLine("Proxy will remain fail-closed and retry L2TP on demand.");
+                Console.Error.WriteLine($"Initial L2TP connection/verification failed: {ex.Message}");
+                Console.Error.WriteLine("Proxy remains fail-closed and will retry L2TP verification on demand.");
             }
 
             var dnsResolver = new L2tpDnsResolver();
@@ -62,14 +60,35 @@ internal static class Program
         }
     }
 
-    private static void PrintVpnContext(VpnContext vpn)
+    private static void PrintVpnContext(VpnContext vpn, VpnVerificationResult? verification)
     {
-        Console.WriteLine($"L2TP connected: {vpn.EntryName}");
+        Console.WriteLine($"L2TP READY: {vpn.EntryName}");
         Console.WriteLine($"  IPv4: {vpn.LocalIPv4}");
         Console.WriteLine($"  Interface: {vpn.InterfaceName} (index {vpn.InterfaceIndex})");
         Console.WriteLine(
             vpn.DnsServers.Count == 0
                 ? "  DNS: none"
                 : $"  DNS: {string.Join(", ", vpn.DnsServers)}");
+
+        if (verification is null)
+        {
+            return;
+        }
+
+        Console.WriteLine($"  Verification target IPv4: {verification.ProbeTargetIPv4}");
+        if (verification.PublicIPv4ComparisonPerformed)
+        {
+            Console.WriteLine($"  Expected public IPv4: {verification.ExpectedPublicIPv4}");
+            Console.WriteLine($"  Observed public IPv4: {verification.ObservedPublicIPv4}");
+            Console.WriteLine("  Public IPv4 verification: PASSED");
+        }
+        else
+        {
+            Console.WriteLine("  Public IPv4 equality check: SKIPPED (publicAddress is a DNS name)");
+            if (verification.ObservedPublicIPv4 is not null)
+            {
+                Console.WriteLine($"  Probe observed public IPv4: {verification.ObservedPublicIPv4}");
+            }
+        }
     }
 }
