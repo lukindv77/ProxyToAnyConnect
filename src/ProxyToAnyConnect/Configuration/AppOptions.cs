@@ -87,7 +87,7 @@ internal sealed class AppOptions
         }
 
         if (string.IsNullOrWhiteSpace(verification.ProbePath) ||
-            !verification.ProbePath.StartsWith('/', StringComparison.Ordinal))
+            !verification.ProbePath.StartsWith("/", StringComparison.Ordinal))
         {
             throw new InvalidOperationException("l2tp.verification.probePath must start with '/'.");
         }
@@ -130,13 +130,9 @@ internal sealed class L2tpOptions
 
 internal sealed class VerificationOptions
 {
-    // Expected public identity of traffic exiting through L2TP.
-    // If this is an IPv4 address, the active public-IP probe must return the same address.
-    // If this is a DNS name, IP-dependent equality checks are deliberately skipped.
     [JsonPropertyName("publicAddress")]
     public string PublicAddress { get; init; } = string.Empty;
 
-    // HTTPS endpoint returning the caller's public IPv4 as plain text.
     [JsonPropertyName("probeHost")]
     public string ProbeHost { get; init; } = "api.ipify.org";
 
