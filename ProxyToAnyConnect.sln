@@ -4,6 +4,8 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ProxyToAnyConnect", "src\ProxyToAnyConnect\ProxyToAnyConnect.csproj", "{6B255BB4-9BE3-4D80-84B1-B357D5D9C6DF}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ProxyToAnyConnect.SelfTests", "tests\ProxyToAnyConnect.SelfTests\ProxyToAnyConnect.SelfTests.csproj", "{9CE4D4D9-9A58-4D6C-A0E0-7EA4675F489A}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -14,5 +16,9 @@ Global
 		{6B255BB4-9BE3-4D80-84B1-B357D5D9C6DF}.Debug|x64.Build.0 = Debug|x64
 		{6B255BB4-9BE3-4D80-84B1-B357D5D9C6DF}.Release|x64.ActiveCfg = Release|x64
 		{6B255BB4-9BE3-4D80-84B1-B357D5D9C6DF}.Release|x64.Build.0 = Release|x64
+		{9CE4D4D9-9A58-4D6C-A0E0-7EA4675F489A}.Debug|x64.ActiveCfg = Debug|x64
+		{9CE4D4D9-9A58-4D6C-A0E0-7EA4675F489A}.Debug|x64.Build.0 = Debug|x64
+		{9CE4D4D9-9A58-4D6C-A0E0-7EA4675F489A}.Release|x64.ActiveCfg = Release|x64
+		{9CE4D4D9-9A58-4D6C-A0E0-7EA4675F489A}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 EndGlobal
