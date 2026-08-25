@@ -32,7 +32,7 @@ internal sealed class L2tpSocketFactory
             {
                 context = await _connectionManager.ConnectAsync(cancellationToken);
             }
-            catch (Exception ex) when (ex is InvalidOperationException or IOException)
+            catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException)
             {
                 throw new VpnUnavailableException("Unable to establish the configured L2TP connection.", ex);
             }
@@ -67,9 +67,12 @@ internal sealed class L2tpSocketFactory
 
             try
             {
-                // Central no-DIRECT invariant: every outbound TCP socket is explicitly
-                // bound to the IPv4 address assigned by the current RAS/L2TP session.
+                // Two independent routing constraints are applied before connect():
+                // 1) the socket source address is the IPv4 assigned by this RAS session;
+                // 2) IP_UNICAST_IF explicitly selects the same Windows interface.
+                // There is no code path that creates an unbound/direct Internet socket.
                 socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
+                WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, context.InterfaceIndex);
                 await socket.ConnectAsync(new IPEndPoint(address, port), linkedCancellation.Token);
 
                 if (!context.IsAlive)
