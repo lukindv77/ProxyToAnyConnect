@@ -13,6 +13,8 @@ internal static class Program
             ("L2TP split-tunnel profile is accepted", AcceptsSplitTunnelL2tp),
             ("Full-tunnel profile is rejected", RejectsFullTunnel),
             ("Non-L2TP profile is rejected", RejectsNonL2tp),
+            ("Unchanged default routes are accepted", AcceptsUnchangedDefaultRoutes),
+            ("Changed default routes are rejected", RejectsChangedDefaultRoutes),
             ("Zero interface index is rejected", RejectsZeroInterfaceIndex)
         };
 
@@ -53,6 +55,28 @@ internal static class Program
         AssertThrows<InvalidOperationException>(() =>
             WindowsVpnProfileInspector.ValidateForProxy(
                 new VpnProfileInfo("Test", "Sstp", SplitTunneling: true, AllUserConnection: false)));
+    }
+
+    private static void AcceptsUnchangedDefaultRoutes()
+    {
+        var routes = new DefaultRouteSnapshot(
+            [new DefaultRouteEntry(7, "192.168.1.1", 0, "ActiveStore")]);
+
+        WindowsDefaultRouteInspector.EnsureUnchanged(routes, routes);
+    }
+
+    private static void RejectsChangedDefaultRoutes()
+    {
+        var before = new DefaultRouteSnapshot(
+            [new DefaultRouteEntry(7, "192.168.1.1", 0, "ActiveStore")]);
+        var after = new DefaultRouteSnapshot(
+            [
+                new DefaultRouteEntry(7, "192.168.1.1", 0, "ActiveStore"),
+                new DefaultRouteEntry(42, "0.0.0.0", 1, "ActiveStore")
+            ]);
+
+        AssertThrows<InvalidOperationException>(() =>
+            WindowsDefaultRouteInspector.EnsureUnchanged(before, after));
     }
 
     private static void RejectsZeroInterfaceIndex()
