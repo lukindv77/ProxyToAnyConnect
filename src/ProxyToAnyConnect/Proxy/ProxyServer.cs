@@ -61,6 +61,10 @@ internal sealed class ProxyServer
             {
                 await TryWriteErrorAsync(client, 400, "Bad Request", ex.Message, cancellationToken);
             }
+            catch (NotSupportedException ex)
+            {
+                await TryWriteErrorAsync(client, 501, "Not Implemented", ex.Message, cancellationToken);
+            }
             catch (Exception ex) when (ex is SocketException or IOException)
             {
                 await TryWriteErrorAsync(client, 502, "Bad Gateway", ex.Message, cancellationToken);
@@ -155,16 +159,16 @@ internal sealed class ProxyServer
                     "Non-CONNECT proxy requests currently support only the http scheme.");
             }
 
-            var port = uri.IsDefaultPort ? 80 : uri.Port;
-            var originTarget = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
-            return new HttpDestination(uri.Host, port, originTarget);
+            var absolutePort = uri.IsDefaultPort ? 80 : uri.Port;
+            var absoluteOriginTarget = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+            return new HttpDestination(uri.Host, absolutePort, absoluteOriginTarget);
         }
 
         var hostHeader = request.GetHeader("Host")
             ?? throw new InvalidDataException("HTTP request does not contain a Host header.");
-        var (host, port) = ParseAuthority(hostHeader, 80);
-        var originTarget = string.IsNullOrWhiteSpace(request.Target) ? "/" : request.Target;
-        return new HttpDestination(host, port, originTarget);
+        var (host, authorityPort) = ParseAuthority(hostHeader, 80);
+        var relativeOriginTarget = string.IsNullOrWhiteSpace(request.Target) ? "/" : request.Target;
+        return new HttpDestination(host, authorityPort, relativeOriginTarget);
     }
 
     private static (string Host, int Port) ParseAuthority(string authority, int defaultPort)
@@ -389,8 +393,6 @@ internal sealed class ProxyServer
                 builder.Append(header.Key).Append(": ").Append(header.Value).Append("\r\n");
             }
 
-            // Keep the first HTTP implementation deliberately simple: one origin connection
-            // per incoming plain-HTTP request.
             builder.Append("Connection: close\r\n\r\n");
             return Encoding.Latin1.GetBytes(builder.ToString());
         }
