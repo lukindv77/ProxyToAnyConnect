@@ -78,7 +78,8 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         try
         {
             var localAddress = GetAssignedIPv4(handle);
-            var context = new VpnContext(_options.EntryName, localAddress);
+            var interfaceInfo = VpnInterfaceResolver.ResolveByAddress(localAddress);
+            var context = new VpnContext(_options.EntryName, localAddress, interfaceInfo);
             return new ConnectionResult(handle, context);
         }
         catch
