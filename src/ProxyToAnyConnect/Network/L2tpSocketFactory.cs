@@ -42,7 +42,20 @@ internal sealed class L2tpSocketFactory
             cancellationToken,
             context.LifetimeToken);
 
-        var addresses = await _dnsResolver.ResolveIPv4Async(host, context, linkedCancellation.Token);
+        IReadOnlyList<IPAddress> addresses;
+        try
+        {
+            addresses = await _dnsResolver.ResolveIPv4Async(host, context, linkedCancellation.Token);
+        }
+        catch (OperationCanceledException ex) when (context.LifetimeToken.IsCancellationRequested)
+        {
+            throw new VpnUnavailableException("L2TP connection disappeared during DNS resolution.", ex);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new IOException($"Unable to resolve '{host}' through L2TP DNS.", ex);
+        }
+
         Exception? lastError = null;
 
         foreach (var address in addresses)
