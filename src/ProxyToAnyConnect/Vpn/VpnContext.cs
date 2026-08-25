@@ -7,14 +7,22 @@ internal sealed class VpnContext : IDisposable
     private readonly CancellationTokenSource _lifetime = new();
     private int _disposed;
 
-    internal VpnContext(string entryName, IPAddress localIPv4)
+    internal VpnContext(string entryName, IPAddress localIPv4, VpnInterfaceInfo interfaceInfo)
     {
         EntryName = entryName;
         LocalIPv4 = localIPv4;
+        InterfaceName = interfaceInfo.Name;
+        InterfaceDescription = interfaceInfo.Description;
+        InterfaceIndex = interfaceInfo.InterfaceIndex;
+        DnsServers = interfaceInfo.DnsServers;
     }
 
     public string EntryName { get; }
     public IPAddress LocalIPv4 { get; }
+    public string InterfaceName { get; }
+    public string InterfaceDescription { get; }
+    public int InterfaceIndex { get; }
+    public IReadOnlyList<IPAddress> DnsServers { get; }
     public CancellationToken LifetimeToken => _lifetime.Token;
     public bool IsAlive => !_lifetime.IsCancellationRequested;
 
