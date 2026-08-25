@@ -9,12 +9,15 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     private readonly L2tpOptions _options;
     private readonly WindowsVpnProfileInspector _profileInspector;
     private readonly WindowsDefaultRouteInspector _routeInspector;
+    private readonly VpnConnectivityVerifier _connectivityVerifier;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly CancellationTokenSource _shutdown = new();
 
     private nint _rasConnection;
     private VpnContext? _current;
+    private VpnVerificationResult? _lastVerification;
     private Task? _monitorTask;
+    private int _state = (int)VpnConnectionState.Disconnected;
     private int _disposed;
 
     public RasConnectionManager(L2tpOptions options)
@@ -22,9 +25,12 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         _options = options;
         _profileInspector = new WindowsVpnProfileInspector();
         _routeInspector = new WindowsDefaultRouteInspector();
+        _connectivityVerifier = new VpnConnectivityVerifier(options.Verification);
     }
 
     public VpnContext? Current => Volatile.Read(ref _current);
+    public VpnVerificationResult? LastVerification => Volatile.Read(ref _lastVerification);
+    public VpnConnectionState State => (VpnConnectionState)Volatile.Read(ref _state);
 
     public async Task<VpnContext> ConnectAsync(CancellationToken cancellationToken)
     {
@@ -33,45 +39,69 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            if (_current is { IsAlive: true } existing)
+            if (_current is { IsAlive: true } existing && State == VpnConnectionState.Ready)
             {
                 return existing;
             }
 
-            // Fail closed before RasDial. A full-tunnel Windows VPN profile can replace
-            // the system default route and would affect applications that do not use
-            // ProxyToAnyConnect, which violates a core project requirement.
-            var profile = await _profileInspector.InspectAsync(_options.EntryName, cancellationToken);
-            WindowsVpnProfileInspector.ValidateForProxy(profile);
-
-            // Capture the actual system default-route state as a second independent guard.
-            // Even if profile metadata is wrong or Windows behaves unexpectedly, a route
-            // change caused by dialing this VPN causes an immediate disconnect.
-            var routesBefore = await _routeInspector.CaptureIPv4Async(cancellationToken);
+            SetState(VpnConnectionState.Dialing);
             ConnectionResult? result = null;
 
             try
             {
+                // Guard 1: fail before RasDial if the Windows profile itself is full tunnel.
+                var profile = await _profileInspector.InspectAsync(_options.EntryName, cancellationToken);
+                WindowsVpnProfileInspector.ValidateForProxy(profile);
+
+                // Guard 2: snapshot the actual system IPv4 default routes around RasDial.
+                // If Windows changes them despite the profile metadata, the just-created
+                // VPN is immediately torn down and never becomes visible to proxy traffic.
+                var routesBefore = await _routeInspector.CaptureIPv4Async(cancellationToken);
+
                 result = await Task.Run(ConnectCore, cancellationToken);
+                SetState(VpnConnectionState.Verifying);
+
                 var routesAfter = await _routeInspector.CaptureIPv4Async(cancellationToken);
                 WindowsDefaultRouteInspector.EnsureUnchanged(routesBefore, routesAfter);
-            }
-            catch
-            {
-                if (result is not null)
+
+                // Guard 3: perform a real HTTPS request through a socket constrained to
+                // the L2TP interface and L2TP source IPv4. When publicAddress is IPv4,
+                // the observed Internet address must match it. For a DNS publicAddress,
+                // the IP-equality check is intentionally skipped.
+                var verification = await _connectivityVerifier.VerifyAsync(
+                    result.Context,
+                    cancellationToken);
+
+                if (!result.Context.IsAlive)
                 {
-                    result.Context.MarkDisconnected();
-                    result.Context.Dispose();
-                    _ = RasNative.RasHangUpW(result.Handle);
+                    throw new IOException("L2TP disappeared before verification completed.");
                 }
 
+                _rasConnection = result.Handle;
+                _lastVerification = verification;
+
+                // This publication is deliberately last. Until this exact assignment,
+                // L2tpSocketFactory cannot obtain a usable VPN context for proxy traffic.
+                _current = result.Context;
+                SetState(VpnConnectionState.Ready);
+
+                _monitorTask = MonitorAsync(result.Handle, result.Context, _shutdown.Token);
+                return result.Context;
+            }
+            catch (OperationCanceledException)
+            {
+                CleanupFailedConnection(result);
+                SetState(VpnConnectionState.Disconnected);
                 throw;
             }
-
-            _rasConnection = result.Handle;
-            _current = result.Context;
-            _monitorTask = MonitorAsync(result.Handle, result.Context, _shutdown.Token);
-            return result.Context;
+            catch (Exception ex)
+            {
+                CleanupFailedConnection(result);
+                SetState(VpnConnectionState.Disconnected);
+                throw new InvalidOperationException(
+                    $"L2TP connection '{_options.EntryName}' did not pass fail-closed verification.",
+                    ex);
+            }
         }
         finally
         {
@@ -173,15 +203,13 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 }
                 catch
                 {
-                    context.MarkDisconnected();
-                    Interlocked.CompareExchange(ref _current, null, context);
+                    MarkCurrentDisconnected(context);
                     return;
                 }
 
                 if (!currentAddress.Equals(context.LocalIPv4))
                 {
-                    context.MarkDisconnected();
-                    Interlocked.CompareExchange(ref _current, null, context);
+                    MarkCurrentDisconnected(context);
                     return;
                 }
             }
@@ -192,6 +220,32 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         }
     }
 
+    private void MarkCurrentDisconnected(VpnContext context)
+    {
+        context.MarkDisconnected();
+        if (ReferenceEquals(Interlocked.CompareExchange(ref _current, null, context), context))
+        {
+            SetState(VpnConnectionState.Disconnected);
+        }
+    }
+
+    private static void CleanupFailedConnection(ConnectionResult? result)
+    {
+        if (result is null)
+        {
+            return;
+        }
+
+        result.Context.MarkDisconnected();
+        result.Context.Dispose();
+        _ = RasNative.RasHangUpW(result.Handle);
+    }
+
+    private void SetState(VpnConnectionState state)
+    {
+        Volatile.Write(ref _state, (int)state);
+    }
+
     public async Task DisconnectAsync()
     {
         await _gate.WaitAsync();
@@ -199,6 +253,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         {
             var context = Interlocked.Exchange(ref _current, null);
             context?.MarkDisconnected();
+            SetState(VpnConnectionState.Disconnected);
 
             var handle = _rasConnection;
             _rasConnection = 0;
