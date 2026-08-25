@@ -7,6 +7,7 @@ namespace ProxyToAnyConnect.Vpn;
 internal sealed class RasConnectionManager : IAsyncDisposable
 {
     private readonly L2tpOptions _options;
+    private readonly WindowsVpnProfileInspector _profileInspector;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly CancellationTokenSource _shutdown = new();
 
@@ -18,6 +19,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     public RasConnectionManager(L2tpOptions options)
     {
         _options = options;
+        _profileInspector = new WindowsVpnProfileInspector();
     }
 
     public VpnContext? Current => Volatile.Read(ref _current);
@@ -33,6 +35,12 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             {
                 return existing;
             }
+
+            // Fail closed before RasDial. A full-tunnel Windows VPN profile can replace
+            // the system default route and would affect applications that do not use
+            // ProxyToAnyConnect, which violates a core project requirement.
+            var profile = await _profileInspector.InspectAsync(_options.EntryName, cancellationToken);
+            WindowsVpnProfileInspector.ValidateForProxy(profile);
 
             var result = await Task.Run(ConnectCore, cancellationToken);
             _rasConnection = result.Handle;
