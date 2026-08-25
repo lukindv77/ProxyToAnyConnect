@@ -69,14 +69,23 @@ internal sealed class L2tpDnsResolver
             context.LifetimeToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(4));
 
-        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
-        await socket.ConnectAsync(new IPEndPoint(dnsServer, 53), timeout.Token);
-        await socket.SendAsync(query, SocketFlags.None, timeout.Token);
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
+            await socket.ConnectAsync(new IPEndPoint(dnsServer, 53), timeout.Token);
+            await socket.SendAsync(query, SocketFlags.None, timeout.Token);
 
-        var response = new byte[4096];
-        var received = await socket.ReceiveAsync(response, SocketFlags.None, timeout.Token);
-        return ParseAResponse(response.AsSpan(0, received), transactionId);
+            var response = new byte[4096];
+            var received = await socket.ReceiveAsync(response, SocketFlags.None, timeout.Token);
+            return ParseAResponse(response.AsSpan(0, received), transactionId);
+        }
+        catch (OperationCanceledException ex)
+            when (!cancellationToken.IsCancellationRequested &&
+                  !context.LifetimeToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"DNS query to {dnsServer} timed out.", ex);
+        }
     }
 
     private static byte[] BuildQuery(string host, ushort transactionId)
@@ -157,7 +166,7 @@ internal sealed class L2tpDnsResolver
             EnsureAvailable(response, offset, dataLength);
             if (type == 1 && recordClass == 1 && dataLength == 4)
             {
-                addresses.Add(new IPAddress(response.Slice(offset, 4)));
+                addresses.Add(new IPAddress(response.Slice(offset, 4).ToArray()));
             }
 
             offset += dataLength;
