@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Sockets;
 using ProxyToAnyConnect.Network;
 using ProxyToAnyConnect.Vpn;
@@ -15,7 +16,9 @@ internal static class Program
             ("Non-L2TP profile is rejected", RejectsNonL2tp),
             ("Unchanged default routes are accepted", AcceptsUnchangedDefaultRoutes),
             ("Changed default routes are rejected", RejectsChangedDefaultRoutes),
-            ("Zero interface index is rejected", RejectsZeroInterfaceIndex)
+            ("Zero interface index is rejected", RejectsZeroInterfaceIndex),
+            ("IPv4 public address enables IP comparison", PublicIpv4EnablesComparison),
+            ("DNS public address skips IP comparison", PublicDnsSkipsComparison)
         };
 
         var failed = 0;
@@ -84,6 +87,24 @@ internal static class Program
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         AssertThrows<ArgumentOutOfRangeException>(() =>
             WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, 0));
+    }
+
+    private static void PublicIpv4EnablesComparison()
+    {
+        var address = VpnConnectivityVerifier.TryGetExpectedPublicIPv4("198.51.100.25");
+        if (!IPAddress.Parse("198.51.100.25").Equals(address))
+        {
+            throw new InvalidOperationException("Expected public IPv4 was not recognized.");
+        }
+    }
+
+    private static void PublicDnsSkipsComparison()
+    {
+        var address = VpnConnectivityVerifier.TryGetExpectedPublicIPv4("vpn.example.com");
+        if (address is not null)
+        {
+            throw new InvalidOperationException("DNS public address must not enable IPv4 equality checking.");
+        }
     }
 
     private static void AssertThrows<TException>(Action action)
