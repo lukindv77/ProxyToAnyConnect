@@ -9,11 +9,11 @@ internal static class WindowsSocketInterfaceBinder
     // SocketOptionName value for this Windows-specific IPv4 option.
     private const SocketOptionName IpUnicastInterface = (SocketOptionName)31;
 
-    public static void BindToIPv4Interface(Socket socket, uint interfaceIndex)
+    public static void BindToIPv4Interface(Socket socket, int interfaceIndex)
     {
         ArgumentNullException.ThrowIfNull(socket);
 
-        if (interfaceIndex == 0 || interfaceIndex > 0x00FF_FFFF)
+        if (interfaceIndex <= 0 || interfaceIndex > 0x00FF_FFFF)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(interfaceIndex),
@@ -22,7 +22,7 @@ internal static class WindowsSocketInterfaceBinder
         }
 
         // IP_UNICAST_IF expects the interface index encoded as a DWORD in network byte order.
-        var networkOrderInterfaceIndex = IPAddress.HostToNetworkOrder(unchecked((int)interfaceIndex));
+        var networkOrderInterfaceIndex = IPAddress.HostToNetworkOrder(interfaceIndex);
         socket.SetSocketOption(
             SocketOptionLevel.IP,
             IpUnicastInterface,
