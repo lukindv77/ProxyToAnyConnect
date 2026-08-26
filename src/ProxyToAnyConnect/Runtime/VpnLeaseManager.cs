@@ -21,7 +21,10 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     public string Id => _options.Id;
     public string Name => _options.Name;
     public bool Shared => _options.Shared;
+    public L2tpOptions Options => _options;
     public RasConnectionManager ConnectionManager => _connectionManager;
+    public L2tpRuntimeMetrics Metrics { get; } = new();
+
     public int ActiveProxyCount
     {
         get
