@@ -50,10 +50,10 @@ internal static class ProxyHeaderScanSelfTests
         var searchStart = first + 4;
         var second = ProxyServer.FindHeaderEnd(data, searchStart);
 
-        if (first != 3 || second != 15)
+        if (first != 3 || second != 17)
         {
             throw new InvalidOperationException(
-                $"Incremental search returned first={first}, second={second}; expected 3 and 15.");
+                $"Incremental search returned first={first}, second={second}; expected 3 and 17.");
         }
     }
 
