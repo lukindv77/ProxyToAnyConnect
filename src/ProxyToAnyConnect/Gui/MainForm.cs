@@ -264,7 +264,8 @@ internal sealed class MainForm : Form
 
     private async void ProxyGridOnCellContentClick(object? sender, DataGridViewCellEventArgs e)
     {
-        if (_runtime is null || e.RowIndex < 0 || e.ColumnIndex != _proxyGrid.Columns["action"].Index)
+        var actionColumn = _proxyGrid.Columns["action"];
+        if (_runtime is null || actionColumn is null || e.RowIndex < 0 || e.ColumnIndex != actionColumn.Index)
         {
             return;
         }
