@@ -11,6 +11,7 @@ Local HTTP/HTTPS proxy for Windows 11 x64 that establishes and monitors a config
 5. Other applications continue to use their ordinary network path unless they explicitly use this proxy.
 6. HTTPS is supported with the standard HTTP `CONNECT` tunnel. TLS is not intercepted or decrypted.
 7. A newly established L2TP connection is not exposed to proxy traffic until active path verification succeeds.
+8. While `Ready`, the application continuously checks the RAS IPv4 and the host IPv4 default-route baseline; a violation cancels active proxy tunnels and disconnects the RAS session.
 
 ## Platform
 
@@ -59,6 +60,8 @@ Internet
 
 If L2TP is unavailable, cannot be verified, changes the Windows default route, or fails the public-IP check, proxy requests fail. The application never retries proxy traffic through the normal Wi-Fi/Ethernet route.
 
+DNS for proxied destinations is also sent only through L2TP-bound sockets. The resolver supports IPv4 A records, follows CNAME chains, and falls back from UDP to DNS-over-TCP when a DNS response is truncated.
+
 ## Required configuration before first run
 
 Edit `src/ProxyToAnyConnect/appsettings.json` (or the deployed copy) and set:
@@ -67,6 +70,8 @@ Edit `src/ProxyToAnyConnect/appsettings.json` (or the deployed copy) and set:
 {
   "l2tp": {
     "entryName": "ProxyToAnyConnect-L2TP",
+    "monitorIntervalMilliseconds": 1000,
+    "routeMonitorIntervalMilliseconds": 5000,
     "verification": {
       "publicAddress": "YOUR_L2TP_PUBLIC_IPV4_OR_DNS_NAME",
       "probeHost": "api.ipify.org",
@@ -79,4 +84,21 @@ Edit `src/ProxyToAnyConnect/appsettings.json` (or the deployed copy) and set:
 
 The Windows VPN entry must already exist and have its credentials stored by Windows. Credentials are not stored in this repository.
 
-See [`docs/architecture.md`](docs/architecture.md) for the current architecture.
+## Verification-only diagnostic run
+
+Before enabling the browser proxy, test the complete VPN path without starting a listener:
+
+```powershell
+.\ProxyToAnyConnect.exe .\appsettings.json --verify-only
+```
+
+Exit code `0` means the connection reached `Ready` and all fail-closed guards passed. The process then exits and disconnects the RAS session.
+
+## Build and publish
+
+GitHub Actions builds with .NET 10 on Windows, runs the self-tests and publishes a self-contained `win-x64` artifact named `ProxyToAnyConnect-win-x64`.
+
+See:
+
+- [`docs/architecture.md`](docs/architecture.md) — current architecture and invariants;
+- [`docs/windows-integration-test.md`](docs/windows-integration-test.md) — reproducible Windows 11 + real L2TP test procedure.
