@@ -2,7 +2,7 @@ using System.Diagnostics;
 
 namespace ProxyToAnyConnect.Diagnostics;
 
-internal readonly record struct ProcessMemorySnapshot(
+internal sealed record ProcessMemorySnapshot(
     DateTimeOffset TimestampUtc,
     long ManagedHeapBytes,
     long TotalAllocatedBytes,
@@ -37,8 +37,8 @@ internal sealed class ProcessMemoryHealthMonitor : IAsyncDisposable
         _runTask = RunAsync(_shutdown.Token);
     }
 
-    // Only the latest scalar snapshot is retained. Historical analysis belongs
-    // in the append-only JSONL log, not in process memory.
+    // Only the latest immutable snapshot is retained. Historical analysis
+    // belongs in the append-only JSONL log, not in process memory.
     public ProcessMemorySnapshot Current => Volatile.Read(ref _current);
 
     internal static ProcessMemorySnapshot Capture()
