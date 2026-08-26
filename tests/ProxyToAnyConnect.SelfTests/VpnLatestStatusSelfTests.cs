@@ -90,13 +90,19 @@ internal static class VpnLatestStatusSelfTests
             VpnLatestStatusRegistry.UpdateFromLog(
                 "vpn.reconnect.cooldown_armed",
                 "cooldown armed",
-                new { VpnId = latestId, Reason = "monitor failed" },
+                new
+                {
+                    VpnId = latestId,
+                    Reason = "monitor failed",
+                    ReconnectCooldownMilliseconds = 5_000
+                },
                 exception: null);
 
             var failed = VpnLatestStatusRegistry.Get(latestId)
                 ?? throw new InvalidOperationException("Fail-closed VPN status is missing.");
             if (!failed.Text.Contains("default-route set changed", StringComparison.Ordinal) ||
                 !failed.Text.Contains("Reconnect cooldown", StringComparison.Ordinal) ||
+                !failed.Text.Contains("cooldown remaining", StringComparison.Ordinal) ||
                 !failed.Text.Contains("Verified:", StringComparison.Ordinal))
             {
                 throw new InvalidOperationException(
