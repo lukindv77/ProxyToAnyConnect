@@ -156,13 +156,19 @@ internal static class ProxyHttpFramingSelfTests
             await originStream.WriteAsync(response, timeout.Token);
             originClient.Client.Shutdown(SocketShutdown.Send);
 
-            var clientResponse = Encoding.Latin1.GetString(
-                await ReadToEndAsync(clientStream, timeout.Token));
-            if (!clientResponse.Contains("200 OK", StringComparison.Ordinal) ||
-                !clientResponse.EndsWith("OK", StringComparison.Ordinal))
+            var clientResponse = await ReadFramedResponseAsync(clientStream, timeout.Token);
+            if (!clientResponse.Header.StartsWith("HTTP/1.1 200 OK\r\n", StringComparison.Ordinal) ||
+                !clientResponse.Body.AsSpan().SequenceEqual("OK"u8))
             {
-                throw new InvalidOperationException($"Unexpected bounded proxy response:\n{clientResponse}");
+                throw new InvalidOperationException(
+                    $"Unexpected bounded proxy response:\n{clientResponse.Header}" +
+                    Encoding.Latin1.GetString(clientResponse.Body));
             }
+
+            // Deliberate post-Content-Length bytes remain unread by the one-request proxy.
+            // Windows may report WSAECONNRESET when that socket closes; only accept that
+            // close detail after the complete framed origin response has been delivered.
+            await AssertClosedAfterCompleteResponseAsync(clientStream, timeout.Token);
 
             if (factory.ConnectCount != 1)
             {
@@ -199,11 +205,13 @@ internal static class ProxyHttpFramingSelfTests
                         "5\r\nHELLO\r\n0\r\n\r\n"),
                     timeout.Token);
 
-                var response = Encoding.Latin1.GetString(
-                    await ReadToEndAsync(stream, timeout.Token));
-                if (!response.StartsWith("HTTP/1.1 501 Not Implemented", StringComparison.Ordinal))
+                var response = await ReadFramedResponseAsync(stream, timeout.Token);
+                if (!response.Header.StartsWith(
+                        "HTTP/1.1 501 Not Implemented\r\n",
+                        StringComparison.Ordinal))
                 {
-                    throw new InvalidOperationException($"Transfer-Encoding was not rejected as unsupported:\n{response}");
+                    throw new InvalidOperationException(
+                        $"Transfer-Encoding was not rejected as unsupported:\n{response.Header}");
                 }
             }
 
@@ -219,11 +227,13 @@ internal static class ProxyHttpFramingSelfTests
                         "Content-Length: 5\r\n\r\n"),
                     timeout.Token);
 
-                var response = Encoding.Latin1.GetString(
-                    await ReadToEndAsync(stream, timeout.Token));
-                if (!response.StartsWith("HTTP/1.1 400 Bad Request", StringComparison.Ordinal))
+                var response = await ReadFramedResponseAsync(stream, timeout.Token);
+                if (!response.Header.StartsWith(
+                        "HTTP/1.1 400 Bad Request\r\n",
+                        StringComparison.Ordinal))
                 {
-                    throw new InvalidOperationException($"Ambiguous TE+CL framing was not rejected as bad request:\n{response}");
+                    throw new InvalidOperationException(
+                        $"Ambiguous TE+CL framing was not rejected as bad request:\n{response.Header}");
                 }
             }
 
@@ -319,21 +329,76 @@ internal static class ProxyHttpFramingSelfTests
         throw new IOException("HTTP header exceeded test limit.");
     }
 
-    private static async Task<byte[]> ReadToEndAsync(
+    private static async Task<HttpResponse> ReadFramedResponseAsync(
         Stream stream,
         CancellationToken cancellationToken)
     {
-        using var buffer = new MemoryStream();
-        var chunk = new byte[4096];
-        while (true)
+        var headerBytes = await ReadHeaderAsync(stream, cancellationToken);
+        var header = Encoding.Latin1.GetString(headerBytes);
+        var contentLength = ParseResponseContentLength(header);
+        var body = new byte[contentLength];
+        await ReadExactlyAsync(stream, body, cancellationToken);
+        return new HttpResponse(header, body);
+    }
+
+    private static int ParseResponseContentLength(string header)
+    {
+        foreach (var line in header.Split("\r\n", StringSplitOptions.RemoveEmptyEntries))
         {
-            var read = await stream.ReadAsync(chunk, cancellationToken);
-            if (read == 0)
+            const string prefix = "Content-Length:";
+            if (!line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             {
-                return buffer.ToArray();
+                continue;
             }
 
-            buffer.Write(chunk, 0, read);
+            var value = line.AsSpan(prefix.Length).Trim();
+            if (int.TryParse(value, out var contentLength) && contentLength >= 0)
+            {
+                return contentLength;
+            }
+
+            throw new InvalidOperationException(
+                $"Invalid Content-Length in proxy test response: {line}");
+        }
+
+        throw new InvalidOperationException(
+            $"Proxy test response did not contain Content-Length:\n{header}");
+    }
+
+    private static async Task AssertClosedAfterCompleteResponseAsync(
+        Stream stream,
+        CancellationToken cancellationToken)
+    {
+        using var closeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        closeTimeout.CancelAfter(TimeSpan.FromSeconds(2));
+        var one = new byte[1];
+
+        try
+        {
+            var read = await stream.ReadAsync(one, closeTimeout.Token);
+            if (read != 0)
+            {
+                throw new InvalidOperationException(
+                    "Proxy sent bytes beyond the complete Content-Length-framed response.");
+            }
+
+            Console.WriteLine(
+                "INFO: exact-CL malicious-tail connection closed with clean EOF after complete response.");
+        }
+        catch (IOException ex) when (
+            ex.InnerException is SocketException socketException &&
+            socketException.SocketErrorCode == SocketError.ConnectionReset)
+        {
+            Console.WriteLine(
+                "INFO: exact-CL malicious-tail connection reset after complete response " +
+                "(Windows WSAECONNRESET 10054 with unread client tail).");
+        }
+        catch (OperationCanceledException) when (
+            closeTimeout.IsCancellationRequested &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            throw new InvalidOperationException(
+                "Proxy did not close the exact-CL malicious-tail connection after the complete response.");
         }
     }
 
@@ -354,6 +419,8 @@ internal static class ProxyHttpFramingSelfTests
             offset += read;
         }
     }
+
+    private readonly record struct HttpResponse(string Header, byte[] Body);
 
     private sealed class LoopbackOutboundFactory : IProxyOutboundConnectionFactory
     {
