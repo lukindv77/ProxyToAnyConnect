@@ -31,73 +31,57 @@ internal sealed class WindowsVpnProfileInspector
             } | ConvertTo-Json -Compress
             """;
 
-        var encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-        var powershellPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.System),
-            "WindowsPowerShell",
-            "v1.0",
-            "powershell.exe");
-
-        if (!File.Exists(powershellPath))
-        {
-            throw new InvalidOperationException($"Windows PowerShell was not found at '{powershellPath}'.");
-        }
-
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = powershellPath,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-        startInfo.ArgumentList.Add("-NoLogo");
-        startInfo.ArgumentList.Add("-NoProfile");
-        startInfo.ArgumentList.Add("-NonInteractive");
-        startInfo.ArgumentList.Add("-EncodedCommand");
-        startInfo.ArgumentList.Add(encodedCommand);
-
-        using var process = new Process { StartInfo = startInfo };
-        if (!process.Start())
-        {
-            throw new InvalidOperationException("Unable to start Windows PowerShell to inspect the VPN profile.");
-        }
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(InspectionTimeout);
-
+        var stdout = await ExecutePowerShellAsync(script, $"inspect VPN profile '{entryName}'", cancellationToken);
         try
         {
-            await process.WaitForExitAsync(timeout.Token);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            TryKill(process);
-            throw new TimeoutException($"Timed out while inspecting VPN profile '{entryName}'.");
-        }
-
-        var stdout = (await stdoutTask).Trim();
-        var stderr = (await stderrTask).Trim();
-
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException(
-                $"Unable to inspect VPN profile '{entryName}'. PowerShell exit code {process.ExitCode}: {stderr}");
-        }
-
-        try
-        {
-            var info = JsonSerializer.Deserialize<VpnProfileInfo>(stdout)
+            return JsonSerializer.Deserialize<VpnProfileInfo>(stdout)
                 ?? throw new InvalidOperationException("VPN profile inspection returned an empty result.");
-            return info;
         }
         catch (JsonException ex)
         {
             throw new InvalidOperationException(
                 $"Unable to parse VPN profile information for '{entryName}'. Output: {stdout}",
+                ex);
+        }
+    }
+
+    public async Task<IReadOnlyList<VpnProfileInfo>> ListL2tpProfilesAsync(CancellationToken cancellationToken)
+    {
+        var script = """
+            $ErrorActionPreference = 'Stop'
+            $profiles = @()
+            $profiles += @(Get-VpnConnection -ErrorAction SilentlyContinue)
+            $profiles += @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue)
+            $result = @(
+                $profiles |
+                    Where-Object { [string]$_.TunnelType -eq 'L2tp' } |
+                    ForEach-Object {
+                        [pscustomobject]@{
+                            Name = [string]$_.Name
+                            TunnelType = [string]$_.TunnelType
+                            SplitTunneling = [bool]$_.SplitTunneling
+                            AllUserConnection = [bool]$_.AllUserConnection
+                        }
+                    } |
+                    Sort-Object Name, AllUserConnection -Unique
+            )
+            ConvertTo-Json -InputObject $result -Compress
+            """;
+
+        var stdout = await ExecutePowerShellAsync(script, "enumerate Windows L2TP profiles", cancellationToken);
+        if (string.IsNullOrWhiteSpace(stdout))
+        {
+            return [];
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<VpnProfileInfo>>(stdout) ?? [];
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException(
+                $"Unable to parse Windows L2TP profile list. Output: {stdout}",
                 ex);
         }
     }
@@ -148,6 +132,71 @@ internal sealed class WindowsVpnProfileInspector
         return phoneBook;
     }
 
+    private static async Task<string> ExecutePowerShellAsync(
+        string script,
+        string operation,
+        CancellationToken cancellationToken)
+    {
+        var encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+        var powershellPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe");
+
+        if (!File.Exists(powershellPath))
+        {
+            throw new InvalidOperationException($"Windows PowerShell was not found at '{powershellPath}'.");
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = powershellPath,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        startInfo.ArgumentList.Add("-NoLogo");
+        startInfo.ArgumentList.Add("-NoProfile");
+        startInfo.ArgumentList.Add("-NonInteractive");
+        startInfo.ArgumentList.Add("-EncodedCommand");
+        startInfo.ArgumentList.Add(encodedCommand);
+
+        using var process = new Process { StartInfo = startInfo };
+        if (!process.Start())
+        {
+            throw new InvalidOperationException($"Unable to start Windows PowerShell to {operation}.");
+        }
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(InspectionTimeout);
+
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            TryKill(process);
+            throw new TimeoutException($"Timed out while attempting to {operation}.");
+        }
+
+        var stdout = (await stdoutTask).Trim();
+        var stderr = (await stderrTask).Trim();
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                $"Unable to {operation}. PowerShell exit code {process.ExitCode}: {stderr}");
+        }
+
+        return stdout;
+    }
+
     private static void TryKill(Process process)
     {
         try
@@ -168,4 +217,9 @@ internal sealed record VpnProfileInfo(
     string Name,
     string TunnelType,
     bool SplitTunneling,
-    bool AllUserConnection);
+    bool AllUserConnection)
+{
+    public string DisplayName =>
+        $"{Name} [{(AllUserConnection ? "All users" : "Current user")}]" +
+        (SplitTunneling ? string.Empty : " — full tunnel");
+}
