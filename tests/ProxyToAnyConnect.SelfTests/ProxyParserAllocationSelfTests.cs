@@ -25,6 +25,8 @@ internal static class ProxyParserAllocationSelfTests
     {
         try
         {
+            RequestLineSpanSplitMatchesLegacySemantics();
+
             var raw = BuildRepresentativeHeader();
 
             for (var i = 0; i < WarmupIterations; i++)
@@ -79,6 +81,35 @@ internal static class ProxyParserAllocationSelfTests
         {
             Console.Error.WriteLine($"FAIL: proxy parser allocation regression: {ex}");
             return 1;
+        }
+    }
+
+    private static void RequestLineSpanSplitMatchesLegacySemantics()
+    {
+        string[] requestLines =
+        [
+            "GET http://example.test/a HTTP/1.1",
+            "  GET   http://example.test/a   HTTP/1.1",
+            "CONNECT   example.test:443   HTTP/1.1",
+            "GET http://example.test/a HTTP/1.1 extra-data"
+        ];
+
+        foreach (var requestLine in requestLines)
+        {
+            var raw = Encoding.Latin1.GetBytes(
+                requestLine + "\r\nHost: example.test\r\n\r\n");
+            var optimized = ProxyServer.ParsedProxyRequest.Parse(raw);
+            var legacy = LegacySplitParse(raw);
+
+            if (!string.Equals(optimized.Method, legacy.Method, StringComparison.Ordinal) ||
+                !string.Equals(optimized.Target, legacy.Target, StringComparison.Ordinal) ||
+                !string.Equals(optimized.Version, legacy.Version, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Request-line span split changed legacy semantics for '{requestLine}'. " +
+                    $"optimized=({optimized.Method}|{optimized.Target}|{optimized.Version}), " +
+                    $"legacy=({legacy.Method}|{legacy.Target}|{legacy.Version}).");
+            }
         }
     }
 
