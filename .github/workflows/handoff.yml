@@ -1,0 +1,67 @@
+name: handoff
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  archive:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble handoff source tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'ProxyToAnyConnect-handoff'
+          if (Test-Path $stage) {
+            Remove-Item $stage -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+
+          $items = @(
+            'src',
+            'tests',
+            'docs',
+            '.github',
+            'README.md',
+            'ProxyToAnyConnect.sln',
+            '.gitignore'
+          )
+
+          foreach ($item in $items) {
+            if (Test-Path $item) {
+              Copy-Item $item -Destination $stage -Recurse -Force
+            }
+          }
+
+          @(
+            "Repository=lukindv77/ProxyToAnyConnect",
+            "Commit=$env:GITHUB_SHA",
+            "Ref=$env:GITHUB_REF",
+            "WorkflowRun=$env:GITHUB_RUN_NUMBER",
+            "CreatedUtc=$([DateTime]::UtcNow.ToString('O'))",
+            'StartNewChatWith=docs/handoff/NEW_CHAT_PROMPT.md',
+            'ReadFirst=docs/handoff/CURRENT_STATE.md;docs/handoff/AUDIT_SNAPSHOT.md;docs/requirements.md;docs/architecture.md;docs/memory-stability.md'
+          ) | Set-Content -Path (Join-Path $stage 'HANDOFF_BUILD_INFO.txt') -Encoding utf8
+
+          Get-ChildItem $stage -Recurse -Directory |
+            Where-Object { $_.Name -in @('bin', 'obj', '.git') } |
+            Sort-Object FullName -Descending |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+          $archive = Join-Path $env:RUNNER_TEMP "ProxyToAnyConnect-handoff-$env:GITHUB_SHA.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal
+          "HANDOFF_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload handoff archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProxyToAnyConnect-handoff-${{ github.sha }}
+          path: ${{ env.HANDOFF_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 30
