@@ -92,8 +92,9 @@ internal static class EphemeralRasPhonebookSelfTests
             throw new InvalidOperationException(
                 "Ephemeral RAS creation unexpectedly accepted an invalid protected PSK.");
         }
-        catch (Exception ex) when (
-            ex is System.Security.Cryptography.CryptographicException or FormatException)
+        catch (InvalidOperationException ex) when (
+            ex.Message.Contains("Protected secret", StringComparison.OrdinalIgnoreCase) ||
+            ex.Message.Contains("DPAPI", StringComparison.OrdinalIgnoreCase))
         {
             // Expected after the private PBK entry has been prepared and before Create returns.
         }
