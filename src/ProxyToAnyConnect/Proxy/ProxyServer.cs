@@ -580,13 +580,7 @@ internal sealed class ProxyServer
 
         public byte[] BuildOriginHeader(string pathAndQuery)
         {
-            var connectionTokens = Headers
-                .Where(header => header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
-                .SelectMany(header => header.Value.Split(','))
-                .Select(token => token.Trim())
-                .Where(token => token.Length > 0)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
+            var connectionTokens = CollectConnectionTokens();
             var builder = new StringBuilder();
             builder.Append(Method).Append(' ').Append(pathAndQuery).Append(' ').Append(Version).Append("\r\n");
 
@@ -594,7 +588,7 @@ internal sealed class ProxyServer
             {
                 if (header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
                     FixedHopByHopHeaders.Contains(header.Name) ||
-                    connectionTokens.Contains(header.Name))
+                    connectionTokens?.Contains(header.Name) == true)
                 {
                     continue;
                 }
@@ -604,6 +598,39 @@ internal sealed class ProxyServer
 
             builder.Append("Connection: close\r\n\r\n");
             return Encoding.Latin1.GetBytes(builder.ToString());
+        }
+
+        private HashSet<string>? CollectConnectionTokens()
+        {
+            HashSet<string>? tokens = null;
+            foreach (var header in Headers)
+            {
+                if (!header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var remaining = header.Value.AsSpan();
+                while (!remaining.IsEmpty)
+                {
+                    var comma = remaining.IndexOf(',');
+                    var token = (comma < 0 ? remaining : remaining[..comma]).Trim();
+                    if (!token.IsEmpty)
+                    {
+                        (tokens ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase))
+                            .Add(token.ToString());
+                    }
+
+                    if (comma < 0)
+                    {
+                        break;
+                    }
+
+                    remaining = remaining[(comma + 1)..];
+                }
+            }
+
+            return tokens;
         }
 
         private sealed record HeaderLine(string Name, string Value);
