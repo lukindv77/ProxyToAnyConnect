@@ -19,11 +19,14 @@ internal static class ProxyDataPathSelfTests
         {
             await TransfersMultiMegabyteConnectPayloadAsync();
             Console.WriteLine("PASS: pooled CONNECT data path transfers multi-megabyte payloads bidirectionally");
+
+            await BoundsConcurrentSessionAdmissionAsync();
+            Console.WriteLine("PASS: proxy concurrency limit bounds user-space session admission");
             return 0;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"FAIL: pooled CONNECT data path regression: {ex}");
+            Console.Error.WriteLine($"FAIL: proxy data-path regression: {ex}");
             return 1;
         }
     }
@@ -43,6 +46,7 @@ internal static class ProxyDataPathSelfTests
             {
                 ListenAddress = "127.0.0.1",
                 ListenPort = proxyPort,
+                MaxConcurrentConnections = 16,
                 MaxHeaderBytes = 65536
             },
             factory);
@@ -54,8 +58,7 @@ internal static class ProxyDataPathSelfTests
             await client.ConnectAsync(IPAddress.Loopback, proxyPort, timeout.Token);
             await using var clientStream = client.GetStream();
 
-            var connectRequest = Encoding.ASCII.GetBytes(
-                "CONNECT performance.test:443 HTTP/1.1\r\nHost: performance.test:443\r\n\r\n");
+            var connectRequest = BuildConnectRequest("performance.test");
             await clientStream.WriteAsync(connectRequest, timeout.Token);
 
             using var originClient = await originListener.AcceptTcpClientAsync(timeout.Token);
@@ -63,11 +66,7 @@ internal static class ProxyDataPathSelfTests
             await using var originStream = originClient.GetStream();
 
             var responseHeader = await ReadHeaderAsync(clientStream, timeout.Token);
-            if (!Encoding.ASCII.GetString(responseHeader)
-                    .StartsWith("HTTP/1.1 200 Connection Established", StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException("CONNECT handshake failed before data-path test.");
-            }
+            EnsureConnectEstablished(responseHeader);
 
             var clientPayload = CreatePayload(PayloadSize, seed: 17);
             var originPayload = CreatePayload(PayloadSize, seed: 91);
@@ -106,6 +105,87 @@ internal static class ProxyDataPathSelfTests
         {
             proxyCancellation.Cancel();
             await proxyTask;
+        }
+    }
+
+    private static async Task BoundsConcurrentSessionAdmissionAsync()
+    {
+        using var timeout = new CancellationTokenSource(Timeout);
+        using var originListener = new TcpListener(IPAddress.Loopback, 0);
+        originListener.Start();
+        var originPort = ((IPEndPoint)originListener.LocalEndpoint).Port;
+
+        var factory = new LoopbackOutboundFactory(originPort);
+        var proxyPort = ReserveLoopbackPort();
+        using var proxyCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        var proxy = new ProxyServer(
+            new ProxyOptions
+            {
+                ListenAddress = "127.0.0.1",
+                ListenPort = proxyPort,
+                MaxConcurrentConnections = 1,
+                MaxHeaderBytes = 65536
+            },
+            factory);
+        var proxyTask = proxy.RunAsync(proxyCancellation.Token);
+
+        TcpClient? firstClient = null;
+        TcpClient? firstOrigin = null;
+        try
+        {
+            firstClient = new TcpClient { NoDelay = true };
+            await firstClient.ConnectAsync(IPAddress.Loopback, proxyPort, timeout.Token);
+            var firstStream = firstClient.GetStream();
+            await firstStream.WriteAsync(BuildConnectRequest("first.test"), timeout.Token);
+
+            firstOrigin = await originListener.AcceptTcpClientAsync(timeout.Token);
+            EnsureConnectEstablished(await ReadHeaderAsync(firstStream, timeout.Token));
+
+            using var secondClient = new TcpClient { NoDelay = true };
+            await secondClient.ConnectAsync(IPAddress.Loopback, proxyPort, timeout.Token);
+            var secondStream = secondClient.GetStream();
+            await secondStream.WriteAsync(BuildConnectRequest("second.test"), timeout.Token);
+
+            await Task.Delay(200, timeout.Token);
+            if (factory.ConnectCount != 1)
+            {
+                throw new InvalidOperationException(
+                    $"Expected exactly one admitted upstream session while the slot was occupied; got {factory.ConnectCount}.");
+            }
+
+            firstClient.Dispose();
+            firstClient = null;
+            firstOrigin.Dispose();
+            firstOrigin = null;
+
+            using var secondOrigin = await originListener.AcceptTcpClientAsync(timeout.Token);
+            EnsureConnectEstablished(await ReadHeaderAsync(secondStream, timeout.Token));
+
+            if (factory.ConnectCount != 2)
+            {
+                throw new InvalidOperationException(
+                    $"Second session was not admitted after the first slot was released; count={factory.ConnectCount}.");
+            }
+        }
+        finally
+        {
+            firstClient?.Dispose();
+            firstOrigin?.Dispose();
+            proxyCancellation.Cancel();
+            await proxyTask;
+        }
+    }
+
+    private static byte[] BuildConnectRequest(string host) =>
+        Encoding.ASCII.GetBytes(
+            $"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n");
+
+    private static void EnsureConnectEstablished(byte[] responseHeader)
+    {
+        if (!Encoding.ASCII.GetString(responseHeader)
+                .StartsWith("HTTP/1.1 200 Connection Established", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("CONNECT handshake failed before data-path test.");
         }
     }
 
@@ -182,17 +262,21 @@ internal static class ProxyDataPathSelfTests
     private sealed class LoopbackOutboundFactory : IProxyOutboundConnectionFactory
     {
         private readonly int _originPort;
+        private int _connectCount;
 
         public LoopbackOutboundFactory(int originPort)
         {
             _originPort = originPort;
         }
 
+        public int ConnectCount => Volatile.Read(ref _connectCount);
+
         public async Task<IProxyOutboundConnection> ConnectAsync(
             string host,
             int port,
             CancellationToken cancellationToken)
         {
+            Interlocked.Increment(ref _connectCount);
             var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
             {
                 NoDelay = true
