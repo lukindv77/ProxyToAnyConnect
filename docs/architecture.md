@@ -93,6 +93,38 @@ After `Ready`, two independent monitors run in parallel:
 
 The first monitor failure wins. The current `VpnContext` is marked disconnected, its lifetime cancellation token is triggered, active HTTP/HTTPS proxy streams are terminated, and the exact RAS handle is hung up. No DIRECT retry exists.
 
+## DNS behavior
+
+`L2tpDnsResolver` never uses the Windows system DNS resolver for proxied destination names.
+
+For every DNS transport socket it applies both routing constraints used elsewhere in the project:
+
+- source bind to the RAS-assigned L2TP IPv4;
+- `IP_UNICAST_IF` set to the L2TP interface index.
+
+The resolver currently supports:
+
+- IPv4 A queries;
+- IDN host conversion to ASCII;
+- multiple DNS servers supplied by the L2TP interface;
+- DNS compression pointers;
+- CNAME chains with loop detection and an 8-hop limit;
+- UDP DNS first;
+- automatic DNS-over-TCP fallback when the UDP reply has `TC=1`;
+- cancellation when the exact `VpnContext` disappears.
+
+There is no system-resolver or DIRECT DNS fallback.
+
+## Proxy behavior
+
+`ProxyServer` listens only on the configured loopback address.
+
+HTTPS uses standard HTTP `CONNECT`; ProxyToAnyConnect does not terminate or inspect destination TLS.
+
+Plain HTTP requests are rewritten from proxy-form to origin-form and the first implementation deliberately uses one origin connection per client request (`Connection: close`). Proxy-only headers such as `Proxy-Authorization` and `Proxy-Connection` are never forwarded to origin servers. Headers named by the incoming `Connection` header are also removed.
+
+Unsupported request forms produce an explicit HTTP error instead of leaving an unobserved background task failure.
+
 ## Diagnostic mode
 
 The executable supports:
@@ -154,7 +186,7 @@ Performs the mandatory HTTPS path probe before `Ready`. If a fixed expected publ
 Applies Winsock `IP_UNICAST_IF` to an IPv4 socket using the current L2TP `InterfaceIndex`. This is socket-local and does not alter the Windows default route.
 
 ### `L2tpDnsResolver`
-Performs IPv4 A-record DNS queries using UDP sockets explicitly bound to the current L2TP IPv4 and `InterfaceIndex`. It does not call the Windows system hostname resolver for proxied hostnames.
+Performs L2TP-bound IPv4 DNS resolution, including CNAME following and TCP fallback for truncated UDP responses.
 
 ### `L2tpSocketFactory`
 The only intended factory for outbound proxy TCP sockets. It has no DIRECT mode. Each socket is source-bound to the current L2TP IPv4 and receives `IP_UNICAST_IF` for the L2TP interface before connecting.
@@ -185,12 +217,22 @@ Current self-tests cover:
 - rejecting changed default routes;
 - rejecting an invalid zero interface index;
 - enabling fixed-public-IPv4 equality checking when `publicAddress` is IPv4;
-- skipping that IP-equality check when `publicAddress` is a DNS name.
+- skipping that IP-equality check when `publicAddress` is a DNS name;
+- parsing DNS A responses;
+- parsing DNS CNAME responses;
+- detecting truncated DNS replies for TCP fallback;
+- CONNECT authority parsing with default and explicit ports;
+- rejecting IPv6 proxy authorities in the current IPv4-only milestone;
+- stripping proxy-only and connection-scoped headers before HTTP origin forwarding.
+
+## Integration test
+
+The reproducible Windows test procedure is maintained in [`windows-integration-test.md`](windows-integration-test.md).
 
 ## Next hardening work
 
-1. Add an integration test against a real Windows L2TP environment.
-2. Harden DNS resolution (TCP fallback for truncated replies and explicit CNAME coverage).
-3. Add tests for HTTP parsing and HTTPS `CONNECT` behavior.
-4. Add structured logs and a Windows Service host mode.
+1. Run the real Windows 11 + L2TP integration test and record results.
+2. Add live proxy integration tests with a local fake origin server and injectable outbound-connection factory.
+3. Add structured logs and a Windows Service host mode.
+4. Replace PowerShell-based route/profile inspection with native Windows APIs after the first real-environment validation.
 5. Add a reproducible installer in addition to the existing self-contained ZIP publish.
