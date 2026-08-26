@@ -102,7 +102,7 @@ internal sealed class L2tpDnsResolver
                 host,
                 dnsServer,
                 context,
-                new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+                visitedNames: null,
                 depth: 0,
                 timeout.Token);
         }
@@ -119,7 +119,7 @@ internal sealed class L2tpDnsResolver
         string host,
         IPAddress dnsServer,
         VpnContext context,
-        HashSet<string> visitedNames,
+        HashSet<string>? visitedNames,
         int depth,
         CancellationToken cancellationToken)
     {
@@ -128,7 +128,7 @@ internal sealed class L2tpDnsResolver
             throw new IOException("DNS CNAME chain exceeded the maximum supported depth.");
         }
 
-        if (!visitedNames.Add(host))
+        if (!TryEnterDnsName(visitedNames, host))
         {
             throw new IOException($"DNS CNAME loop detected at '{host}'.");
         }
@@ -153,6 +153,7 @@ internal sealed class L2tpDnsResolver
 
         if (parsed.CanonicalName is not null)
         {
+            visitedNames = EnsureVisitedNamesForCname(visitedNames, host);
             var recursive = await ResolveCoreAsync(
                 NormalizeDnsName(parsed.CanonicalName),
                 dnsServer,
@@ -169,6 +170,24 @@ internal sealed class L2tpDnsResolver
         }
 
         return new DnsResolutionResult([], 0);
+    }
+
+    internal static bool TryEnterDnsName(HashSet<string>? visitedNames, string host) =>
+        visitedNames is null || visitedNames.Add(host);
+
+    internal static HashSet<string> EnsureVisitedNamesForCname(
+        HashSet<string>? visitedNames,
+        string currentHost)
+    {
+        if (visitedNames is not null)
+        {
+            return visitedNames;
+        }
+
+        return new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            currentHost
+        };
     }
 
     private static async Task<ParsedDnsResponse> QueryUdpAsync(
