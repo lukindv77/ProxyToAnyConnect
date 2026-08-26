@@ -84,6 +84,35 @@ internal sealed class ProxyServer
         finally
         {
             listener?.Stop();
+
+            // A session owns one semaphore permit from immediately before Accept
+            // until all of its client/upstream resources have been disposed. Once
+            // the accept loop has stopped, acquiring every permit is therefore a
+            // zero-allocation bounded join over all previously accepted sessions.
+            // RunAsync does not return (and ProxyInstanceRuntime cannot release its
+            // L2TP lease) until every accepted session has completed cleanup.
+            await DrainAcceptedSessionsAsync();
+            _sessionSlots.Dispose();
+        }
+    }
+
+    private async Task DrainAcceptedSessionsAsync()
+    {
+        var acquired = 0;
+        try
+        {
+            while (acquired < _options.MaxConcurrentConnections)
+            {
+                await _sessionSlots.WaitAsync();
+                acquired++;
+            }
+        }
+        finally
+        {
+            if (acquired > 0)
+            {
+                _sessionSlots.Release(acquired);
+            }
         }
     }
 
