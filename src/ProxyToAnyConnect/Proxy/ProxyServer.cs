@@ -517,6 +517,10 @@ internal sealed class ProxyServer
             "Upgrade"
         };
 
+        // CONNECT does not forward origin headers. The shared empty list avoids
+        // allocating a per-request List<HeaderLine> after header syntax validation.
+        private static readonly List<HeaderLine> EmptyHeaders = [];
+
         private ParsedProxyRequest(string method, string target, string version, List<HeaderLine> headers)
         {
             Method = method;
@@ -553,9 +557,15 @@ internal sealed class ProxyServer
             var method = requestLine[requestParts[0]].ToString();
             var target = requestLine[requestParts[1]].ToString();
             var version = requestLine[requestParts[2]].ToString();
+            var offset = requestLineEnd + 2;
+
+            if (method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
+            {
+                ValidateHeaderLines(text, offset);
+                return new ParsedProxyRequest(method, target, version, EmptyHeaders);
+            }
 
             var headers = new List<HeaderLine>();
-            var offset = requestLineEnd + 2;
             while (offset < text.Length)
             {
                 var remaining = text.AsSpan(offset);
@@ -584,6 +594,31 @@ internal sealed class ProxyServer
             }
 
             return new ParsedProxyRequest(method, target, version, headers);
+        }
+
+        private static void ValidateHeaderLines(string text, int offset)
+        {
+            while (offset < text.Length)
+            {
+                var remaining = text.AsSpan(offset);
+                var lineEnd = remaining.IndexOf("\r\n".AsSpan());
+                if (lineEnd < 0)
+                {
+                    throw new InvalidDataException("Invalid HTTP header line.");
+                }
+
+                if (lineEnd == 0)
+                {
+                    return;
+                }
+
+                if (remaining[..lineEnd].IndexOf(':') <= 0)
+                {
+                    throw new InvalidDataException("Invalid HTTP header line.");
+                }
+
+                offset += lineEnd + 2;
+            }
         }
 
         public byte[] BuildOriginHeader(string pathAndQuery)
