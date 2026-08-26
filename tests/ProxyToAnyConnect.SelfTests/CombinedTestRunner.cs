@@ -29,6 +29,11 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        if (VerificationChunkedDecodeSelfTests.Run() != 0)
+        {
+            return 1;
+        }
+
         var lifetimeFailures = await ProxyLifetimeSelfTests.RunAsync();
         if (lifetimeFailures != 0)
         {
@@ -131,7 +136,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, bounded-status, memory-health, configuration/reconfigure, incremental-header, parser-allocation/timing, verification-parser/read, CONNECT-setup, DNS-query, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, bounded-status, memory-health, configuration/reconfigure, incremental-header, parser-allocation/timing, verification-parser/read/chunk, CONNECT-setup, DNS-query, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }

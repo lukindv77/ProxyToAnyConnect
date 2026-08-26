@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Globalization;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -317,10 +316,31 @@ internal sealed class VpnConnectivityVerifier
         return -1;
     }
 
-    private static byte[] DecodeChunkedBody(ReadOnlySpan<byte> body)
+    internal static byte[] DecodeChunkedBody(ReadOnlySpan<byte> body)
     {
-        using var decoded = new MemoryStream();
+        var decodedLength = ScanChunkedBody(body, destination: default, copyPayload: false);
+        if (decodedLength == 0)
+        {
+            return [];
+        }
+
+        var decoded = GC.AllocateUninitializedArray<byte>(decodedLength);
+        var copiedLength = ScanChunkedBody(body, decoded, copyPayload: true);
+        if (copiedLength != decodedLength)
+        {
+            throw new IOException("Chunked verification response changed while decoding.");
+        }
+
+        return decoded;
+    }
+
+    private static int ScanChunkedBody(
+        ReadOnlySpan<byte> body,
+        Span<byte> destination,
+        bool copyPayload)
+    {
         var offset = 0;
+        var decodedLength = 0;
 
         while (true)
         {
@@ -330,19 +350,7 @@ internal sealed class VpnConnectivityVerifier
                 throw new IOException("Malformed chunked verification response.");
             }
 
-            var sizeText = Encoding.ASCII.GetString(body[offset..lineEnd]);
-            var extensionSeparator = sizeText.IndexOf(';');
-            if (extensionSeparator >= 0)
-            {
-                sizeText = sizeText[..extensionSeparator];
-            }
-
-            if (!int.TryParse(
-                    sizeText.Trim(),
-                    NumberStyles.HexNumber,
-                    CultureInfo.InvariantCulture,
-                    out var chunkSize) ||
-                chunkSize < 0)
+            if (!TryParseChunkSize(body[offset..lineEnd], out var chunkSize))
             {
                 throw new IOException("Malformed HTTP chunk size in verification response.");
             }
@@ -350,15 +358,20 @@ internal sealed class VpnConnectivityVerifier
             offset = lineEnd + 2;
             if (chunkSize == 0)
             {
-                return decoded.ToArray();
+                return decodedLength;
             }
 
-            if (offset > body.Length - chunkSize - 2)
+            if (offset > body.Length - 2 || chunkSize > body.Length - offset - 2)
             {
                 throw new IOException("Truncated chunked verification response.");
             }
 
-            decoded.Write(body.Slice(offset, chunkSize));
+            if (copyPayload)
+            {
+                body.Slice(offset, chunkSize).CopyTo(destination[decodedLength..]);
+            }
+
+            decodedLength = checked(decodedLength + chunkSize);
             offset += chunkSize;
 
             if (body[offset] != (byte)'\r' || body[offset + 1] != (byte)'\n')
@@ -368,6 +381,62 @@ internal sealed class VpnConnectivityVerifier
 
             offset += 2;
         }
+    }
+
+    private static bool TryParseChunkSize(ReadOnlySpan<byte> sizeLine, out int chunkSize)
+    {
+        chunkSize = 0;
+        var extensionSeparator = sizeLine.IndexOf((byte)';');
+        if (extensionSeparator >= 0)
+        {
+            sizeLine = sizeLine[..extensionSeparator];
+        }
+
+        while (!sizeLine.IsEmpty && IsAsciiWhitespace(sizeLine[0]))
+        {
+            sizeLine = sizeLine[1..];
+        }
+
+        while (!sizeLine.IsEmpty && IsAsciiWhitespace(sizeLine[^1]))
+        {
+            sizeLine = sizeLine[..^1];
+        }
+
+        if (sizeLine.IsEmpty)
+        {
+            return false;
+        }
+
+        uint value = 0;
+        foreach (var current in sizeLine)
+        {
+            var digit = current switch
+            {
+                >= (byte)'0' and <= (byte)'9' => current - (byte)'0',
+                >= (byte)'A' and <= (byte)'F' => current - (byte)'A' + 10,
+                >= (byte)'a' and <= (byte)'f' => current - (byte)'a' + 10,
+                _ => -1
+            };
+            if (digit < 0 || value > (uint.MaxValue - (uint)digit) / 16)
+            {
+                return false;
+            }
+
+            value = (value * 16) + (uint)digit;
+        }
+
+        if (value > int.MaxValue)
+        {
+            return false;
+        }
+
+        chunkSize = (int)value;
+        return true;
+    }
+
+    private static bool IsAsciiWhitespace(byte value)
+    {
+        return value == (byte)' ' || value is >= 0x09 and <= 0x0D;
     }
 
     private static int FindCrlf(ReadOnlySpan<byte> data, int start)
