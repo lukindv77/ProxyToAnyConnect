@@ -13,6 +13,8 @@ internal sealed class ProxyServer
 
     private readonly ProxyOptions _options;
     private readonly IProxyOutboundConnectionFactory _socketFactory;
+    private readonly TaskCompletionSource _listening =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public ProxyServer(ProxyOptions options, IProxyOutboundConnectionFactory socketFactory)
     {
@@ -20,15 +22,18 @@ internal sealed class ProxyServer
         _socketFactory = socketFactory;
     }
 
+    public Task WaitUntilListeningAsync(CancellationToken cancellationToken) =>
+        _listening.Task.WaitAsync(cancellationToken);
+
     public async Task RunAsync(CancellationToken cancellationToken)
     {
-        var listener = new TcpListener(IPAddress.Parse(_options.ListenAddress), _options.ListenPort);
-        listener.Start();
-
-        Console.WriteLine($"Proxy listening on {_options.ListenAddress}:{_options.ListenPort}");
-
+        TcpListener? listener = null;
         try
         {
+            listener = new TcpListener(IPAddress.Parse(_options.ListenAddress), _options.ListenPort);
+            listener.Start();
+            _listening.TrySetResult();
+
             while (!cancellationToken.IsCancellationRequested)
             {
                 var client = await listener.AcceptTcpClientAsync(cancellationToken);
@@ -37,11 +42,16 @@ internal sealed class ProxyServer
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Normal shutdown.
+            _listening.TrySetCanceled(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _listening.TrySetException(ex);
+            throw;
         }
         finally
         {
-            listener.Stop();
+            listener?.Stop();
         }
     }
 
@@ -71,7 +81,7 @@ internal sealed class ProxyServer
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                // Normal shutdown.
+                // Normal proxy pause/shutdown.
             }
             catch (Exception ex)
             {
@@ -86,7 +96,9 @@ internal sealed class ProxyServer
         client.NoDelay = true;
         await using var clientStream = client.GetStream();
 
-        var readResult = await ReadHeaderAsync(clientStream, _options.MaxHeaderBytes, cancellationToken);
+        using var headerTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        headerTimeout.CancelAfter(TimeSpan.FromSeconds(_options.ClientHeaderTimeoutSeconds));
+        var readResult = await ReadHeaderAsync(clientStream, _options.MaxHeaderBytes, headerTimeout.Token);
         var request = ParsedProxyRequest.Parse(readResult.Header);
 
         if (request.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
@@ -120,11 +132,23 @@ internal sealed class ProxyServer
             await upstreamStream.WriteAsync(remainder, cancellationToken);
         }
 
-        await PumpBidirectionalAsync(
-            clientStream,
-            upstreamStream,
-            upstream.LifetimeToken,
-            cancellationToken);
+        using var tunnelCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            upstream.LifetimeToken);
+
+        var clientToUpstream = PumpAsync(clientStream, upstreamStream, tunnelCancellation.Token);
+        var upstreamToClient = PumpAsync(upstreamStream, clientStream, tunnelCancellation.Token);
+
+        try
+        {
+            await Task.WhenAny(clientToUpstream, upstreamToClient);
+        }
+        finally
+        {
+            tunnelCancellation.Cancel();
+            await IgnoreCancellationAsync(clientToUpstream);
+            await IgnoreCancellationAsync(upstreamToClient);
+        }
     }
 
     private async Task HandleHttpAsync(
@@ -133,145 +157,102 @@ internal sealed class ProxyServer
         ReadOnlyMemory<byte> remainder,
         CancellationToken cancellationToken)
     {
-        var destination = ResolveHttpDestination(request);
-        await using var upstream = await _socketFactory.ConnectAsync(
-            destination.Host,
-            destination.Port,
-            cancellationToken);
+        var uri = ParseAbsoluteHttpUri(request.Target);
+        var host = uri.IdnHost;
+        var port = uri.IsDefaultPort ? 80 : uri.Port;
+        var pathAndQuery = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+
+        await using var upstream = await _socketFactory.ConnectAsync(host, port, cancellationToken);
         await using var upstreamStream = new NetworkStream(upstream.Socket, ownsSocket: false);
 
-        var outboundHeader = request.BuildOriginHeader(destination.OriginTarget);
-        await upstreamStream.WriteAsync(outboundHeader, cancellationToken);
+        var originHeader = request.BuildOriginHeader(pathAndQuery);
+        await upstreamStream.WriteAsync(originHeader, cancellationToken);
         if (!remainder.IsEmpty)
         {
             await upstreamStream.WriteAsync(remainder, cancellationToken);
         }
 
-        await PumpBidirectionalAsync(
-            clientStream,
-            upstreamStream,
-            upstream.LifetimeToken,
-            cancellationToken);
-    }
+        using var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            upstream.LifetimeToken);
 
-    private static HttpDestination ResolveHttpDestination(ParsedProxyRequest request)
-    {
-        if (Uri.TryCreate(request.Target, UriKind.Absolute, out var uri))
-        {
-            if (!uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidDataException(
-                    "Non-CONNECT proxy requests currently support only the http scheme.");
-            }
-
-            var absolutePort = uri.IsDefaultPort ? 80 : uri.Port;
-            var absoluteOriginTarget = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
-            return new HttpDestination(uri.Host, absolutePort, absoluteOriginTarget);
-        }
-
-        var hostHeader = request.GetHeader("Host")
-            ?? throw new InvalidDataException("HTTP request does not contain a Host header.");
-        var (host, authorityPort) = ParseAuthority(hostHeader, 80);
-        var relativeOriginTarget = string.IsNullOrWhiteSpace(request.Target) ? "/" : request.Target;
-        return new HttpDestination(host, authorityPort, relativeOriginTarget);
-    }
-
-    internal static (string Host, int Port) ParseAuthority(string authority, int defaultPort)
-    {
-        var value = authority.Trim();
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            throw new InvalidDataException("Proxy target authority is empty.");
-        }
-
-        if (value.StartsWith('['))
-        {
-            throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
-        }
-
-        var colon = value.LastIndexOf(':');
-        if (colon <= 0)
-        {
-            return (value, defaultPort);
-        }
-
-        var host = value[..colon];
-        if (string.IsNullOrWhiteSpace(host) ||
-            !int.TryParse(value[(colon + 1)..], out var port) ||
-            port is < 1 or > 65535)
-        {
-            throw new InvalidDataException($"Invalid target authority '{authority}'.");
-        }
-
-        return (host, port);
-    }
-
-    private static async Task PumpBidirectionalAsync(
-        Stream client,
-        Stream upstream,
-        CancellationToken vpnLifetimeToken,
-        CancellationToken applicationToken)
-    {
-        using var sessionCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-            vpnLifetimeToken,
-            applicationToken);
-
-        var clientToUpstream = client.CopyToAsync(upstream, sessionCancellation.Token);
-        var upstreamToClient = upstream.CopyToAsync(client, sessionCancellation.Token);
-
-        await Task.WhenAny(clientToUpstream, upstreamToClient);
-        sessionCancellation.Cancel();
+        var clientToUpstream = PumpAsync(clientStream, upstreamStream, requestCancellation.Token);
+        var upstreamToClient = PumpAsync(upstreamStream, clientStream, requestCancellation.Token);
 
         try
         {
-            await Task.WhenAll(clientToUpstream, upstreamToClient);
+            await Task.WhenAny(clientToUpstream, upstreamToClient);
         }
-        catch (OperationCanceledException) when (sessionCancellation.IsCancellationRequested)
+        finally
         {
-            // Expected when either side closes or the VPN disappears.
+            requestCancellation.Cancel();
+            await IgnoreCancellationAsync(clientToUpstream);
+            await IgnoreCancellationAsync(upstreamToClient);
+        }
+    }
+
+    private static async Task PumpAsync(Stream source, Stream destination, CancellationToken cancellationToken)
+    {
+        var buffer = new byte[32 * 1024];
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+            {
+                return;
+            }
+
+            await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+            await destination.FlushAsync(cancellationToken);
+        }
+    }
+
+    private static async Task IgnoreCancellationAsync(Task task)
+    {
+        try
+        {
+            await task;
+        }
+        catch (OperationCanceledException)
+        {
         }
         catch (IOException)
         {
-            // A closed TCP tunnel is a normal end of a proxy session.
+        }
+        catch (SocketException)
+        {
         }
     }
 
     private static async Task<HeaderReadResult> ReadHeaderAsync(
-        NetworkStream stream,
+        Stream stream,
         int maxHeaderBytes,
         CancellationToken cancellationToken)
     {
-        using var aggregate = new MemoryStream(Math.Min(maxHeaderBytes, 16 * 1024));
-        var buffer = new byte[4096];
+        var buffer = new byte[Math.Min(4096, maxHeaderBytes)];
+        using var received = new MemoryStream();
 
-        while (aggregate.Length <= maxHeaderBytes)
+        while (received.Length < maxHeaderBytes)
         {
             var read = await stream.ReadAsync(buffer, cancellationToken);
             if (read == 0)
             {
-                throw new InvalidDataException("Client disconnected before sending a complete HTTP header.");
+                throw new InvalidDataException("Connection closed before the HTTP proxy request header was complete.");
             }
 
-            aggregate.Write(buffer, 0, read);
-            if (aggregate.Length > maxHeaderBytes)
-            {
-                throw new InvalidDataException("Proxy request header exceeds the configured limit.");
-            }
-
-            var data = aggregate.GetBuffer().AsSpan(0, checked((int)aggregate.Length));
+            received.Write(buffer, 0, read);
+            var data = received.GetBuffer().AsSpan(0, checked((int)received.Length));
             var headerEnd = FindHeaderEnd(data);
-            if (headerEnd < 0)
+            if (headerEnd >= 0)
             {
-                continue;
+                var headerLength = headerEnd + 4;
+                return new HeaderReadResult(
+                    data[..headerLength].ToArray(),
+                    data[headerLength..].ToArray());
             }
-
-            var headerLength = headerEnd + 4;
-            var header = data[..headerLength].ToArray();
-            var remainder = data[headerLength..].ToArray();
-            return new HeaderReadResult(header, remainder);
         }
 
-        throw new InvalidDataException("Proxy request header exceeds the configured limit.");
+        throw new InvalidDataException("HTTP proxy request header exceeded the configured size limit.");
     }
 
     private static int FindHeaderEnd(ReadOnlySpan<byte> data)
@@ -290,6 +271,47 @@ internal sealed class ProxyServer
         return -1;
     }
 
+    internal static (string Host, int Port) ParseAuthority(string authority, int defaultPort)
+    {
+        if (string.IsNullOrWhiteSpace(authority))
+        {
+            throw new InvalidDataException("CONNECT target is empty.");
+        }
+
+        if (authority.StartsWith('[', StringComparison.Ordinal))
+        {
+            throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+        }
+
+        var separator = authority.LastIndexOf(':');
+        if (separator < 0)
+        {
+            return (authority, defaultPort);
+        }
+
+        var host = authority[..separator];
+        if (string.IsNullOrWhiteSpace(host) ||
+            !int.TryParse(authority[(separator + 1)..], out var port) ||
+            port is < 1 or > 65535)
+        {
+            throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+        }
+
+        return (host, port);
+    }
+
+    private static Uri ParseAbsoluteHttpUri(string target)
+    {
+        if (!Uri.TryCreate(target, UriKind.Absolute, out var uri) ||
+            !uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(uri.Host))
+        {
+            throw new InvalidDataException("Plain HTTP proxy requests must use an absolute http:// URI.");
+        }
+
+        return uri;
+    }
+
     private static async Task TryWriteErrorAsync(
         TcpClient client,
         int statusCode,
@@ -297,9 +319,14 @@ internal sealed class ProxyServer
         string detail,
         CancellationToken cancellationToken)
     {
+        if (!client.Connected)
+        {
+            return;
+        }
+
         try
         {
-            var body = Encoding.UTF8.GetBytes(detail + "\n");
+            var body = Encoding.UTF8.GetBytes(detail);
             var header = Encoding.ASCII.GetBytes(
                 $"HTTP/1.1 {statusCode} {reason}\r\n" +
                 "Content-Type: text/plain; charset=utf-8\r\n" +
@@ -312,20 +339,27 @@ internal sealed class ProxyServer
         }
         catch
         {
-            // The client may already be gone; error reporting is best-effort only.
+            // Best effort error response only.
         }
     }
 
-    private sealed record HeaderReadResult(byte[] Header, byte[] Remainder);
-    private sealed record HttpDestination(string Host, int Port, string OriginTarget);
+    private readonly record struct HeaderReadResult(byte[] Header, byte[] Remainder);
 
     internal sealed class ParsedProxyRequest
     {
-        private ParsedProxyRequest(
-            string method,
-            string target,
-            string version,
-            IReadOnlyList<KeyValuePair<string, string>> headers)
+        private static readonly HashSet<string> FixedHopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Proxy-Authorization",
+            "Proxy-Authenticate",
+            "Proxy-Connection",
+            "Keep-Alive",
+            "TE",
+            "Trailer",
+            "Transfer-Encoding",
+            "Upgrade"
+        };
+
+        private ParsedProxyRequest(string method, string target, string version, List<HeaderLine> headers)
         {
             Method = method;
             Target = target;
@@ -336,90 +370,68 @@ internal sealed class ProxyServer
         public string Method { get; }
         public string Target { get; }
         public string Version { get; }
-        public IReadOnlyList<KeyValuePair<string, string>> Headers { get; }
+        private List<HeaderLine> Headers { get; }
 
         public static ParsedProxyRequest Parse(ReadOnlySpan<byte> headerBytes)
         {
             var text = Encoding.Latin1.GetString(headerBytes);
             var lines = text.Split("\r\n", StringSplitOptions.None);
-            if (lines.Length == 0)
+            if (lines.Length < 2)
             {
-                throw new InvalidDataException("Empty proxy request.");
+                throw new InvalidDataException("Invalid HTTP proxy request.");
             }
 
-            var firstLine = lines[0].Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
-            if (firstLine.Length != 3)
+            var requestLine = lines[0].Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+            if (requestLine.Length != 3)
             {
-                throw new InvalidDataException("Malformed HTTP request line.");
+                throw new InvalidDataException("Invalid HTTP proxy request line.");
             }
 
-            if (!firstLine[2].StartsWith("HTTP/", StringComparison.OrdinalIgnoreCase))
+            var headers = new List<HeaderLine>();
+            for (var i = 1; i < lines.Length && lines[i].Length > 0; i++)
             {
-                throw new InvalidDataException($"Unsupported HTTP version token '{firstLine[2]}'.");
-            }
-
-            var headers = new List<KeyValuePair<string, string>>();
-            for (var i = 1; i < lines.Length; i++)
-            {
-                var line = lines[i];
-                if (line.Length == 0)
-                {
-                    break;
-                }
-
-                var separator = line.IndexOf(':');
+                var separator = lines[i].IndexOf(':');
                 if (separator <= 0)
                 {
-                    throw new InvalidDataException($"Malformed HTTP header '{line}'.");
+                    throw new InvalidDataException("Invalid HTTP header line.");
                 }
 
-                headers.Add(new KeyValuePair<string, string>(
-                    line[..separator].Trim(),
-                    line[(separator + 1)..].Trim()));
+                headers.Add(new HeaderLine(
+                    lines[i][..separator].Trim(),
+                    lines[i][(separator + 1)..].Trim()));
             }
 
-            return new ParsedProxyRequest(firstLine[0], firstLine[1], firstLine[2], headers);
+            return new ParsedProxyRequest(requestLine[0], requestLine[1], requestLine[2], headers);
         }
 
-        public string? GetHeader(string name)
+        public byte[] BuildOriginHeader(string pathAndQuery)
         {
-            foreach (var header in Headers)
-            {
-                if (header.Key.Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
-                    return header.Value;
-                }
-            }
-
-            return null;
-        }
-
-        public byte[] BuildOriginHeader(string originTarget)
-        {
-            var builder = new StringBuilder();
-            builder.Append(Method).Append(' ').Append(originTarget).Append(' ').Append(Version).Append("\r\n");
-
-            var connectionHeaderTokens = Headers
-                .Where(header => header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase))
-                .SelectMany(header => header.Value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            var connectionTokens = Headers
+                .Where(header => header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                .SelectMany(header => header.Value.Split(','))
+                .Select(token => token.Trim())
+                .Where(token => token.Length > 0)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+            var builder = new StringBuilder();
+            builder.Append(Method).Append(' ').Append(pathAndQuery).Append(' ').Append(Version).Append("\r\n");
+
             foreach (var header in Headers)
             {
-                if (header.Key.Equals("Proxy-Connection", StringComparison.OrdinalIgnoreCase) ||
-                    header.Key.Equals("Proxy-Authorization", StringComparison.OrdinalIgnoreCase) ||
-                    header.Key.Equals("Proxy-Authenticate", StringComparison.OrdinalIgnoreCase) ||
-                    header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
-                    connectionHeaderTokens.Contains(header.Key))
+                if (header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+                    FixedHopByHopHeaders.Contains(header.Name) ||
+                    connectionTokens.Contains(header.Name))
                 {
                     continue;
                 }
 
-                builder.Append(header.Key).Append(": ").Append(header.Value).Append("\r\n");
+                builder.Append(header.Name).Append(": ").Append(header.Value).Append("\r\n");
             }
 
             builder.Append("Connection: close\r\n\r\n");
             return Encoding.Latin1.GetBytes(builder.ToString());
         }
+
+        private sealed record HeaderLine(string Name, string Value);
     }
 }
