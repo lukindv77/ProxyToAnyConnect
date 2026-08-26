@@ -11,6 +11,7 @@ internal static class DnsNameSkipSelfTests
     private const int TimingRounds = 9;
     private const int IterationsPerRound = 65536;
     private const double MaxMedianSlowdownRatio = 1.25;
+    private static int _sink;
 
     public static int Run()
     {
@@ -23,20 +24,20 @@ internal static class DnsNameSkipSelfTests
             var offset = FindAliasOffset(packet);
             for (var i = 0; i < WarmupIterations; i++)
             {
-                GC.KeepAlive(RunOptimized(packet, offset));
-                GC.KeepAlive(RunPredecessor(packet, offset));
+                ConsumeOptimized(packet, offset);
+                ConsumePredecessor(packet, offset);
             }
 
-            var optimizedBytes = MeasureAllocatedBytes(() => GC.KeepAlive(RunOptimized(packet, offset)));
-            var predecessorBytes = MeasureAllocatedBytes(() => GC.KeepAlive(RunPredecessor(packet, offset)));
+            var optimizedBytes = MeasureAllocatedBytes(() => ConsumeOptimized(packet, offset));
+            var predecessorBytes = MeasureAllocatedBytes(() => ConsumePredecessor(packet, offset));
             if (optimizedBytes >= predecessorBytes)
             {
                 throw new InvalidOperationException(
                     $"DNS name skip allocated {optimizedBytes} bytes versus {predecessorBytes} bytes for materialization.");
             }
 
-            Action optimized = () => GC.KeepAlive(RunOptimized(packet, offset));
-            Action predecessor = () => GC.KeepAlive(RunPredecessor(packet, offset));
+            Action optimized = () => ConsumeOptimized(packet, offset);
+            Action predecessor = () => ConsumePredecessor(packet, offset);
             var timing = MeasurePaired(optimized, predecessor);
             if (timing.Ratio > MaxMedianSlowdownRatio)
             {
@@ -59,6 +60,17 @@ internal static class DnsNameSkipSelfTests
             Console.Error.WriteLine($"FAIL: DNS discard-name parsing regression: {ex}");
             return 1;
         }
+    }
+
+    private static void ConsumeOptimized(byte[] packet, int initialOffset)
+    {
+        _sink ^= RunOptimized(packet, initialOffset);
+    }
+
+    private static void ConsumePredecessor(byte[] packet, int initialOffset)
+    {
+        var result = RunPredecessor(packet, initialOffset);
+        _sink ^= result.Offset ^ result.Name.Length;
     }
 
     private static void OffsetsAndValidationMatchMaterializingPredecessor()
