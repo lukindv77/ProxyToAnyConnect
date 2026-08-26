@@ -31,6 +31,15 @@ internal static class ProxySetupTimingSelfTests
             var raw = BuildRepresentativeHeader();
             var optimizedRequest = ProxyServer.ParsedProxyRequest.Parse(raw);
             var predecessorRequest = CurrentTextSpanParse(raw);
+            var legacyParserRequest = LegacySplitParse(raw);
+
+            if (!string.Equals(optimizedRequest.Method, legacyParserRequest.Method, StringComparison.Ordinal) ||
+                !string.Equals(optimizedRequest.Target, legacyParserRequest.Target, StringComparison.Ordinal) ||
+                !string.Equals(optimizedRequest.Version, legacyParserRequest.Version, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Timing parser baseline does not match current request-line semantics.");
+            }
 
             var optimizedOrigin = optimizedRequest.BuildOriginHeader(OriginPath);
             var predecessorOrigin = CurrentDirectBuildOriginHeader(predecessorRequest, OriginPath);
@@ -43,7 +52,7 @@ internal static class ProxySetupTimingSelfTests
             for (var i = 0; i < WarmupIterations; i++)
             {
                 GC.KeepAlive(ProxyServer.ParsedProxyRequest.Parse(raw));
-                GC.KeepAlive(CurrentTextSpanParse(raw));
+                GC.KeepAlive(LegacySplitParse(raw));
                 GC.KeepAlive(optimizedRequest.BuildOriginHeader(OriginPath));
                 GC.KeepAlive(CurrentDirectBuildOriginHeader(predecessorRequest, OriginPath));
             }
@@ -51,7 +60,7 @@ internal static class ProxySetupTimingSelfTests
             Action optimizedParser = () =>
                 GC.KeepAlive(ProxyServer.ParsedProxyRequest.Parse(raw));
             Action predecessorParser = () =>
-                GC.KeepAlive(CurrentTextSpanParse(raw));
+                GC.KeepAlive(LegacySplitParse(raw));
             Action optimizedOriginBuilder = () =>
                 GC.KeepAlive(optimizedRequest.BuildOriginHeader(OriginPath));
             Action predecessorOriginBuilder = () =>
@@ -60,7 +69,7 @@ internal static class ProxySetupTimingSelfTests
             var parserTiming = MeasurePaired(optimizedParser, predecessorParser);
             var originTiming = MeasurePaired(optimizedOriginBuilder, predecessorOriginBuilder);
 
-            AssertNoMaterialSlowdown("byte-span parser", parserTiming);
+            AssertNoMaterialSlowdown("text-span parser", parserTiming);
             AssertNoMaterialSlowdown("stack-token origin builder", originTiming);
 
             Console.WriteLine(
@@ -153,9 +162,8 @@ internal static class ProxySetupTimingSelfTests
             "Cookie: a=1; b=2; c=3\r\n" +
             "Proxy-Connection: keep-alive\r\n\r\n");
 
-    // Test-only immediate predecessor of the current byte-span parser. It keeps
-    // one full Latin-1 string for the request block, then materializes the same
-    // final request/header strings from spans.
+    // Test-only mirror of the current text-span parser, used to construct the
+    // request representation consumed by the immediate origin-builder predecessor.
     private static TimingRequest CurrentTextSpanParse(ReadOnlySpan<byte> headerBytes)
     {
         var text = Encoding.Latin1.GetString(headerBytes);
@@ -210,6 +218,40 @@ internal static class ProxySetupTimingSelfTests
         }
 
         return new TimingRequest(method, target, version, headers);
+    }
+
+    // Test-only older Split-based parser used as the timing predecessor after the
+    // byte-span experiment was rejected for excessive CPU cost.
+    private static TimingRequest LegacySplitParse(ReadOnlySpan<byte> headerBytes)
+    {
+        var text = Encoding.Latin1.GetString(headerBytes);
+        var lines = text.Split("\r\n", StringSplitOptions.None);
+        if (lines.Length < 2)
+        {
+            throw new InvalidDataException("Invalid HTTP proxy request.");
+        }
+
+        var requestLine = lines[0].Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        if (requestLine.Length != 3)
+        {
+            throw new InvalidDataException("Invalid HTTP proxy request line.");
+        }
+
+        var headers = new List<TimingHeaderLine>();
+        for (var i = 1; i < lines.Length && lines[i].Length > 0; i++)
+        {
+            var separator = lines[i].IndexOf(':');
+            if (separator <= 0)
+            {
+                throw new InvalidDataException("Invalid HTTP header line.");
+            }
+
+            headers.Add(new TimingHeaderLine(
+                lines[i][..separator].Trim(),
+                lines[i][(separator + 1)..].Trim()));
+        }
+
+        return new TimingRequest(requestLine[0], requestLine[1], requestLine[2], headers);
     }
 
     // Test-only immediate predecessor of the bounded stack Connection-token path:

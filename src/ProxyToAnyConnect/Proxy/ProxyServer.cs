@@ -532,33 +532,37 @@ internal sealed class ProxyServer
 
         public static ParsedProxyRequest Parse(ReadOnlySpan<byte> headerBytes)
         {
-            var requestLineEnd = headerBytes.IndexOf("\r\n"u8);
+            var text = Encoding.Latin1.GetString(headerBytes);
+            var requestLineEnd = text.IndexOf("\r\n", StringComparison.Ordinal);
             if (requestLineEnd < 0)
             {
                 throw new InvalidDataException("Invalid HTTP proxy request.");
             }
 
-            var requestLine = headerBytes[..requestLineEnd];
+            var requestLine = text.AsSpan(0, requestLineEnd);
             Span<Range> requestParts = stackalloc Range[3];
-            var requestPartCount = SplitRequestLine(requestLine, requestParts);
+            var requestPartCount = requestLine.Split(
+                requestParts,
+                ' ',
+                StringSplitOptions.RemoveEmptyEntries);
             if (requestPartCount != 3)
             {
                 throw new InvalidDataException("Invalid HTTP proxy request line.");
             }
 
-            var method = Encoding.Latin1.GetString(requestLine[requestParts[0]]);
-            var target = Encoding.Latin1.GetString(requestLine[requestParts[1]]);
-            var version = Encoding.Latin1.GetString(requestLine[requestParts[2]]);
+            var method = requestLine[requestParts[0]].ToString();
+            var target = requestLine[requestParts[1]].ToString();
+            var version = requestLine[requestParts[2]].ToString();
 
             var headers = new List<HeaderLine>();
             var offset = requestLineEnd + 2;
-            while (offset < headerBytes.Length)
+            while (offset < text.Length)
             {
-                var remaining = headerBytes[offset..];
-                var lineEnd = remaining.IndexOf("\r\n"u8);
+                var remaining = text.AsSpan(offset);
+                var lineEnd = remaining.IndexOf("\r\n".AsSpan());
                 if (lineEnd < 0)
                 {
-                    throw new InvalidDataException("Invalid HTTP proxy request.");
+                    throw new InvalidDataException("Invalid HTTP header line.");
                 }
 
                 if (lineEnd == 0)
@@ -567,81 +571,19 @@ internal sealed class ProxyServer
                 }
 
                 var line = remaining[..lineEnd];
-                var separator = line.IndexOf((byte)':');
+                var separator = line.IndexOf(':');
                 if (separator <= 0)
                 {
                     throw new InvalidDataException("Invalid HTTP header line.");
                 }
 
-                var name = TrimLatin1Whitespace(line[..separator]);
-                var value = TrimLatin1Whitespace(line[(separator + 1)..]);
                 headers.Add(new HeaderLine(
-                    Encoding.Latin1.GetString(name),
-                    Encoding.Latin1.GetString(value)));
+                    line[..separator].Trim().ToString(),
+                    line[(separator + 1)..].Trim().ToString()));
                 offset += lineEnd + 2;
             }
 
             return new ParsedProxyRequest(method, target, version, headers);
-        }
-
-        private static int SplitRequestLine(ReadOnlySpan<byte> requestLine, Span<Range> parts)
-        {
-            if (parts.Length < 3)
-            {
-                throw new ArgumentException("At least three request-line ranges are required.", nameof(parts));
-            }
-
-            var offset = 0;
-            var count = 0;
-            while (count < 2)
-            {
-                while (offset < requestLine.Length && requestLine[offset] == (byte)' ')
-                {
-                    offset++;
-                }
-
-                if (offset >= requestLine.Length)
-                {
-                    return count;
-                }
-
-                var start = offset;
-                while (offset < requestLine.Length && requestLine[offset] != (byte)' ')
-                {
-                    offset++;
-                }
-
-                parts[count++] = start..offset;
-            }
-
-            while (offset < requestLine.Length && requestLine[offset] == (byte)' ')
-            {
-                offset++;
-            }
-
-            if (offset < requestLine.Length)
-            {
-                parts[count++] = offset..requestLine.Length;
-            }
-
-            return count;
-        }
-
-        private static ReadOnlySpan<byte> TrimLatin1Whitespace(ReadOnlySpan<byte> value)
-        {
-            var start = 0;
-            while (start < value.Length && char.IsWhiteSpace((char)value[start]))
-            {
-                start++;
-            }
-
-            var end = value.Length;
-            while (end > start && char.IsWhiteSpace((char)value[end - 1]))
-            {
-                end--;
-            }
-
-            return value[start..end];
         }
 
         public byte[] BuildOriginHeader(string pathAndQuery)
@@ -785,7 +727,7 @@ internal sealed class ProxyServer
                                 overflowTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                                 for (var i = 0; i < stackTokenCount; i++)
                                 {
-                                    overflowTokens.Add(GetConnectionTokenSpan(stackTokens[i]).ToString());
+                                    overflowTokens.Add(GetConnectionTokenSpan((stackTokens[i])).ToString());
                                 }
                             }
 
