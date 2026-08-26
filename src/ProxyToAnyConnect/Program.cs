@@ -1,4 +1,5 @@
 using ProxyToAnyConnect.Configuration;
+using ProxyToAnyConnect.Diagnostics;
 using ProxyToAnyConnect.Network;
 using ProxyToAnyConnect.Proxy;
 using ProxyToAnyConnect.Vpn;
@@ -53,21 +54,44 @@ internal static class Program
             }
 
             var options = await AppOptions.LoadAsync(configPath, shutdown.Token);
+            AppLog.Configure(
+                options.Logging,
+                Path.GetDirectoryName(configPath) ?? AppContext.BaseDirectory);
+            AppLog.Info(
+                "application.start",
+                "ProxyToAnyConnect started.",
+                new
+                {
+                    VerifyOnly = verifyOnly,
+                    ProxyListenAddress = options.Proxy.ListenAddress,
+                    ProxyListenPort = options.Proxy.ListenPort,
+                    L2tpEntryName = options.L2tp.EntryName
+                });
+
             await using var rasConnectionManager = new RasConnectionManager(options.L2tp);
 
             try
             {
                 var vpn = await rasConnectionManager.ConnectAsync(shutdown.Token);
                 PrintVpnContext(vpn, rasConnectionManager.LastVerification);
+                LogVerifiedVpn(vpn, rasConnectionManager.LastVerification);
 
                 if (verifyOnly)
                 {
+                    AppLog.Info(
+                        "verification.complete",
+                        "Verification-only mode completed successfully.");
                     Console.WriteLine("Verification-only mode completed successfully. Proxy listener was not started.");
                     return 0;
                 }
             }
             catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException)
             {
+                AppLog.Error(
+                    "verification.failed",
+                    "Initial L2TP connection or verification failed.",
+                    ex,
+                    new { EntryName = options.L2tp.EntryName });
                 Console.Error.WriteLine($"Initial L2TP connection/verification failed: {ex.Message}");
 
                 if (verifyOnly)
@@ -84,14 +108,17 @@ internal static class Program
             var proxyServer = new ProxyServer(options.Proxy, socketFactory);
 
             await proxyServer.RunAsync(shutdown.Token);
+            AppLog.Info("application.stop", "ProxyToAnyConnect stopped normally.");
             return 0;
         }
         catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
         {
+            AppLog.Info("application.stop", "ProxyToAnyConnect shutdown was requested.");
             return 0;
         }
         catch (Exception ex)
         {
+            AppLog.Error("application.fatal", "ProxyToAnyConnect terminated with a fatal error.", ex);
             Console.Error.WriteLine(ex);
             return 1;
         }
@@ -137,5 +164,24 @@ internal static class Program
                 Console.WriteLine($"  Probe observed public IPv4: {verification.ObservedPublicIPv4}");
             }
         }
+    }
+
+    private static void LogVerifiedVpn(VpnContext vpn, VpnVerificationResult? verification)
+    {
+        AppLog.Info(
+            "vpn.ready",
+            "L2TP connection passed verification and is available to proxy traffic.",
+            new
+            {
+                vpn.EntryName,
+                LocalIPv4 = vpn.LocalIPv4.ToString(),
+                vpn.InterfaceName,
+                vpn.InterfaceIndex,
+                DnsServers = vpn.DnsServers.Select(address => address.ToString()).ToArray(),
+                ProbeTargetIPv4 = verification?.ProbeTargetIPv4.ToString(),
+                ObservedPublicIPv4 = verification?.ObservedPublicIPv4?.ToString(),
+                ExpectedPublicIPv4 = verification?.ExpectedPublicIPv4?.ToString(),
+                PublicIPv4ComparisonPerformed = verification?.PublicIPv4ComparisonPerformed
+            });
     }
 }
