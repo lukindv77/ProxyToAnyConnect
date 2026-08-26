@@ -9,8 +9,32 @@ internal sealed record VpnLatestStatus(
     string? KeepaliveSummary,
     string? ReconnectSummary,
     string? LastFailureReason,
-    string Text,
-    DateTimeOffset UpdatedUtc);
+    DateTimeOffset? ReconnectCooldownUntilUtc,
+    string CachedText,
+    DateTimeOffset UpdatedUtc)
+{
+    public string Text
+    {
+        get
+        {
+            if (ReconnectCooldownUntilUtc is not { } cooldownUntil)
+            {
+                return CachedText;
+            }
+
+            var remaining = cooldownUntil - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+            {
+                return CachedText;
+            }
+
+            var remainingText = $"cooldown remaining {Math.Ceiling(remaining.TotalMilliseconds):F0} ms";
+            return string.IsNullOrWhiteSpace(CachedText)
+                ? remainingText
+                : $"{CachedText} | {remainingText}";
+        }
+    }
+}
 
 internal static class VpnLatestStatusRegistry
 {
@@ -129,6 +153,7 @@ internal static class VpnLatestStatusRegistry
                     Activity = null,
                     VerificationSummary = BuildVerificationText(data),
                     ReconnectSummary = null,
+                    ReconnectCooldownUntilUtc = null,
                     UpdatedUtc = now
                 },
 
@@ -146,9 +171,10 @@ internal static class VpnLatestStatusRegistry
 
                 "vpn.reconnect.cooldown_active" => status with
                 {
-                    ReconnectSummary = GetLong(data, "RetryAfterMilliseconds") is { } remaining
-                        ? $"Reconnect cooldown: {remaining} ms"
-                        : "Reconnect cooldown active",
+                    ReconnectSummary = "Reconnect cooldown active",
+                    ReconnectCooldownUntilUtc = GetLong(data, "RetryAfterMilliseconds") is { } remaining
+                        ? now.AddMilliseconds(Math.Max(0, remaining))
+                        : status.ReconnectCooldownUntilUtc,
                     UpdatedUtc = now
                 },
 
@@ -157,12 +183,16 @@ internal static class VpnLatestStatusRegistry
                     ReconnectSummary = GetString(data, "Reason") is { Length: > 0 } reason
                         ? $"Reconnect cooldown: {reason}"
                         : "Reconnect cooldown armed",
+                    ReconnectCooldownUntilUtc = GetLong(data, "ReconnectCooldownMilliseconds") is { } cooldown
+                        ? now.AddMilliseconds(Math.Max(0, cooldown))
+                        : status.ReconnectCooldownUntilUtc,
                     UpdatedUtc = now
                 },
 
                 "vpn.maintenance.reconnect_attempt" => status with
                 {
                     ReconnectSummary = "Reconnect: dialing and verifying",
+                    ReconnectCooldownUntilUtc = null,
                     UpdatedUtc = now
                 },
 
@@ -177,6 +207,7 @@ internal static class VpnLatestStatusRegistry
                 "vpn.maintenance.reconnected" => status with
                 {
                     ReconnectSummary = "Reconnect completed",
+                    ReconnectCooldownUntilUtc = null,
                     UpdatedUtc = now
                 },
 
@@ -221,7 +252,8 @@ internal static class VpnLatestStatusRegistry
                 KeepaliveSummary: null,
                 ReconnectSummary: null,
                 LastFailureReason: null,
-                Text: string.Empty,
+                ReconnectCooldownUntilUtc: null,
+                CachedText: string.Empty,
                 UpdatedUtc: DateTimeOffset.UtcNow);
 
             var updated = update(current);
@@ -230,7 +262,7 @@ internal static class VpnLatestStatusRegistry
                 return;
             }
 
-            updated = updated with { Text = BuildText(updated) };
+            updated = updated with { CachedText = BuildText(updated) };
 
             if (!exists && Entries.Count >= MaxEntries)
             {
