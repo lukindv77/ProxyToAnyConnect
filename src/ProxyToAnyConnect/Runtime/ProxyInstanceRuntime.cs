@@ -23,6 +23,7 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
     private VpnLeaseManager.VpnLease? _lease;
     private CancellationTokenSource? _runCancellation;
     private Task? _runTask;
+    private Task? _observerTask;
     private int _generation;
     private int _state = (int)ProxyInstanceState.Paused;
     private string? _lastError;
@@ -46,6 +47,8 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
             if (State is ProxyInstanceState.Running or ProxyInstanceState.Starting)
             {
                 return;
@@ -88,7 +91,7 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
                         VpnId = _options.VpnConnectionId
                     });
 
-                _ = ObserveRunCompletionAsync(runTask, generation);
+                _observerTask = ObserveRunCompletionAsync(runTask, generation);
                 lease = null;
                 runCancellation = null;
             }
@@ -121,57 +124,65 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
+        Task? observerToJoin = null;
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
             if (State == ProxyInstanceState.Paused && _lease is null)
             {
-                return;
+                observerToJoin = Interlocked.Exchange(ref _observerTask, null);
             }
-
-            SetState(ProxyInstanceState.Stopping);
-            unchecked { _generation++; }
-
-            var cancellation = _runCancellation;
-            var runTask = _runTask;
-            var lease = _lease;
-
-            _runCancellation = null;
-            _runTask = null;
-            _lease = null;
-
-            cancellation?.Cancel();
-            if (runTask is not null)
+            else
             {
-                try
-                {
-                    await runTask.WaitAsync(cancellationToken);
-                }
-                catch (OperationCanceledException) when (cancellation?.IsCancellationRequested == true)
-                {
-                }
-                catch (Exception ex) when (ex is IOException or System.Net.Sockets.SocketException)
-                {
-                    System.Diagnostics.Debug.WriteLine(ex);
-                }
-            }
+                SetState(ProxyInstanceState.Stopping);
+                unchecked { _generation++; }
 
-            cancellation?.Dispose();
-            if (lease is not null)
-            {
-                await lease.DisposeAsync();
-            }
+                var cancellation = _runCancellation;
+                var runTask = _runTask;
+                var lease = _lease;
 
-            SetState(ProxyInstanceState.Paused);
-            AppLog.Info(
-                "proxy.paused",
-                "Proxy listener was paused and its L2TP lease released.",
-                new { ProxyId = _options.Id, ProxyName = _options.Name });
+                _runCancellation = null;
+                _runTask = null;
+                _lease = null;
+                observerToJoin = Interlocked.Exchange(ref _observerTask, null);
+
+                cancellation?.Cancel();
+                if (runTask is not null)
+                {
+                    try
+                    {
+                        await runTask.WaitAsync(cancellationToken);
+                    }
+                    catch (OperationCanceledException) when (cancellation?.IsCancellationRequested == true)
+                    {
+                    }
+                    catch (Exception ex) when (ex is IOException or System.Net.Sockets.SocketException)
+                    {
+                        System.Diagnostics.Debug.WriteLine(ex);
+                    }
+                }
+
+                cancellation?.Dispose();
+                if (lease is not null)
+                {
+                    await lease.DisposeAsync();
+                }
+
+                SetState(ProxyInstanceState.Paused);
+                AppLog.Info(
+                    "proxy.paused",
+                    "Proxy listener was paused and its L2TP lease released.",
+                    new { ProxyId = _options.Id, ProxyName = _options.Name });
+            }
         }
         finally
         {
             _gate.Release();
         }
+
+        await JoinObserverAsync(observerToJoin);
     }
 
     public ProxyRuntimeSnapshot Snapshot()
@@ -219,9 +230,16 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
             _lease = null;
 
             cancellation?.Dispose();
-            if (lease is not null)
+            try
             {
-                await lease.DisposeAsync();
+                if (lease is not null)
+                {
+                    await lease.DisposeAsync();
+                }
+            }
+            catch (Exception cleanupError)
+            {
+                failure ??= cleanupError;
             }
 
             if (failure is not null)
@@ -239,9 +257,40 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
                 SetState(ProxyInstanceState.Paused);
             }
         }
+        catch (Exception ex)
+        {
+            // This observer is deliberately no-throw because it can be triggered by
+            // an unexpected listener completion while no foreground caller awaits it.
+            Volatile.Write(ref _lastError, ex.Message);
+            SetState(ProxyInstanceState.Error);
+            AppLog.Error(
+                "proxy.observer.failed",
+                "Proxy runtime completion observer failed.",
+                ex,
+                new { ProxyId = _options.Id, ProxyName = _options.Name });
+        }
         finally
         {
             _gate.Release();
+        }
+    }
+
+    private static async Task JoinObserverAsync(Task? observer)
+    {
+        if (observer is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await observer;
+        }
+        catch (Exception ex)
+        {
+            // ObserveRunCompletionAsync is intended to be no-throw. Keep this guard
+            // so a future regression can never surface as an unobserved Task exception.
+            System.Diagnostics.Debug.WriteLine(ex);
         }
     }
 
@@ -255,6 +304,7 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
             return;
         }
 
+        Task? observerToJoin;
         await _gate.WaitAsync();
         try
         {
@@ -274,6 +324,7 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
             _runCancellation?.Dispose();
             _runCancellation = null;
             _runTask = null;
+            observerToJoin = Interlocked.Exchange(ref _observerTask, null);
 
             if (_lease is not null)
             {
@@ -286,8 +337,14 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
         finally
         {
             _gate.Release();
-            _gate.Dispose();
         }
+
+        await JoinObserverAsync(observerToJoin);
+
+        // SemaphoreSlim only creates an OS wait handle if AvailableWaitHandle is
+        // requested (it is not here). Do not race Dispose() against a caller that
+        // passed the pre-wait disposed check immediately before disposal; once this
+        // runtime becomes unreachable, the managed semaphore is collectible with it.
     }
 }
 
