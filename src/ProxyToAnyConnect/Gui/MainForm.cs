@@ -37,7 +37,7 @@ internal sealed class MainForm : Form
         RebuildVpnNameIndex();
 
         Text = "ProxyToAnyConnect";
-        Width = 1220;
+        Width = 1480;
         Height = 720;
         MinimumSize = new Size(920, 540);
         StartPosition = FormStartPosition.CenterScreen;
@@ -158,11 +158,12 @@ internal sealed class MainForm : Form
         _vpnGrid.Columns.Add(TextColumn("mode", "Режим", 150));
         _vpnGrid.Columns.Add(TextColumn("sharing", "Тип", 90));
         _vpnGrid.Columns.Add(TextColumn("state", "Состояние", 100));
-        _vpnGrid.Columns.Add(TextColumn("ip", "IPv4", 120));
+        _vpnGrid.Columns.Add(TextColumn("ip", "IPv4 / ifIndex", 170));
         _vpnGrid.Columns.Add(TextColumn("leases", "Proxy", 60));
         _vpnGrid.Columns.Add(TextColumn("rx", "RX", 110));
         _vpnGrid.Columns.Add(TextColumn("tx", "TX", 110));
         _vpnGrid.Columns.Add(TextColumn("ping", "Ping avg 5m", 110));
+        _vpnGrid.Columns.Add(TextColumn("status", "Статус / причина", 390));
 
         var toolbar = new FlowLayoutPanel
         {
@@ -300,6 +301,7 @@ internal sealed class MainForm : Form
                 SetByteCell(row.Cells[6], 0);
                 SetByteCell(row.Cells[7], 0);
                 SetCell(row, 8, "—");
+                SetCell(row, 9, _runtimeHost.ConfigurationError ?? "Конфигурация runtime недействительна");
             }
         }
         else
@@ -312,11 +314,12 @@ internal sealed class MainForm : Form
                 SetCell(row, 1, snapshot.Mode.ToString());
                 SetCell(row, 2, snapshot.Shared ? "Shared" : "Dedicated");
                 SetCell(row, 3, snapshot.State.ToString());
-                SetCell(row, 4, snapshot.LocalIPv4 ?? string.Empty);
+                SetCell(row, 4, FormatVpnInterface(snapshot.LocalIPv4, snapshot.InterfaceIndex));
                 SetCell(row, 5, snapshot.ActiveProxyCount);
                 SetByteCell(row.Cells[6], snapshot.ReceivedBytes);
                 SetByteCell(row.Cells[7], snapshot.SentBytes);
                 SetPingCell(row.Cells[8], snapshot.AveragePingMilliseconds);
+                SetCell(row, 9, VpnLatestStatusRegistry.Get(snapshot.Id)?.Text ?? string.Empty);
             }
         }
 
@@ -701,6 +704,18 @@ internal sealed class MainForm : Form
 
         cell.Tag = normalized;
         cell.Value = FormatBytes(normalized);
+    }
+
+    private static string FormatVpnInterface(string? localIPv4, int? interfaceIndex)
+    {
+        if (string.IsNullOrWhiteSpace(localIPv4))
+        {
+            return interfaceIndex is null ? string.Empty : $"ifIndex {interfaceIndex.Value}";
+        }
+
+        return interfaceIndex is null
+            ? localIPv4
+            : $"{localIPv4} / ifIndex {interfaceIndex.Value}";
     }
 
     private static void SetPingCell(DataGridViewCell cell, double? value)
