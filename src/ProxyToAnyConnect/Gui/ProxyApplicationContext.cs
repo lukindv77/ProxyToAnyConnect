@@ -6,14 +6,14 @@ namespace ProxyToAnyConnect.Gui;
 internal sealed class ProxyApplicationContext : ApplicationContext
 {
     private readonly MainForm _mainForm;
-    private readonly ProxyRuntimeCoordinator? _runtime;
+    private readonly ProxyRuntimeHost _runtimeHost;
     private readonly NotifyIcon _notifyIcon;
     private int _exitStarted;
 
-    public ProxyApplicationContext(MainForm mainForm, ProxyRuntimeCoordinator? runtime)
+    public ProxyApplicationContext(MainForm mainForm, ProxyRuntimeHost runtimeHost)
     {
         _mainForm = mainForm;
-        _runtime = runtime;
+        _runtimeHost = runtimeHost;
 
         var trayMenu = new ContextMenuStrip();
         var openItem = new ToolStripMenuItem("Открыть");
@@ -45,20 +45,17 @@ internal sealed class ProxyApplicationContext : ApplicationContext
         MainForm = _mainForm;
         _mainForm.Show();
 
-        if (_runtime is not null)
+        _mainForm.BeginInvoke(async () =>
         {
-            _mainForm.BeginInvoke(async () =>
+            try
             {
-                try
-                {
-                    await _runtime.StartEnabledAsync();
-                }
-                catch (Exception ex)
-                {
-                    AppLog.Error("runtime.start.failed", "Runtime startup failed.", ex);
-                }
-            });
-        }
+                await _runtimeHost.StartEnabledAsync();
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("runtime.start.failed", "Runtime startup failed.", ex);
+            }
+        });
     }
 
     private async Task ExitApplicationAsync()
@@ -72,10 +69,7 @@ internal sealed class ProxyApplicationContext : ApplicationContext
 
         try
         {
-            if (_runtime is not null)
-            {
-                await _runtime.DisposeAsync();
-            }
+            await _runtimeHost.DisposeAsync();
         }
         catch (Exception ex)
         {
