@@ -124,7 +124,7 @@ internal static class RetentionCleanupSchedulerSelfTests
 
         try
         {
-            scheduler.Schedule(new DateOnly(2026, 8, 27));
+            _ = scheduler.Schedule(new DateOnly(2026, 8, 27));
             throw new InvalidOperationException("Disposed retention scheduler accepted new work.");
         }
         catch (ObjectDisposedException)
