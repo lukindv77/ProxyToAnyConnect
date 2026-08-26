@@ -85,7 +85,14 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 _current = result.Context;
                 SetState(VpnConnectionState.Ready);
 
-                _monitorTask = MonitorAsync(result.Handle, result.Context, _shutdown.Token);
+                // Keep enforcing the same default-route snapshot that existed before
+                // RasDial. A later route mutation is treated as a fail-closed event too.
+                _monitorTask = MonitorAsync(
+                    result.Handle,
+                    result.Context,
+                    routesBefore,
+                    _shutdown.Token);
+
                 return result.Context;
             }
             catch (OperationCanceledException)
@@ -188,35 +195,85 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         return address;
     }
 
-    private async Task MonitorAsync(nint handle, VpnContext context, CancellationToken cancellationToken)
+    private async Task MonitorAsync(
+        nint handle,
+        VpnContext context,
+        DefaultRouteSnapshot routeBaseline,
+        CancellationToken cancellationToken)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(_options.MonitorIntervalMilliseconds));
+        using var monitorCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        var projectionTask = MonitorProjectionAsync(handle, context, monitorCancellation.Token);
+        var routeTask = MonitorDefaultRoutesAsync(routeBaseline, monitorCancellation.Token);
 
         try
         {
-            while (await timer.WaitForNextTickAsync(cancellationToken))
-            {
-                IPAddress currentAddress;
-                try
-                {
-                    currentAddress = GetAssignedIPv4(handle);
-                }
-                catch
-                {
-                    MarkCurrentDisconnected(context);
-                    return;
-                }
-
-                if (!currentAddress.Equals(context.LocalIPv4))
-                {
-                    MarkCurrentDisconnected(context);
-                    return;
-                }
-            }
+            var completedTask = await Task.WhenAny(projectionTask, routeTask);
+            await completedTask;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Normal application shutdown.
+            return;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"L2TP fail-closed monitor rejected the active connection: {ex.Message}");
+        }
+        finally
+        {
+            monitorCancellation.Cancel();
+
+            try
+            {
+                await Task.WhenAll(projectionTask, routeTask);
+            }
+            catch (OperationCanceledException) when (monitorCancellation.IsCancellationRequested)
+            {
+                // Expected after the first monitor completes/fails or on shutdown.
+            }
+            catch
+            {
+                // The first failure has already been handled above. A concurrent secondary
+                // monitor failure does not change the fail-closed action below.
+            }
+        }
+
+        if (!cancellationToken.IsCancellationRequested)
+        {
+            MarkCurrentDisconnected(context);
+            _ = RasNative.RasHangUpW(handle);
+        }
+    }
+
+    private async Task MonitorProjectionAsync(
+        nint handle,
+        VpnContext context,
+        CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(_options.MonitorIntervalMilliseconds));
+
+        while (await timer.WaitForNextTickAsync(cancellationToken))
+        {
+            var currentAddress = GetAssignedIPv4(handle);
+            if (!currentAddress.Equals(context.LocalIPv4))
+            {
+                throw new IOException(
+                    $"L2TP IPv4 changed from {context.LocalIPv4} to {currentAddress} while the connection was Ready.");
+            }
+        }
+    }
+
+    private async Task MonitorDefaultRoutesAsync(
+        DefaultRouteSnapshot routeBaseline,
+        CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(
+            TimeSpan.FromMilliseconds(_options.RouteMonitorIntervalMilliseconds));
+
+        while (await timer.WaitForNextTickAsync(cancellationToken))
+        {
+            var currentRoutes = await _routeInspector.CaptureIPv4Async(cancellationToken);
+            WindowsDefaultRouteInspector.EnsureUnchanged(routeBaseline, currentRoutes);
         }
     }
 
