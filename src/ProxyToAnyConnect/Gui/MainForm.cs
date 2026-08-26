@@ -6,11 +6,15 @@ namespace ProxyToAnyConnect.Gui;
 
 internal sealed class MainForm : Form
 {
+    private static readonly string[] ByteUnits = ["B", "KB", "MB", "GB", "TB"];
+
     private readonly string _configPath;
     private readonly ProxyRuntimeHost _runtimeHost;
-    private AppOptions _options;
     private readonly DataGridView _proxyGrid = CreateGrid();
     private readonly DataGridView _vpnGrid = CreateGrid();
+    private readonly Dictionary<string, DataGridViewRow> _proxyRows = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DataGridViewRow> _vpnRows = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _vpnNames = new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 1000 };
     private readonly TextBox _logDirectory = new() { Dock = DockStyle.Fill };
     private readonly NumericUpDown _retentionDays = new()
@@ -21,6 +25,8 @@ internal sealed class MainForm : Form
     };
     private readonly Label _effectiveLogPath = new() { AutoSize = true };
     private readonly Label _configurationStatus = new() { AutoSize = true };
+
+    private AppOptions _options;
     private bool _allowExit;
 
     public MainForm(AppOptions options, string configPath, ProxyRuntimeHost runtimeHost)
@@ -28,6 +34,7 @@ internal sealed class MainForm : Form
         _options = options;
         _configPath = configPath;
         _runtimeHost = runtimeHost;
+        RebuildVpnNameIndex();
 
         Text = "ProxyToAnyConnect";
         Width = 1220;
@@ -221,99 +228,99 @@ internal sealed class MainForm : Form
     {
         RefreshProxyGrid();
         RefreshVpnGrid();
-        _effectiveLogPath.Text = AppLog.LogRootDirectory ?? AppContext.BaseDirectory;
-        _configurationStatus.Text = string.IsNullOrWhiteSpace(_runtimeHost.ConfigurationError)
-            ? "Конфигурация runtime: OK"
-            : $"Конфигурация runtime: {_runtimeHost.ConfigurationError}";
+        SetLabelText(_effectiveLogPath, AppLog.LogRootDirectory ?? AppContext.BaseDirectory);
+        SetLabelText(
+            _configurationStatus,
+            string.IsNullOrWhiteSpace(_runtimeHost.ConfigurationError)
+                ? "Конфигурация runtime: OK"
+                : $"Конфигурация runtime: {_runtimeHost.ConfigurationError}");
     }
 
     private void RefreshProxyGrid()
     {
-        var selectedId = SelectedRowId(_proxyGrid);
-        _proxyGrid.Rows.Clear();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (_runtimeHost.Current is null)
         {
             foreach (var proxy in _options.Proxies)
             {
-                var rowIndex = _proxyGrid.Rows.Add(
-                    proxy.Name,
-                    $"{proxy.ListenAddress}:{proxy.ListenPort}",
-                    FindVpnName(proxy.VpnConnectionId),
-                    "Error",
-                    "0 B",
-                    "0 B",
-                    _runtimeHost.ConfigurationError ?? "Конфигурация runtime недействительна",
-                    "Запустить");
-                _proxyGrid.Rows[rowIndex].Tag = proxy.Id;
+                seen.Add(proxy.Id);
+                var row = GetOrCreateRow(_proxyGrid, _proxyRows, proxy.Id);
+                SetCell(row, 0, proxy.Name);
+                SetCell(row, 1, $"{proxy.ListenAddress}:{proxy.ListenPort}");
+                SetCell(row, 2, FindVpnName(proxy.VpnConnectionId));
+                SetCell(row, 3, "Error");
+                SetByteCell(row.Cells[4], 0);
+                SetByteCell(row.Cells[5], 0);
+                SetCell(row, 6, _runtimeHost.ConfigurationError ?? "Конфигурация runtime недействительна");
+                SetCell(row, 7, "Запустить");
             }
         }
         else
         {
             foreach (var snapshot in _runtimeHost.GetProxySnapshots())
             {
-                var action = snapshot.State is ProxyInstanceState.Running or ProxyInstanceState.Starting
-                    ? "Пауза"
-                    : "Запустить";
-                var rowIndex = _proxyGrid.Rows.Add(
-                    snapshot.Name,
-                    $"{snapshot.ListenAddress}:{snapshot.ListenPort}",
-                    FindVpnName(snapshot.VpnConnectionId),
-                    snapshot.State.ToString(),
-                    FormatBytes(snapshot.ReceivedBytes),
-                    FormatBytes(snapshot.SentBytes),
-                    snapshot.LastError ?? string.Empty,
-                    action);
-                _proxyGrid.Rows[rowIndex].Tag = snapshot.Id;
+                seen.Add(snapshot.Id);
+                var row = GetOrCreateRow(_proxyGrid, _proxyRows, snapshot.Id);
+                SetCell(row, 0, snapshot.Name);
+                SetCell(row, 1, $"{snapshot.ListenAddress}:{snapshot.ListenPort}");
+                SetCell(row, 2, FindVpnName(snapshot.VpnConnectionId));
+                SetCell(row, 3, snapshot.State.ToString());
+                SetByteCell(row.Cells[4], snapshot.ReceivedBytes);
+                SetByteCell(row.Cells[5], snapshot.SentBytes);
+                SetCell(row, 6, snapshot.LastError ?? string.Empty);
+                SetCell(
+                    row,
+                    7,
+                    snapshot.State is ProxyInstanceState.Running or ProxyInstanceState.Starting
+                        ? "Пауза"
+                        : "Запустить");
             }
         }
 
-        RestoreSelection(_proxyGrid, selectedId);
+        RemoveStaleRows(_proxyGrid, _proxyRows, seen);
     }
 
     private void RefreshVpnGrid()
     {
-        var selectedId = SelectedRowId(_vpnGrid);
-        _vpnGrid.Rows.Clear();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (_runtimeHost.Current is null)
         {
             foreach (var vpn in _options.VpnConnections)
             {
-                var rowIndex = _vpnGrid.Rows.Add(
-                    vpn.Name,
-                    vpn.Mode.ToString(),
-                    vpn.Shared ? "Shared" : "Dedicated",
-                    "Error",
-                    string.Empty,
-                    0,
-                    "0 B",
-                    "0 B",
-                    "—");
-                _vpnGrid.Rows[rowIndex].Tag = vpn.Id;
+                seen.Add(vpn.Id);
+                var row = GetOrCreateRow(_vpnGrid, _vpnRows, vpn.Id);
+                SetCell(row, 0, vpn.Name);
+                SetCell(row, 1, vpn.Mode.ToString());
+                SetCell(row, 2, vpn.Shared ? "Shared" : "Dedicated");
+                SetCell(row, 3, "Error");
+                SetCell(row, 4, string.Empty);
+                SetCell(row, 5, 0);
+                SetByteCell(row.Cells[6], 0);
+                SetByteCell(row.Cells[7], 0);
+                SetCell(row, 8, "—");
             }
         }
         else
         {
             foreach (var snapshot in _runtimeHost.GetL2tpSnapshots())
             {
-                var rowIndex = _vpnGrid.Rows.Add(
-                    snapshot.Name,
-                    snapshot.Mode.ToString(),
-                    snapshot.Shared ? "Shared" : "Dedicated",
-                    snapshot.State.ToString(),
-                    snapshot.LocalIPv4 ?? string.Empty,
-                    snapshot.ActiveProxyCount,
-                    FormatBytes(snapshot.ReceivedBytes),
-                    FormatBytes(snapshot.SentBytes),
-                    snapshot.AveragePingMilliseconds is double ping
-                        ? $"{ping:F1} ms"
-                        : "—");
-                _vpnGrid.Rows[rowIndex].Tag = snapshot.Id;
+                seen.Add(snapshot.Id);
+                var row = GetOrCreateRow(_vpnGrid, _vpnRows, snapshot.Id);
+                SetCell(row, 0, snapshot.Name);
+                SetCell(row, 1, snapshot.Mode.ToString());
+                SetCell(row, 2, snapshot.Shared ? "Shared" : "Dedicated");
+                SetCell(row, 3, snapshot.State.ToString());
+                SetCell(row, 4, snapshot.LocalIPv4 ?? string.Empty);
+                SetCell(row, 5, snapshot.ActiveProxyCount);
+                SetByteCell(row.Cells[6], snapshot.ReceivedBytes);
+                SetByteCell(row.Cells[7], snapshot.SentBytes);
+                SetPingCell(row.Cells[8], snapshot.AveragePingMilliseconds);
             }
         }
 
-        RestoreSelection(_vpnGrid, selectedId);
+        RemoveStaleRows(_vpnGrid, _vpnRows, seen);
     }
 
     private async void ProxyGridOnCellContentClick(object? sender, DataGridViewCellEventArgs e)
@@ -555,10 +562,10 @@ internal sealed class MainForm : Form
     {
         try
         {
-            // SaveAsync validates the full graph before touching the file.
             await newOptions.SaveAsync(_configPath, CancellationToken.None);
             await _runtimeHost.ApplyOptionsAsync(newOptions, CancellationToken.None);
             _options = newOptions;
+            RebuildVpnNameIndex();
             RefreshRuntimeViews();
         }
         catch (Exception ex)
@@ -616,32 +623,112 @@ internal sealed class MainForm : Form
     {
         _logDirectory.Text = _options.Logging.Directory;
         _retentionDays.Value = Math.Clamp(_options.Logging.RetentionDays, 1, 3650);
-        _effectiveLogPath.Text = AppLog.LogRootDirectory ?? AppContext.BaseDirectory;
+        SetLabelText(_effectiveLogPath, AppLog.LogRootDirectory ?? AppContext.BaseDirectory);
+    }
+
+    private void RebuildVpnNameIndex()
+    {
+        _vpnNames.Clear();
+        foreach (var vpn in _options.VpnConnections)
+        {
+            _vpnNames[vpn.Id] = vpn.Name;
+        }
     }
 
     private string FindVpnName(string vpnId) =>
-        _options.VpnConnections.FirstOrDefault(vpn => vpn.Id.Equals(vpnId, StringComparison.OrdinalIgnoreCase))?.Name
-        ?? vpnId;
+        _vpnNames.TryGetValue(vpnId, out var name) ? name : vpnId;
 
-    private static string? SelectedRowId(DataGridView grid) =>
-        grid.SelectedRows.Count > 0 ? grid.SelectedRows[0].Tag as string : null;
-
-    private static void RestoreSelection(DataGridView grid, string? id)
+    private static DataGridViewRow GetOrCreateRow(
+        DataGridView grid,
+        Dictionary<string, DataGridViewRow> rows,
+        string id)
     {
-        if (id is null)
+        if (rows.TryGetValue(id, out var existing))
+        {
+            return existing;
+        }
+
+        var index = grid.Rows.Add();
+        var row = grid.Rows[index];
+        row.Tag = id;
+        rows.Add(id, row);
+        return row;
+    }
+
+    private static void RemoveStaleRows(
+        DataGridView grid,
+        Dictionary<string, DataGridViewRow> rows,
+        HashSet<string> seen)
+    {
+        List<string>? stale = null;
+        foreach (var id in rows.Keys)
+        {
+            if (!seen.Contains(id))
+            {
+                (stale ??= []).Add(id);
+            }
+        }
+
+        if (stale is null)
         {
             return;
         }
 
-        foreach (DataGridViewRow row in grid.Rows)
+        foreach (var id in stale)
         {
-            if (row.Tag is string rowId && rowId.Equals(id, StringComparison.OrdinalIgnoreCase))
-            {
-                row.Selected = true;
-                break;
-            }
+            var row = rows[id];
+            rows.Remove(id);
+            grid.Rows.Remove(row);
         }
     }
+
+    private static void SetCell(DataGridViewRow row, int index, object? value)
+    {
+        var cell = row.Cells[index];
+        if (!Equals(cell.Value, value))
+        {
+            cell.Value = value;
+        }
+    }
+
+    private static void SetByteCell(DataGridViewCell cell, long value)
+    {
+        var normalized = Math.Max(0, value);
+        if (cell.Tag is long previous && previous == normalized)
+        {
+            return;
+        }
+
+        cell.Tag = normalized;
+        cell.Value = FormatBytes(normalized);
+    }
+
+    private static void SetPingCell(DataGridViewCell cell, double? value)
+    {
+        if (cell.Tag is double previous && value is double current && previous.Equals(current))
+        {
+            return;
+        }
+
+        if (cell.Tag is null && value is null)
+        {
+            return;
+        }
+
+        cell.Tag = value;
+        cell.Value = value is double ping ? $"{ping:F1} ms" : "—";
+    }
+
+    private static void SetLabelText(Label label, string text)
+    {
+        if (!string.Equals(label.Text, text, StringComparison.Ordinal))
+        {
+            label.Text = text;
+        }
+    }
+
+    private static string? SelectedRowId(DataGridView grid) =>
+        grid.SelectedRows.Count > 0 ? grid.SelectedRows[0].Tag as string : null;
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
@@ -681,15 +768,14 @@ internal sealed class MainForm : Form
     private static string FormatBytes(long value)
     {
         var bytes = Math.Max(0, value);
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
         var unit = 0;
         var number = (double)bytes;
-        while (number >= 1024 && unit < units.Length - 1)
+        while (number >= 1024 && unit < ByteUnits.Length - 1)
         {
             number /= 1024;
             unit++;
         }
 
-        return unit == 0 ? $"{bytes} B" : $"{number:F2} {units[unit]}";
+        return unit == 0 ? $"{bytes} B" : $"{number:F2} {ByteUnits[unit]}";
     }
 }
