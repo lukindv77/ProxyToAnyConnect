@@ -45,8 +45,6 @@ internal sealed class EphemeralRasPhonebook : IDisposable
         var resource = new EphemeralRasPhonebook(sessionRoot, phoneBookPath, entryName);
         try
         {
-            // RAS expects a phone-book path. A zero-length private PBK is initialized by
-            // RasSetEntryProperties when the first entry is written.
             using (File.Create(phoneBookPath))
             {
             }
@@ -135,9 +133,6 @@ internal sealed class EphemeralRasPhonebook : IDisposable
             flags |= RasNative.RasEoRequireMsChap2;
         }
 
-        // Deliberately do NOT set RASEO_RemoteDefaultGateway. Custom sessions are split-tunnel;
-        // proxy sockets select the L2TP interface explicitly and unrelated applications keep
-        // their ordinary Windows default route.
         var entry = new RasNative.RasEntry
         {
             DwSize = checked((uint)Marshal.SizeOf<RasNative.RasEntry>()),
@@ -163,10 +158,10 @@ internal sealed class EphemeralRasPhonebook : IDisposable
 
     private static uint MapEncryption(L2tpEncryptionMode mode) => mode switch
     {
-        L2tpEncryptionMode.None => 0,       // ET_None
-        L2tpEncryptionMode.Required => 1,   // ET_Require
-        L2tpEncryptionMode.Maximum => 2,    // ET_RequireMax
-        L2tpEncryptionMode.Optional => 3,   // ET_Optional
+        L2tpEncryptionMode.None => 0,
+        L2tpEncryptionMode.Required => 1,
+        L2tpEncryptionMode.Maximum => 2,
+        L2tpEncryptionMode.Optional => 3,
         _ => throw new ArgumentOutOfRangeException(nameof(mode))
     };
 
@@ -194,9 +189,11 @@ internal sealed class EphemeralRasPhonebook : IDisposable
             }
 
             var capacity = checked((int)((bufferSize + structureSize - 1) / structureSize));
-            devices = Enumerable.Range(0, capacity)
-                .Select(_ => new RasNative.RasDevInfo { DwSize = structureSize })
-                .ToArray();
+            devices = new RasNative.RasDevInfo[capacity];
+            for (var index = 0; index < devices.Length; index++)
+            {
+                devices[index].DwSize = structureSize;
+            }
 
             result = RasNative.RasEnumDevicesW(devices, ref bufferSize, out count);
             if (result != RasNative.ErrorSuccess)
@@ -207,15 +204,21 @@ internal sealed class EphemeralRasPhonebook : IDisposable
 
             if (count < devices.Length)
             {
-                devices = devices.Take(checked((int)count)).ToArray();
+                Array.Resize(ref devices, checked((int)count));
             }
         }
 
-        var l2tp = devices.FirstOrDefault(device =>
-            device.SzDeviceType.Equals("vpn", StringComparison.OrdinalIgnoreCase) &&
-            device.SzDeviceName.Contains("L2TP", StringComparison.OrdinalIgnoreCase));
+        foreach (var device in devices)
+        {
+            if (string.Equals(device.SzDeviceType, "vpn", StringComparison.OrdinalIgnoreCase) &&
+                device.SzDeviceName is { Length: > 0 } name &&
+                name.Contains("L2TP", StringComparison.OrdinalIgnoreCase))
+            {
+                return device;
+            }
+        }
 
-        return l2tp ?? throw new InvalidOperationException(
+        throw new InvalidOperationException(
             "Windows RAS did not expose an L2TP VPN device (normally 'WAN Miniport (L2TP)').");
     }
 
@@ -263,7 +266,6 @@ internal sealed class EphemeralRasPhonebook : IDisposable
         }
         catch
         {
-            // Best-effort cleanup continues with filesystem removal below.
         }
 
         try
