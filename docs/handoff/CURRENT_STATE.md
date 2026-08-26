@@ -1,190 +1,150 @@
 # ProxyToAnyConnect — current handoff state
 
-> Snapshot prepared 2026-08-26 for moving development to a new ChatGPT conversation. **Live GitHub `main` remains authoritative.** The next chat must still fetch the current head, issues/comments and Actions status before changing code.
+> Prepared 2026-08-26 for continuation in a new ChatGPT conversation. Live GitHub `main` is authoritative. The next chat must fetch the current head, issue comments and exact-head Actions before changing code.
 
-## Snapshot baseline
+## Snapshot identity
 
 - Repository: `lukindv77/ProxyToAnyConnect` (private)
 - Branch: `main`
-- Platform: Windows 11 x64
-- Runtime: C# / .NET 10 `net10.0-windows`
-- GUI: WinForms + tray
-- Code head immediately before this handoff-doc commit: `71a93e5d529225adfd0e1b5125a4302d81c58da5` (`test: stabilize proxy setup timing guard`)
-- Its parent production framing commit: `f9db53f074d6740296e46452077622099b6f64ff` (`fix: enforce plain HTTP request framing`)
+- Platform/runtime: Windows 11 x64, C# / .NET 10 `net10.0-windows`, WinForms + tray
+- Production HTTP-framing commit: `f9db53f074d6740296e46452077622099b6f64ff`
+- Timing-test commit: `71a93e5d529225adfd0e1b5125a4302d81c58da5`
+- First refreshed handoff docs commit: `b3fbe1f96c0ffa7d031cb72b81793ec6ea9c2858`
 
-## Exact known CI state before final handoff docs
+## Exact known CI at the refreshed handoff commit
 
-### `71a93e5d...`
+### handoff #84 / run `32982263807`
 
-- build #271 / run `32979967766`: **FAILED** in self-tests.
-- Compilation succeeded with 0 warnings / 0 errors.
-- Failure: `ProxySetupTimingSelfTests` text-span parser median `5859 ns/op` vs immediate predecessor `3350 ns/op` = `1.75x`, limit `1.25x`.
-- This commit changed only benchmark warmup/sample size (`2048` warmup, `32768` ops/round); the 1.25x policy threshold was not weakened.
-- handoff #83 / run `32979967788`: **SUCCESS**, source handoff archive uploaded.
+**SUCCESS.** GitHub Actions artifact:
 
-### `f9db53f...`
+`ProxyToAnyConnect-handoff-b3fbe1f96c0ffa7d031cb72b81793ec6ea9c2858`
 
-- build #270 / run `32979190505`: **FAILED** at the same setup-timing guard (`5322` vs `3206 ns/op`, `1.66x`, limit `1.25x`).
-- Compilation and all earlier self-tests succeeded.
-- New HTTP framing suite was later in the runner and therefore did not execute before the timing failure.
+Artifact id `9611924335`, size 211286 bytes, SHA-256:
 
-Do not describe the current code baseline as green until a later exact-head build proves it.
+`5b9307c6a184f3a6bf4ddc47b60af6569ea4a3611940f7cb7d9b527eaa72aa6b`
 
-## Product / immutable architecture
+### build #272 / run `32982263806`
 
-ProxyToAnyConnect exposes one or more local HTTP/HTTPS forward proxy listeners. Every proxy routes only through its selected L2TP runtime. Domain selection is external (for example PAC). There is no DIRECT fallback.
+Compilation succeeded with 0 warnings / 0 errors and the suite progressed through the setup timing gate.
 
-Hard invariants:
+Important passes before failure:
 
-- always GUI; `X` hides to tray; only explicit Exit terminates the process;
-- multiple independent proxy instances with bind IPv4/port/timeouts/max concurrency/state/RX/TX and independent Pause/Resume;
-- shared/dedicated L2TP lease model;
-- first lease dials/verifies, last lease disconnects;
-- ExistingWindowsProfile and CustomEphemeral private `.pbk` modes;
-- DPAPI-only storage for password/PSK;
-- keepalive Off / PPP internal server IPv4 / CustomIPv4;
-- JSONL append-only logs with retention and no secrets/body/tunnel contents;
-- HTTPS CONNECT only, no MITM;
-- proxy traffic never DIRECT;
-- all outbound sockets bind source L2TP IPv4 + `IP_UNICAST_IF`;
-- proxied DNS is custom L2TP-bound DNS, never `System.Net.Dns`;
-- split-tunnel existing-profile preflight and default-route before/after/continuous guard;
-- lifecycle `Disconnected -> Dialing -> Verifying -> Ready`, with context hidden until Ready;
-- L2TP-bound HTTPS verification and expected-public-IP equality when configured as IPv4 literal;
-- VPN loss cancels dependent active sessions;
-- accepted proxy sessions drain before the higher-level runtime may release its L2TP lease;
-- performance/latency/throughput and bounded whole-process memory are equal first-class constraints.
+- selective reconfigure/cancellation/lifetime tests;
+- 250 selective reconfigure cycles: proxy retained 0, L2TP retained 0;
+- incremental header terminator scan;
+- parser/origin allocation guard;
+- **proxy setup paired timing guard PASS**: parser `1999 vs 2042 ns/op = 0.98x`, origin `973 vs 1222 ns/op = 0.80x`;
+- CONNECT syntax-only parser setup guard.
 
-## Major implemented subsystems
+Current failure:
 
-### GUI/config/runtime
+`ProxyHttpFramingSelfTests.ExactContentLengthBoundsClientToOriginBytesAsync`
 
-- WinForms main form + tray lifecycle.
-- Proxy and L2TP add/edit/remove settings flows.
-- Multiple configured `Proxies[]` and `VpnConnections[]`.
-- Per-proxy runtime state and metrics.
-- L2TP latest status/reason GUI field backed by bounded `VpnLatestStatusRegistry`.
-- Selective reconfigure: only changed VPNs and their dependent proxies are recreated; independent groups retain exact runtime object identity.
-- Canonical enabled listener collision validation uses parsed `IPAddress`, so textual aliases like `127.1` and `127.0.0.1` cannot bind the same endpoint unnoticed.
+`ReadToEndAsync` receives `IOException` with inner Windows `SocketException 10054` (connection forcibly closed by remote host) while reading the proxy response.
 
-### L2TP/RAS
+Therefore the current code baseline is **not green**, but the old timing blocker is not the immediate problem anymore. The suite now reaches #14 framing tests.
 
-- Existing Windows L2TP profile enumeration and split-tunnel validation.
-- Current-user/all-user phonebook handling.
-- Custom ephemeral private phonebook creation/cleanup without persistent Windows Settings profile.
-- Windows DPAPI protection of custom secrets.
-- Native RAS device/entry/PSK smoke tests on Windows runner.
+## Immutable architecture/product rules
+
+- Always GUI; form `X` hides to tray; process exit only explicit Exit.
+- Multiple independent proxy listeners with bind IPv4/port/timeouts/max concurrency/state/RX/TX and Pause/Resume.
+- Shared/dedicated L2TP lease model; first lease dial+verify, last release disconnect.
+- Existing Windows profile + CustomEphemeral private `.pbk` modes.
+- Password/PSK protected by user-bound Windows DPAPI only.
+- Keepalive Off / PPP server internal IPv4 / CustomIPv4 with fail-closed threshold/reconnect.
+- JSONL append-only daily logs with retention and no secrets/body/tunnel contents.
+- No DIRECT fallback.
+- Outbound TCP uses source L2TP IPv4 `Bind()` + `IP_UNICAST_IF`.
+- Proxied DNS is custom L2TP-bound DNS, never `System.Net.Dns`.
+- Existing profile must be L2TP + split tunnel; default IPv4 route guarded before/after dial and continuously.
+- Lifecycle `Disconnected -> Dialing -> Verifying -> Ready`; no usable context before Ready.
+- Real L2TP-bound HTTPS verification; fixed expected public IPv4 must match.
+- VPN loss cancels dependent active sessions.
+- HTTPS via CONNECT, no MITM.
+- `ProxyServer.RunAsync` drains accepted sessions before higher runtime may release L2TP lease.
+- Performance/latency/throughput and bounded whole-process memory are first-class constraints; no production forced GC.
+
+## Major implemented blocks
+
+- WinForms/tray lifecycle and settings UI.
+- Multi-proxy runtime, shared/dedicated `VpnLeaseManager`, independent Pause/Resume.
+- Existing Windows L2TP profile enumeration/validation and current/all-user handling.
+- Custom ephemeral RAS phonebook + DPAPI secrets + Windows native phonebook/PSK/cleanup smoke test.
 - RAS client IPv4, PPP server IPv4, interface index and DNS discovery.
-- Per-RAS-session monitor CTS/task ownership: disconnect cancels and joins the exact old monitor; stale monitor cannot hang up a replacement handle.
-- Default-route snapshot guard before/after dial and continuous while Ready.
-- Keepalive/reconnect architecture and bounded reconnect status diagnostics.
+- Source address + interface socket binding.
+- Split-tunnel/default-route guards.
+- L2TP-bound HTTPS verification.
+- L2TP-bound DNS UDP/TCP fallback/CNAME/bounded TTL cache.
+- Plain HTTP forward proxy + CONNECT.
+- `ArrayPool<byte>` transfer buffers and bounded session admission.
+- Deterministic accepted-session shutdown drain.
+- Traffic counters and rolling ping metrics.
+- Append-only logs and retention.
+- Bounded latest L2TP status registry + GUI status/reason.
+- Deterministic `VpnContext` ownership.
+- Per-RAS-session monitor CTS/task ownership; stale monitor cannot hang up replacement handle.
+- Selective reconfigure exact identity preservation for unrelated groups.
+- Runtime start/reconfigure cancellation reconciliation.
+- Process memory health latest snapshot and lifetime stress tests.
 
-### VPN context/network fail-closed
+## Recent hardening results
 
-- `VpnContext` lifetime/ref-count ownership so active outbound sessions retain a disconnected context until they close; final release disposes CTS deterministically.
-- Outbound TCP socket source address + interface binding.
-- L2TP-bound DNS UDP with TCP fallback, CNAME handling and bounded TTL cache scoped to current VPN context.
-- HTTPS verification through L2TP-bound sockets.
+- listener collision validation uses parsed `IPAddress`, so equivalent textual IPv4 representations cannot bypass uniqueness;
+- 250 selective-reconfigure cycles preserve unrelated object identity;
+- recorded retained replacements: `ProxyInstanceRuntime` 0/250, `VpnLeaseManager` 0/250;
+- HTTP header delimiter search is incremental/boundary-safe;
+- current setup timing self-test uses paired alternating measurement and passes on build #272.
 
-### Proxy server
+## Issue #14 — HTTP framing/request-smuggling
 
-- Plain HTTP forwarding and bidirectional CONNECT.
-- `ArrayPool<byte>` transfer buffers; no full tunnel buffering.
-- Per-proxy `maxConcurrentConnections` admission before Accept; Windows backlog supplies backpressure.
-- Accepted-session drain before `RunAsync` returns.
-- Incremental header terminator search starting no earlier than 3 bytes before newly appended data, avoiding repeated whole-prefix rescans under fragmented headers.
-- Hop-by-hop/proxy header handling.
+Code implemented in `f9db53f...`:
 
-### HTTP framing hardening now in code — issue #14
+- strict single non-negative decimal `Content-Length`;
+- reject duplicates/conflicts/comma lists;
+- reject any Transfer-Encoding/TE+CL;
+- no CL => body length zero;
+- reject header-read remainder beyond CL before outbound connect;
+- forward exactly CL bytes;
+- never forward trailing/pipelined/smuggled bytes on same origin connection;
+- early EOF fails;
+- valid CL preserved;
+- CONNECT unchanged.
 
-Commit `f9db53f...` changed plain HTTP framing to fail closed:
+New `ProxyHttpFramingSelfTests` is wired into `CombinedTestRunner`.
 
-- framing parsed before outbound connection;
-- exactly one valid non-negative decimal `Content-Length` accepted;
-- duplicate/conflicting/comma-list CL rejected;
-- any `Transfer-Encoding` rejected (including TE+CL) until decode/re-encode exists;
-- no CL => zero body;
-- header-read remainder cannot exceed declared body length;
-- body forwarding is bounded to exactly CL bytes;
-- later pipelined/smuggled bytes are not forwarded to the origin;
-- early client EOF before CL completes fails the session;
-- valid CL is preserved in rewritten origin header;
-- CONNECT path remains opaque and unchanged.
+Current exact Windows failure occurs in the exact-CL smuggling-boundary scenario while the test client reads the proxy response and sees socket reset 10054. Likely hypotheses to verify, not assume:
 
-New `ProxyHttpFramingSelfTests` covers parser framing, pre-outbound rejection, exact-body forwarding, smuggling/trailing-byte boundary and early EOF scenarios. `CombinedTestRunner` invokes it, but current timing gate fails earlier, so exact Windows execution of this new suite still needs to be reached.
+- closing the proxy client while malicious trailing bytes remain unread may cause Windows to send RST even after a valid origin response;
+- proxy may instead be closing too early before complete response;
+- test may incorrectly require clean EOF rather than reading/verifying a known response before reset.
 
-## Performance/memory work already completed
+The invariant that bytes after CL never reach origin must not be weakened. #14 remains open until the test and behavior are made deterministic and exact-head Windows CI is green through framing coverage.
 
-- pooled data-path buffers;
-- bounded header storage and incremental delimiter scan;
-- reduced parser/origin header allocations with self-tests;
-- bounded DNS cache and optimized DNS parsing/materialization paths;
-- bounded latest-status registry;
-- stable in-place GUI row updates;
-- process memory-health latest snapshot only;
-- no in-memory log history;
-- deterministic observer/monitor/context cleanup;
-- production never forces GC.
+## Issue #15 — transactional proxy startup ownership
 
-Important measured regression evidence from previous green runs includes:
+Confirmed pending lifecycle bug: `ProxyInstanceRuntime.StartAsync` can publish `_lease`, `_runCancellation`, `_runTask`, then fail/cancel in `WaitUntilListeningAsync` and cleanup without first awaiting exact run-task drain or clearing already-published fields.
 
-- 250 selective reconfigure cycles preserved independent-group runtime identities;
-- retained replaced `ProxyInstanceRuntime`: 0/250;
-- retained replaced `VpnLeaseManager`: 0/250;
-- proxy lifecycle stress and shutdown-drain tests passed;
-- CONNECT throughput numbers are diagnostic only and are not hard product thresholds.
+Required failure order:
 
-## Latest audit finding — issue #15
+`cancel exact run CTS -> await exact runTask drain -> clear same-generation fields -> dispose CTS -> release exact lease once`.
 
-`ProxyInstanceRuntime.StartAsync` currently has an ownership hole during startup failure/cancellation after `ProxyServer.RunAsync` has been created and instance fields assigned.
+Preserve caller cancellation, safe retry, Pause/Dispose idempotence, no double release/unobserved observers and successful Running behavior.
 
-Current sequence includes:
+Planned test seam is orchestration-only: injectable lease acquisition + server lifetime (`RunAsync`, `WaitUntilListeningAsync`). Production networking chain remains unchanged.
 
-1. acquire VPN lease;
-2. create run CTS and proxy server;
-3. start `runTask`;
-4. assign `_lease`, `_runCancellation`, `_runTask`;
-5. await `WaitUntilListeningAsync(cancellationToken)`.
+## Issue map at snapshot
 
-If step 5 throws/cancels, current catch can cancel/dispose local resources and dispose the lease without first awaiting exact `runTask` completion and without clearing already assigned ownership fields. Risks:
+Open: `#2, #4, #5, #6, #7, #11, #13, #14, #15`
 
-- stale disposed `_lease` / `_runCancellation` fields;
-- still-cleaning `_runTask` retained in runtime;
-- release of last L2TP lease before listener/session drain completes;
-- retry/observer interaction and potential double-cleanup complexity.
+Closed: `#1, #3, #8, #9, #10, #12`
 
-Issue #15 acceptance requires startup as a transactional generation ownership unit: cancel run -> await exact run drain -> clear matching fields -> dispose CTS -> release exact lease once; cancellation propagation, safe retry, idempotent Pause/Dispose and no unobserved observer task.
+#2 remains the mandatory real Windows 11 + real L2TP E2E gap. #4/#5/#6/#7 retain real-environment acceptance. #11 and #13 remain ongoing performance/memory/lifetime programs.
 
-Planned test seam: internal injectable lease acquisition and proxy-server lifetime abstraction (`RunAsync`/`WaitUntilListeningAsync`) only at orchestration layer. Production constructor continues using the existing real VPN/DNS/socket/proxy chain; no hot-path or routing semantics should change.
+## Immediate continuation order
 
-## Current roadmap issue state at snapshot
-
-Open:
-
-- #2 real Windows 11 + real L2TP E2E;
-- #4 multi-proxy/shared-dedicated acceptance;
-- #5 settings/selective reload real-environment acceptance;
-- #6 custom ephemeral real endpoint validation;
-- #7 keepalive/reconnect real endpoint validation;
-- #11 performance/memory ongoing;
-- #13 long-run memory/resource stability ongoing;
-- #14 HTTP framing/request-smuggling hardening — code present, exact acceptance blocked by timing gate;
-- #15 transactional startup ownership — audit/acceptance recorded, implementation pending.
-
-Closed:
-
-- #1, #3, #8, #9, #10, #12.
-
-## First work in the next chat
-
-1. Fetch live head/actions/issues and confirm no commit appeared after this handoff.
-2. Inspect `ProxySetupTimingSelfTests` and current `ParsedProxyRequest.Parse` together. Do not merely widen the 1.25x limit.
-3. Determine why current parser measures 1.66–1.75x slower than its immediate-predecessor benchmark after HTTP framing bookkeeping. Fix production code or benchmark comparability as justified by source-level evidence.
-4. Run exact-head Windows CI until the suite reaches and executes `ProxyHttpFramingSelfTests`; resolve any framing correctness/performance failures.
-5. Update/close #14 only after exact-head semantic and performance gates pass.
-6. Implement #15 transactional startup ownership with deterministic failure/cancel/drain/retry/single-release tests.
-7. Continue broader #11/#13 hardening and real Windows #2/#4/#5/#6/#7 acceptance work.
-
-## Handoff archive
-
-`.github/workflows/handoff.yml` packages the exact checked-out commit into `ProxyToAnyConnect-handoff-<sha>` and includes `src`, `tests`, `docs`, `.github`, README, solution and `HANDOFF_BUILD_INFO.txt`. Start the new chat with `docs/handoff/NEW_CHAT_PROMPT.md` from the latest handoff artifact or live `main`.
+1. Fetch live current head and exact Actions; confirm no later commits.
+2. Reproduce/audit build #272 framing failure in `ExactContentLengthBoundsClientToOriginBytesAsync`.
+3. Preserve exact Content-Length smuggling boundary; determine reset-vs-response semantics and make test/production behavior deterministic.
+4. Get exact-head Windows CI through `ProxyHttpFramingSelfTests`; update/close #14 only after semantic + performance gates pass.
+5. Implement #15 transactional startup ownership with deterministic fail/cancel/drain/retry/single-release tests.
+6. Continue broad #11/#13 and real Windows acceptance work.

@@ -1,73 +1,66 @@
 # ProxyToAnyConnect handoff manifest
 
-This manifest defines the minimum material a new development chat must inspect before continuing. Live GitHub is authoritative.
+Live GitHub is authoritative. This manifest defines minimum reading and archive behavior for the new conversation.
 
-## Required reading
+## Read first
 
-1. `docs/handoff/NEW_CHAT_PROMPT.md` — first-message prompt for the new chat.
-2. `docs/handoff/CURRENT_STATE.md` — exact implementation/CI snapshot.
-3. `docs/handoff/AUDIT_SNAPSHOT.md` — engineering findings, races and architectural rationale.
-4. `docs/handoff/ISSUES_SNAPSHOT.md` — roadmap snapshot.
-5. `docs/requirements.md` — normative product/runtime requirements.
-6. `docs/architecture.md` — system architecture.
-7. `docs/memory-stability.md` — deterministic ownership, bounded memory and latency-neutral optimization rules.
-8. `docs/windows-integration-test.md` — real Windows/L2TP validation plan.
-9. `README.md`.
-10. `.github/workflows/build.yml` and `.github/workflows/handoff.yml`.
+1. `docs/handoff/NEW_CHAT_PROMPT.md`
+2. `docs/handoff/CURRENT_STATE.md`
+3. `docs/handoff/AUDIT_SNAPSHOT.md`
+4. `docs/handoff/ISSUES_SNAPSHOT.md`
+5. `docs/handoff/HANDOFF_INDEX.md`
+6. `docs/requirements.md`
+7. `docs/architecture.md`
+8. `docs/memory-stability.md`
+9. `docs/windows-integration-test.md`
+10. `README.md`
+11. `.github/workflows/build.yml`
+12. `.github/workflows/handoff.yml`
 
-## Code areas to inspect before architecture changes
+Before changing architecture inspect current `Configuration`, `Gui`, `Runtime`, `Proxy`, `Network`, `Vpn`, `Diagnostics` and `tests/ProxyToAnyConnect.SelfTests`.
 
-- `src/ProxyToAnyConnect/Configuration/`
-- `src/ProxyToAnyConnect/Gui/`
-- `src/ProxyToAnyConnect/Runtime/`
-- `src/ProxyToAnyConnect/Proxy/`
-- `src/ProxyToAnyConnect/Network/`
-- `src/ProxyToAnyConnect/Vpn/`
-- `src/ProxyToAnyConnect/Diagnostics/`
-- `tests/ProxyToAnyConnect.SelfTests/`
+## Live facts the new chat must query
 
-## Live state the next chat must query
+- current `main` SHA;
+- exact-head `build` and `handoff` conclusions;
+- latest issue states/comments;
+- newer commits after this package;
+- latest artifacts.
 
-- exact current `main` SHA;
-- exact-head `build` and `handoff` Actions status;
-- current open/closed issues and newest comments;
-- commits made after this snapshot;
-- latest build and handoff artifacts.
+Never infer green CI from older heads.
 
-Never infer green CI from an older head.
+## Handoff archive
 
-## Handoff source archive
-
-`.github/workflows/handoff.yml` runs on every `main` push and creates an Actions artifact:
+`.github/workflows/handoff.yml` creates GitHub Actions artifact:
 
 `ProxyToAnyConnect-handoff-<github.sha>`
 
-The ZIP contains the exact checked-out revision of:
+It contains exact checked-out `src`, `tests`, `docs`, `.github`, README, solution, `.gitignore` and generated `HANDOFF_BUILD_INFO.txt` with exact commit/ref/run/timestamp and startup prompt path. `bin`, `obj`, `.git` are excluded.
 
-- `src/`
-- `tests/`
-- `docs/` including this manifest and `NEW_CHAT_PROMPT.md`
-- `.github/`
-- `README.md`
-- `ProxyToAnyConnect.sln`
-- `.gitignore`
-- generated `HANDOFF_BUILD_INFO.txt` with repository, exact commit SHA, ref, workflow run, creation UTC, startup prompt path and read-first list.
+Recorded refreshed archive before final status correction:
 
-`bin`, `obj` and `.git` are intentionally excluded. The normal `build` workflow separately creates the self-contained win-x64 application ZIP when its build/self-tests pass.
+- head `b3fbe1f96c0ffa7d031cb72b81793ec6ea9c2858`;
+- handoff #84 / run `32982263807`: success;
+- artifact id `9611924335`;
+- artifact name `ProxyToAnyConnect-handoff-b3fbe1f96c0ffa7d031cb72b81793ec6ea9c2858`;
+- SHA-256 `5b9307c6a184f3a6bf4ddc47b60af6569ea4a3611940f7cb7d9b527eaa72aa6b`.
 
-## Snapshot code/CI baseline immediately before this handoff docs commit
+This final handoff status correction will create a newer handoff artifact; the next chat must use the latest exact-head artifact, not blindly the older id above.
 
-- `f9db53f074d6740296e46452077622099b6f64ff` — HTTP framing/request-smuggling production hardening.
-- `71a93e5d529225adfd0e1b5125a4302d81c58da5` — timing benchmark sample stabilization only; current code head before docs packaging.
-- build #270 on `f9db53f...`: failed in `ProxySetupTimingSelfTests` at 1.66x vs 1.25x limit after successful compilation and earlier suites.
-- build #271 on `71a93e5d...`: failed in the same test at 1.75x vs 1.25x limit. Compilation succeeded; framing suite is later in runner and has not yet executed in exact Windows CI.
-- handoff #83 on `71a93e5d...`: success and source archive uploaded.
+## Exact code validation at `b3fbe1f...`
 
-The final handoff documentation commit will have its own `build`/`handoff` runs. The next chat must inspect those exact runs; docs-only commit does not magically make the inherited code-level timing failure green.
+Build #272 / run `32982263806`:
 
-## Immediate continuation order
+- compile succeeded, 0 warnings/errors;
+- paired proxy setup timing guard passed: parser 0.98x, origin 0.80x;
+- framing suite was reached;
+- failed `ProxyHttpFramingSelfTests.ExactContentLengthBoundsClientToOriginBytesAsync` because client `ReadToEndAsync` saw Windows SocketException 10054 / connection reset.
 
-1. Resolve `ProxySetupTimingSelfTests` / current parser performance verdict without casually widening the 1.25x threshold.
-2. Reach and execute `ProxyHttpFramingSelfTests` on Windows CI; complete #14 only if semantic + performance gates pass.
-3. Implement #15 transactional `ProxyInstanceRuntime.StartAsync` ownership: cancel -> drain exact run -> clear same generation -> dispose CTS -> release lease once.
-4. Continue #11/#13 performance/memory/lifetime hardening and real Windows #2/#4/#5/#6/#7 acceptance.
+Thus the current development blocker is the exact Content-Length smuggling-boundary test/connection-close behavior, not the older timing noise.
+
+## Immediate continuation
+
+1. Audit/fix framing reset semantics without allowing any bytes after declared CL to reach origin.
+2. Reach exact-head green `ProxyHttpFramingSelfTests` and finish #14 only after all semantic/performance gates.
+3. Implement #15 transactional `ProxyInstanceRuntime.StartAsync` ownership: cancel -> await exact run drain -> clear same generation -> dispose CTS -> release lease once.
+4. Continue #11/#13 and real Windows #2/#4/#5/#6/#7 acceptance.

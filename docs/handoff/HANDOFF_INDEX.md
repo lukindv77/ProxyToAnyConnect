@@ -1,20 +1,9 @@
 # Handoff package index — 2026-08-26
 
-This repository state is prepared for continuation in a new ChatGPT conversation without restarting the design discussion.
+Start a new conversation with `docs/handoff/NEW_CHAT_PROMPT.md`.
 
-Start with `docs/handoff/NEW_CHAT_PROMPT.md`.
+Then read `CURRENT_STATE.md`, `AUDIT_SNAPSHOT.md`, `ISSUES_SNAPSHOT.md`, `MANIFEST.md`, `docs/requirements.md`, `docs/architecture.md`, `docs/memory-stability.md` and `docs/windows-integration-test.md`.
 
-Read next:
+Current exact known code verdict before this final status-doc commit: build #272 on `b3fbe1f96c0ffa7d031cb72b81793ec6ea9c2858` compiles and passes the paired setup timing guard, then fails the new HTTP framing suite with Windows SocketException 10054 in `ExactContentLengthBoundsClientToOriginBytesAsync`. Issue #14 remains open. Issue #15 is the next confirmed lifecycle implementation after #14.
 
-- `docs/handoff/CURRENT_STATE.md`
-- `docs/handoff/AUDIT_SNAPSHOT.md`
-- `docs/handoff/ISSUES_SNAPSHOT.md`
-- `docs/handoff/MANIFEST.md`
-- `docs/requirements.md`
-- `docs/architecture.md`
-- `docs/memory-stability.md`
-- `docs/windows-integration-test.md`
-
-The GitHub Actions `handoff` workflow creates `ProxyToAnyConnect-handoff-<sha>` from the exact commit and includes this prompt/documentation plus source/tests/workflows and `HANDOFF_BUILD_INFO.txt`.
-
-Important handoff condition: the code baseline immediately before this package is **not green**. Build #271 compiled successfully but failed `ProxySetupTimingSelfTests` at 1.75x vs the 1.25x limit. Do not lose or hide this blocker in the new chat. Issue #14 code is present but its new framing suite has not yet run to completion on Windows CI; issue #15 is the next confirmed lifecycle audit bug after #14 is validated.
+The GitHub Actions `handoff` workflow packages the exact commit into `ProxyToAnyConnect-handoff-<sha>` including the prompt, source, tests, docs, workflows and `HANDOFF_BUILD_INFO.txt`. Always use the latest artifact corresponding to the current `main` head.
