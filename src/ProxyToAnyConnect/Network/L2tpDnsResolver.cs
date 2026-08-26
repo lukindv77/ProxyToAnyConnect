@@ -356,7 +356,7 @@ internal sealed class L2tpDnsResolver
             offset += 4;
         }
 
-        var addresses = new List<IPAddress>();
+        List<IPAddress>? addresses = null;
         string? canonicalName = null;
         uint? minimumTtlSeconds = null;
 
@@ -372,7 +372,8 @@ internal sealed class L2tpDnsResolver
 
             if (type == 1 && dataLength == 4)
             {
-                addresses.Add(new IPAddress(response.Slice(offset, 4)));
+                (addresses ??= new List<IPAddress>()).Add(
+                    new IPAddress(response.Slice(offset, 4)));
                 minimumTtlSeconds = MinTtl(minimumTtlSeconds, ttlSeconds);
             }
             else if (type == 5)
@@ -385,8 +386,11 @@ internal sealed class L2tpDnsResolver
             offset += dataLength;
         }
 
+        IReadOnlyList<IPAddress> parsedAddresses = addresses is null
+            ? Array.Empty<IPAddress>()
+            : addresses;
         return new ParsedDnsResponse(
-            addresses,
+            parsedAddresses,
             canonicalName,
             Truncated: false,
             MinimumTtlSeconds: minimumTtlSeconds);
