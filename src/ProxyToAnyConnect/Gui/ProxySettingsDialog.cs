@@ -12,6 +12,7 @@ internal sealed class ProxySettingsDialog : Form
     private readonly CheckBox _enabled = new() { Text = "Запускать автоматически", AutoSize = true };
     private readonly ComboBox _listenAddress = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly NumericUpDown _listenPort = Numeric(1, 65535);
+    private readonly NumericUpDown _maxConcurrentConnections = Numeric(1, 100000);
     private readonly ComboBox _vpn = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly NumericUpDown _maxHeaderBytes = Numeric(4096, 1024 * 1024);
     private readonly NumericUpDown _clientHeaderTimeout = Numeric(1, 300);
@@ -25,9 +26,9 @@ internal sealed class ProxySettingsDialog : Form
         _id = existing?.Id ?? Guid.NewGuid().ToString("N");
 
         Text = existing is null ? "Новый proxy" : $"Proxy — {existing.Name}";
-        Width = 560;
-        Height = 500;
-        MinimumSize = new Size(500, 440);
+        Width = 580;
+        Height = 540;
+        MinimumSize = new Size(520, 470);
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.Sizable;
         MinimizeBox = false;
@@ -47,12 +48,13 @@ internal sealed class ProxySettingsDialog : Form
         AddRow(layout, 0, "Имя:", _name);
         AddRow(layout, 1, "Bind IPv4:", _listenAddress);
         AddRow(layout, 2, "Bind port:", _listenPort);
-        AddRow(layout, 3, "L2TP:", _vpn);
-        AddRow(layout, 4, "Max HTTP header, bytes:", _maxHeaderBytes);
-        AddRow(layout, 5, "Header timeout, sec:", _clientHeaderTimeout);
-        AddRow(layout, 6, "Connect timeout, sec:", _outboundConnectTimeout);
-        AddRow(layout, 7, "DNS timeout, ms:", _dnsTimeout);
-        layout.Controls.Add(_enabled, 1, 8);
+        AddRow(layout, 3, "Max concurrent connections:", _maxConcurrentConnections);
+        AddRow(layout, 4, "L2TP:", _vpn);
+        AddRow(layout, 5, "Max HTTP header, bytes:", _maxHeaderBytes);
+        AddRow(layout, 6, "Header timeout, sec:", _clientHeaderTimeout);
+        AddRow(layout, 7, "Connect timeout, sec:", _outboundConnectTimeout);
+        AddRow(layout, 8, "DNS timeout, ms:", _dnsTimeout);
+        layout.Controls.Add(_enabled, 1, 9);
 
         var buttons = new FlowLayoutPanel
         {
@@ -62,7 +64,7 @@ internal sealed class ProxySettingsDialog : Form
         };
         var ok = new Button { Text = "OK", AutoSize = true, DialogResult = DialogResult.OK };
         var cancel = new Button { Text = "Отмена", AutoSize = true, DialogResult = DialogResult.Cancel };
-        ok.Click += (_, e) =>
+        ok.Click += (_, _) =>
         {
             try
             {
@@ -76,7 +78,7 @@ internal sealed class ProxySettingsDialog : Form
         };
         buttons.Controls.Add(ok);
         buttons.Controls.Add(cancel);
-        layout.Controls.Add(buttons, 0, 10);
+        layout.Controls.Add(buttons, 0, 11);
         layout.SetColumnSpan(buttons, 2);
 
         Controls.Add(layout);
@@ -93,6 +95,7 @@ internal sealed class ProxySettingsDialog : Form
         Enabled = _enabled.Checked,
         ListenAddress = _listenAddress.SelectedItem?.ToString() ?? string.Empty,
         ListenPort = decimal.ToInt32(_listenPort.Value),
+        MaxConcurrentConnections = decimal.ToInt32(_maxConcurrentConnections.Value),
         VpnConnectionId = (_vpn.SelectedItem as VpnItem)?.Id ?? string.Empty,
         MaxHeaderBytes = decimal.ToInt32(_maxHeaderBytes.Value),
         ClientHeaderTimeoutSeconds = decimal.ToInt32(_clientHeaderTimeout.Value),
@@ -105,6 +108,7 @@ internal sealed class ProxySettingsDialog : Form
         _name.Text = existing?.Name ?? $"Proxy {vpnConnections.Count + 1}";
         _enabled.Checked = existing?.Enabled ?? true;
         _listenPort.Value = existing?.ListenPort ?? 18080;
+        _maxConcurrentConnections.Value = existing?.MaxConcurrentConnections ?? 512;
         _maxHeaderBytes.Value = existing?.MaxHeaderBytes ?? 65536;
         _clientHeaderTimeout.Value = existing?.ClientHeaderTimeoutSeconds ?? 15;
         _outboundConnectTimeout.Value = existing?.OutboundConnectTimeoutSeconds ?? 15;
@@ -189,7 +193,7 @@ internal sealed class ProxySettingsDialog : Form
             Dock = DockStyle.Fill,
             Padding = new Padding(12),
             ColumnCount = 2,
-            RowCount = 11,
+            RowCount = 12,
             AutoScroll = true
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
