@@ -61,6 +61,15 @@ internal sealed class ProxyRuntimeHost : IAsyncDisposable
             await current.ReconfigureAsync(options, cancellationToken);
             Volatile.Write(ref _configurationError, null);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Caller cancellation is not a configuration-validation failure. The coordinator
+            // keeps any unfinished desired starts pending so a later apply can reconcile them.
+            AppLog.Warning(
+                "runtime.reconfigure.cancelled",
+                "Selective runtime reconfiguration was cancelled by the caller.");
+            throw;
+        }
         catch (Exception ex)
         {
             // Existing unaffected runtime groups remain alive if selective reconfiguration fails.
