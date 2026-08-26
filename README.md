@@ -21,6 +21,7 @@ Windows 11 x64 GUI application that exposes one or more local HTTP/HTTPS proxy l
 5. HTTPS uses normal HTTP `CONNECT`; ProxyToAnyConnect does not intercept or decrypt TLS.
 6. L2TP is not usable by proxy traffic until active verification reaches `Ready`.
 7. Loss of a verified L2TP context cancels dependent active proxy tunnels fail-closed.
+8. Memory/resource use must remain bounded during long-running operation, and memory optimization must not increase proxy forwarding latency/jitter or reduce sustained throughput.
 
 ## GUI lifecycle
 
@@ -141,4 +142,5 @@ During this refactor, `main` may temporarily contain incomplete integration comm
 
 - [`docs/requirements.md`](docs/requirements.md) — current product requirements and runtime semantics
 - [`docs/architecture.md`](docs/architecture.md) — implementation architecture (being updated during the refactor)
+- [`docs/memory-stability.md`](docs/memory-stability.md) — long-run memory/resource stability and latency-preserving optimization rules
 - [`docs/windows-integration-test.md`](docs/windows-integration-test.md) — Windows integration test procedure (will be expanded for multi-proxy scenarios)
