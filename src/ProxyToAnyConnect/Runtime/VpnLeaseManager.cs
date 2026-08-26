@@ -10,10 +10,11 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromMilliseconds(500);
 
     private readonly L2tpOptions _options;
-    private readonly RasConnectionManager _connectionManager;
+    private readonly IVpnConnectionController _connectionManager;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly HashSet<string> _consumers = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly CancellationToken _lifetimeToken;
 
     private CancellationTokenSource? _maintenanceCancellation;
     private Task? _maintenanceTask;
@@ -21,18 +22,26 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     private int _disposed;
 
     public VpnLeaseManager(L2tpOptions options)
+        : this(options, null)
     {
-        _options = options;
+    }
+
+    internal VpnLeaseManager(
+        L2tpOptions options,
+        IVpnConnectionController? connectionManager)
+    {
+        _options = options ?? throw new ArgumentNullException(nameof(options));
         Metrics = new L2tpRuntimeMetrics();
         DnsCache = new L2tpDnsCache();
-        _connectionManager = new RasConnectionManager(options, Metrics);
+        _connectionManager = connectionManager ?? new RasConnectionManager(options, Metrics);
+        _lifetimeToken = _lifetime.Token;
     }
 
     public string Id => _options.Id;
     public string Name => _options.Name;
     public bool Shared => _options.Shared;
     public L2tpOptions Options => _options;
-    public RasConnectionManager ConnectionManager => _connectionManager;
+    public IVpnConnectionController ConnectionManager => _connectionManager;
     public L2tpRuntimeMetrics Metrics { get; }
     public L2tpDnsCache DnsCache { get; }
     public int ActiveProxyCount => Volatile.Read(ref _activeProxyCount);
@@ -42,7 +51,12 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(proxyId);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        await _gate.WaitAsync(cancellationToken);
+        using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _lifetimeToken);
+        var operationToken = operationCancellation.Token;
+
+        await _gate.WaitAsync(operationToken);
         try
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -63,7 +77,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
 
             try
             {
-                await _connectionManager.ConnectAsync(cancellationToken);
+                await _connectionManager.ConnectAsync(operationToken);
             }
             catch
             {
@@ -119,7 +133,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
 
             AppLog.Info(
                 "vpn.lease.released",
-                "Proxy released its L2TP runtime lease.",
+                "Proxy released an L2TP runtime lease.",
                 new
                 {
                     VpnId = _options.Id,
@@ -154,7 +168,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         }
 
         _maintenanceCancellation?.Dispose();
-        _maintenanceCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _maintenanceCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeToken);
         _maintenanceTask = MaintainConnectionAsync(_maintenanceCancellation.Token);
     }
 
@@ -305,7 +319,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             _proxyId = proxyId;
         }
 
-        public RasConnectionManager ConnectionManager => _owner._connectionManager;
+        public IVpnConnectionController ConnectionManager => _owner._connectionManager;
         public L2tpDnsCache DnsCache => _owner.DnsCache;
 
         public async ValueTask DisposeAsync()
