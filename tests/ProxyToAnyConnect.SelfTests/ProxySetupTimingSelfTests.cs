@@ -6,9 +6,10 @@ namespace ProxyToAnyConnect.SelfTests;
 
 internal static class ProxySetupTimingSelfTests
 {
-    private const int WarmupIterations = 2048;
+    private const int WarmupIterations = 16384;
     private const int TimingRounds = 9;
-    private const int IterationsPerRound = 32768;
+    private const int PairSamplesPerRound = 8;
+    private const int IterationsPerBatch = 8192;
     private const double MaxMedianSlowdownRatio = 1.25;
     private const string OriginPath = "/path?q=1";
 
@@ -31,14 +32,15 @@ internal static class ProxySetupTimingSelfTests
             var raw = BuildRepresentativeHeader();
             var optimizedRequest = ProxyServer.ParsedProxyRequest.Parse(raw);
             var predecessorRequest = CurrentTextSpanParse(raw);
-            var legacyParserRequest = LegacySplitParse(raw);
+            var framingEquivalentParserRequest = FramingAwareSplitParse(raw);
 
-            if (!string.Equals(optimizedRequest.Method, legacyParserRequest.Method, StringComparison.Ordinal) ||
-                !string.Equals(optimizedRequest.Target, legacyParserRequest.Target, StringComparison.Ordinal) ||
-                !string.Equals(optimizedRequest.Version, legacyParserRequest.Version, StringComparison.Ordinal))
+            if (!string.Equals(optimizedRequest.Method, framingEquivalentParserRequest.Method, StringComparison.Ordinal) ||
+                !string.Equals(optimizedRequest.Target, framingEquivalentParserRequest.Target, StringComparison.Ordinal) ||
+                !string.Equals(optimizedRequest.Version, framingEquivalentParserRequest.Version, StringComparison.Ordinal) ||
+                optimizedRequest.ContentLength != framingEquivalentParserRequest.ContentLength)
             {
                 throw new InvalidOperationException(
-                    "Timing parser baseline does not match current request-line semantics.");
+                    "Timing parser baseline does not match current request/framing semantics.");
             }
 
             var optimizedOrigin = optimizedRequest.BuildOriginHeader(OriginPath);
@@ -49,35 +51,38 @@ internal static class ProxySetupTimingSelfTests
                     "Timing baseline does not match current origin-header bytes.");
             }
 
-            for (var i = 0; i < WarmupIterations; i++)
-            {
-                GC.KeepAlive(ProxyServer.ParsedProxyRequest.Parse(raw));
-                GC.KeepAlive(LegacySplitParse(raw));
-                GC.KeepAlive(optimizedRequest.BuildOriginHeader(OriginPath));
-                GC.KeepAlive(CurrentDirectBuildOriginHeader(predecessorRequest, OriginPath));
-            }
-
             Action optimizedParser = () =>
                 GC.KeepAlive(ProxyServer.ParsedProxyRequest.Parse(raw));
             Action predecessorParser = () =>
-                GC.KeepAlive(LegacySplitParse(raw));
+                GC.KeepAlive(FramingAwareSplitParse(raw));
             Action optimizedOriginBuilder = () =>
                 GC.KeepAlive(optimizedRequest.BuildOriginHeader(OriginPath));
             Action predecessorOriginBuilder = () =>
                 GC.KeepAlive(CurrentDirectBuildOriginHeader(predecessorRequest, OriginPath));
 
+            WarmUpPaired(optimizedParser, predecessorParser);
+            PrepareMeasurementGeneration();
             var parserTiming = MeasurePaired(optimizedParser, predecessorParser);
+
+            WarmUpPaired(optimizedOriginBuilder, predecessorOriginBuilder);
+            PrepareMeasurementGeneration();
             var originTiming = MeasurePaired(optimizedOriginBuilder, predecessorOriginBuilder);
 
-            AssertNoMaterialSlowdown("text-span parser", parserTiming);
-            AssertNoMaterialSlowdown("stack-token origin builder", originTiming);
+            AssertNoMaterialSlowdown(
+                "text-span parser",
+                "framing-equivalent Split predecessor",
+                parserTiming);
+            AssertNoMaterialSlowdown(
+                "stack-token origin builder",
+                "direct+HashSet immediate predecessor",
+                originTiming);
 
             Console.WriteLine(
                 $"PASS: proxy setup paired timing guard " +
                 $"(parser {parserTiming.OptimizedMedianNs:F0} vs " +
                 $"{parserTiming.PredecessorMedianNs:F0} ns/op, " +
-                $"{parserTiming.Ratio:F2}x; origin {originTiming.OptimizedMedianNs:F0} vs " +
-                $"{originTiming.PredecessorMedianNs:F0} ns/op, {originTiming.Ratio:F2}x)");
+                $"paired {parserTiming.Ratio:F2}x; origin {originTiming.OptimizedMedianNs:F0} vs " +
+                $"{originTiming.PredecessorMedianNs:F0} ns/op, paired {originTiming.Ratio:F2}x)");
             return 0;
         }
         catch (Exception ex)
@@ -87,43 +92,94 @@ internal static class ProxySetupTimingSelfTests
         }
     }
 
+    private static void WarmUpPaired(Action optimized, Action predecessor)
+    {
+        for (var i = 0; i < WarmupIterations; i++)
+        {
+            if ((i & 1) == 0)
+            {
+                optimized();
+                predecessor();
+            }
+            else
+            {
+                predecessor();
+                optimized();
+            }
+        }
+    }
+
+    private static void PrepareMeasurementGeneration()
+    {
+        // Test harness only: start each independently measured path from a comparable
+        // GC phase. Collection cost caused by the measured workload itself remains
+        // inside the timing samples and is therefore still part of the regression gate.
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: false);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: false);
+    }
+
     private static TimingResult MeasurePaired(Action optimized, Action predecessor)
     {
         var optimizedRounds = new double[TimingRounds];
         var predecessorRounds = new double[TimingRounds];
+        var pairedRoundRatios = new double[TimingRounds];
+        var operationsPerRound = checked(PairSamplesPerRound * IterationsPerBatch);
+        var nanosecondsPerTick = 1_000_000_000.0 / Stopwatch.Frequency;
 
         for (var round = 0; round < TimingRounds; round++)
         {
-            if ((round & 1) == 0)
+            long optimizedTicks = 0;
+            long predecessorTicks = 0;
+            var pairRatios = new double[PairSamplesPerRound];
+
+            for (var pair = 0; pair < PairSamplesPerRound; pair++)
             {
-                optimizedRounds[round] = MeasureNanosecondsPerOperation(optimized);
-                predecessorRounds[round] = MeasureNanosecondsPerOperation(predecessor);
+                long optimizedBatchTicks;
+                long predecessorBatchTicks;
+                if (((round + pair) & 1) == 0)
+                {
+                    optimizedBatchTicks = MeasureBatchTicks(optimized);
+                    predecessorBatchTicks = MeasureBatchTicks(predecessor);
+                }
+                else
+                {
+                    predecessorBatchTicks = MeasureBatchTicks(predecessor);
+                    optimizedBatchTicks = MeasureBatchTicks(optimized);
+                }
+
+                optimizedTicks += optimizedBatchTicks;
+                predecessorTicks += predecessorBatchTicks;
+                pairRatios[pair] = (double)optimizedBatchTicks / predecessorBatchTicks;
             }
-            else
-            {
-                predecessorRounds[round] = MeasureNanosecondsPerOperation(predecessor);
-                optimizedRounds[round] = MeasureNanosecondsPerOperation(optimized);
-            }
+
+            optimizedRounds[round] =
+                optimizedTicks * nanosecondsPerTick / operationsPerRound;
+            predecessorRounds[round] =
+                predecessorTicks * nanosecondsPerTick / operationsPerRound;
+
+            // Gate on a ratio computed from adjacent, order-balanced batch pairs rather
+            // than on the ratio of two independent global medians. Taking the median
+            // pair ratio inside each round rejects one-off hosted-runner scheduling or
+            // CPU-migration stalls without hiding sustained slowdown.
+            pairedRoundRatios[round] = Median(pairRatios);
         }
 
-        var optimizedMedian = Median(optimizedRounds);
-        var predecessorMedian = Median(predecessorRounds);
         return new TimingResult(
-            optimizedMedian,
-            predecessorMedian,
-            optimizedMedian / predecessorMedian);
+            Median(optimizedRounds),
+            Median(predecessorRounds),
+            Median(pairedRoundRatios));
     }
 
-    private static double MeasureNanosecondsPerOperation(Action action)
+    private static long MeasureBatchTicks(Action action)
     {
         var started = Stopwatch.GetTimestamp();
-        for (var i = 0; i < IterationsPerRound; i++)
+        for (var i = 0; i < IterationsPerBatch; i++)
         {
             action();
         }
 
-        var elapsedTicks = Stopwatch.GetTimestamp() - started;
-        return elapsedTicks * (1_000_000_000.0 / Stopwatch.Frequency) / IterationsPerRound;
+        return Stopwatch.GetTimestamp() - started;
     }
 
     private static double Median(double[] values)
@@ -133,7 +189,10 @@ internal static class ProxySetupTimingSelfTests
         return ordered[ordered.Length / 2];
     }
 
-    private static void AssertNoMaterialSlowdown(string path, TimingResult result)
+    private static void AssertNoMaterialSlowdown(
+        string path,
+        string predecessorDescription,
+        TimingResult result)
     {
         if (result.Ratio <= MaxMedianSlowdownRatio)
         {
@@ -142,8 +201,9 @@ internal static class ProxySetupTimingSelfTests
 
         throw new InvalidOperationException(
             $"{path} median was {result.OptimizedMedianNs:F0} ns/op versus " +
-            $"{result.PredecessorMedianNs:F0} ns/op for the immediate predecessor " +
-            $"({result.Ratio:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
+            $"{result.PredecessorMedianNs:F0} ns/op for the {predecessorDescription}; " +
+            $"paired median ratio was {result.Ratio:F2}x " +
+            $"(limit {MaxMedianSlowdownRatio:F2}x).");
     }
 
     private static byte[] BuildRepresentativeHeader() =>
@@ -155,6 +215,7 @@ internal static class ProxySetupTimingSelfTests
             "Accept-Language: en-US,en;q=0.9\r\n" +
             "Cache-Control: no-cache\r\n" +
             "Pragma: no-cache\r\n" +
+            "Content-Length: 0\r\n" +
             "Connection: X-Hop, keep-alive\r\n" +
             "X-Hop: remove-me\r\n" +
             "X-Request-Id: 0123456789abcdef\r\n" +
@@ -220,9 +281,12 @@ internal static class ProxySetupTimingSelfTests
         return new TimingRequest(method, target, version, headers);
     }
 
-    // Test-only older Split-based parser used as the timing predecessor after the
-    // byte-span experiment was rejected for excessive CPU cost.
-    private static TimingRequest LegacySplitParse(ReadOnlySpan<byte> headerBytes)
+    // Test-only framing-equivalent version of the older Split-based parser.
+    // The historical pre-framing parser did less work, so comparing current production
+    // parsing against it directly would charge mandatory security validation as a
+    // performance regression. This baseline keeps the old Split traversal/allocation
+    // strategy while applying the same plain-HTTP header/framing rules as production.
+    private static TimingRequest FramingAwareSplitParse(ReadOnlySpan<byte> headerBytes)
     {
         var text = Encoding.Latin1.GetString(headerBytes);
         var lines = text.Split("\r\n", StringSplitOptions.None);
@@ -237,21 +301,127 @@ internal static class ProxySetupTimingSelfTests
             throw new InvalidDataException("Invalid HTTP proxy request line.");
         }
 
+        if (requestLine[0].Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
+        {
+            for (var i = 1; i < lines.Length && lines[i].Length > 0; i++)
+            {
+                if (lines[i].IndexOf(':') <= 0)
+                {
+                    throw new InvalidDataException("Invalid HTTP header line.");
+                }
+            }
+
+            return new TimingRequest(
+                requestLine[0],
+                requestLine[1],
+                requestLine[2],
+                [],
+                0);
+        }
+
         var headers = new List<TimingHeaderLine>();
+        long? contentLength = null;
+        var hasTransferEncoding = false;
         for (var i = 1; i < lines.Length && lines[i].Length > 0; i++)
         {
-            var separator = lines[i].IndexOf(':');
-            if (separator <= 0)
+            var line = lines[i].AsSpan();
+            var separator = line.IndexOf(':');
+            if (separator <= 0 || char.IsWhiteSpace(line[separator - 1]))
             {
                 throw new InvalidDataException("Invalid HTTP header line.");
             }
 
-            headers.Add(new TimingHeaderLine(
-                lines[i][..separator].Trim(),
-                lines[i][(separator + 1)..].Trim()));
+            var name = line[..separator];
+            if (!IsValidHeaderName(name))
+            {
+                throw new InvalidDataException("Invalid HTTP header name.");
+            }
+
+            var value = line[(separator + 1)..].Trim();
+            headers.Add(new TimingHeaderLine(name.ToString(), value.ToString()));
+
+            if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+            {
+                if (contentLength.HasValue)
+                {
+                    throw new InvalidDataException(
+                        "Multiple Content-Length fields are not accepted by this proxy.");
+                }
+
+                contentLength = ParseContentLength(value);
+            }
+            else if (name.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
+            {
+                hasTransferEncoding = true;
+            }
         }
 
-        return new TimingRequest(requestLine[0], requestLine[1], requestLine[2], headers);
+        if (hasTransferEncoding && contentLength.HasValue)
+        {
+            throw new InvalidDataException(
+                "Requests containing both Transfer-Encoding and Content-Length are rejected.");
+        }
+
+        if (hasTransferEncoding)
+        {
+            throw new NotSupportedException(
+                "Transfer-Encoding request bodies are not supported; use Content-Length.");
+        }
+
+        return new TimingRequest(
+            requestLine[0],
+            requestLine[1],
+            requestLine[2],
+            headers,
+            contentLength ?? 0);
+    }
+
+    private static long ParseContentLength(ReadOnlySpan<char> value)
+    {
+        if (value.IsEmpty)
+        {
+            throw new InvalidDataException("Content-Length is empty.");
+        }
+
+        long result = 0;
+        foreach (var character in value)
+        {
+            if (character is < '0' or > '9')
+            {
+                throw new InvalidDataException(
+                    "Content-Length must be a non-negative decimal integer.");
+            }
+
+            var digit = character - '0';
+            if (result > (long.MaxValue - digit) / 10)
+            {
+                throw new InvalidDataException("Content-Length is too large.");
+            }
+
+            result = result * 10 + digit;
+        }
+
+        return result;
+    }
+
+    private static bool IsValidHeaderName(ReadOnlySpan<char> name)
+    {
+        if (name.IsEmpty)
+        {
+            return false;
+        }
+
+        foreach (var character in name)
+        {
+            if (character > 0x7F ||
+                !(char.IsAsciiLetterOrDigit(character) ||
+                  character is '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     // Test-only immediate predecessor of the bounded stack Connection-token path:
@@ -359,7 +529,8 @@ internal static class ProxySetupTimingSelfTests
         string Method,
         string Target,
         string Version,
-        List<TimingHeaderLine> Headers);
+        List<TimingHeaderLine> Headers,
+        long ContentLength = 0);
 
     private readonly record struct TimingHeaderLine(string Name, string Value);
 }
