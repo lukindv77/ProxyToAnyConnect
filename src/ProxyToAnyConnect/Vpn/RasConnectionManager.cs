@@ -2,12 +2,14 @@ using System.Net;
 using System.Runtime.InteropServices;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
+using ProxyToAnyConnect.Runtime;
 
 namespace ProxyToAnyConnect.Vpn;
 
 internal sealed class RasConnectionManager : IAsyncDisposable
 {
     private readonly L2tpOptions _options;
+    private readonly L2tpRuntimeMetrics? _metrics;
     private readonly WindowsVpnProfileInspector _profileInspector;
     private readonly WindowsDefaultRouteInspector _routeInspector;
     private readonly VpnConnectivityVerifier _connectivityVerifier;
@@ -22,9 +24,10 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     private int _state = (int)VpnConnectionState.Disconnected;
     private int _disposed;
 
-    public RasConnectionManager(L2tpOptions options)
+    public RasConnectionManager(L2tpOptions options, L2tpRuntimeMetrics? metrics = null)
     {
         _options = options;
+        _metrics = metrics;
         _profileInspector = new WindowsVpnProfileInspector();
         _routeInspector = new WindowsDefaultRouteInspector();
         _connectivityVerifier = new VpnConnectivityVerifier(options.Verification);
@@ -54,9 +57,15 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 AppLog.Warning(
                     "vpn.reconnect.cooldown_active",
                     "L2TP reconnect was skipped because a previous fail-closed attempt is cooling down.",
-                    new { EntryName = _options.EntryName, RetryAfterMilliseconds = retryRemaining });
+                    new { VpnId = _options.Id, VpnName = _options.Name, RetryAfterMilliseconds = retryRemaining });
                 throw new InvalidOperationException(
                     $"L2TP reconnect cooldown is active for another {retryRemaining} ms.");
+            }
+
+            if (_options.Mode != L2tpConnectionMode.ExistingWindowsProfile)
+            {
+                throw new NotSupportedException(
+                    $"L2TP connection '{_options.Name}' uses CustomEphemeral mode, which is not wired to RAS dialing yet.");
             }
 
             SetState(VpnConnectionState.Dialing);
@@ -73,6 +82,8 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                     "Windows VPN profile passed L2TP split-tunnel validation.",
                     new
                     {
+                        VpnId = _options.Id,
+                        VpnName = _options.Name,
                         profile.Name,
                         profile.TunnelType,
                         profile.SplitTunneling,
@@ -90,7 +101,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 AppLog.Info(
                     "vpn.routes.validated",
                     "IPv4 default-route set remained unchanged after RasDial.",
-                    new { DefaultRouteCount = routesBefore.Routes.Count });
+                    new { VpnId = _options.Id, VpnName = _options.Name, DefaultRouteCount = routesBefore.Routes.Count });
 
                 var verification = await _connectivityVerifier.VerifyAsync(
                     result.Context,
@@ -130,9 +141,9 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                     "vpn.connection.rejected",
                     "L2TP connection did not pass fail-closed verification.",
                     ex,
-                    new { EntryName = _options.EntryName });
+                    new { VpnId = _options.Id, VpnName = _options.Name, EntryName = _options.EntryName });
                 throw new InvalidOperationException(
-                    $"L2TP connection '{_options.EntryName}' did not pass fail-closed verification.",
+                    $"L2TP connection '{_options.Name}' did not pass fail-closed verification.",
                     ex);
             }
         }
@@ -162,6 +173,8 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             "RAS dial parameters were loaded from the Windows phone book.",
             new
             {
+                VpnId = _options.Id,
+                VpnName = _options.Name,
                 EntryName = _options.EntryName,
                 HasSavedPassword = hasSavedPassword,
                 PhoneBookScope = phoneBook is null ? "CurrentUserDefault" : "ExplicitAllUsers"
@@ -183,16 +196,23 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
         try
         {
-            var localAddress = GetAssignedIPv4(handle);
-            var interfaceInfo = VpnInterfaceResolver.ResolveByAddress(localAddress);
-            var context = new VpnContext(_options.EntryName, localAddress, interfaceInfo);
+            var projection = GetProjection(handle);
+            var interfaceInfo = VpnInterfaceResolver.ResolveByAddress(projection.LocalIPv4);
+            var context = new VpnContext(
+                _options.EntryName,
+                projection.LocalIPv4,
+                interfaceInfo,
+                projection.ServerIPv4);
             AppLog.Info(
                 "vpn.ras.connected",
                 "RAS established the L2TP connection and assigned an IPv4 address.",
                 new
                 {
+                    VpnId = _options.Id,
+                    VpnName = _options.Name,
                     EntryName = _options.EntryName,
-                    LocalIPv4 = localAddress.ToString(),
+                    LocalIPv4 = projection.LocalIPv4.ToString(),
+                    ServerIPv4 = projection.ServerIPv4?.ToString(),
                     interfaceInfo.Name,
                     interfaceInfo.InterfaceIndex
                 });
@@ -205,7 +225,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         }
     }
 
-    private static IPAddress GetAssignedIPv4(nint handle)
+    private static PppProjection GetProjection(nint handle)
     {
         var projection = new RasNative.RasPppIp
         {
@@ -231,14 +251,25 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 $"PPP IPv4 negotiation failed: {RasNative.DescribeError(projection.DwError)}");
         }
 
-        if (!IPAddress.TryParse(projection.SzIpAddress, out var address) ||
-            address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+        if (!IPAddress.TryParse(projection.SzIpAddress, out var localAddress) ||
+            localAddress.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
         {
             throw new InvalidOperationException(
                 $"RAS returned an invalid IPv4 address: '{projection.SzIpAddress}'.");
         }
 
-        return address;
+        IPAddress? serverAddress = null;
+        if (!string.IsNullOrWhiteSpace(projection.SzServerIpAddress))
+        {
+            if (!IPAddress.TryParse(projection.SzServerIpAddress, out serverAddress) ||
+                serverAddress.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            {
+                throw new InvalidOperationException(
+                    $"RAS returned an invalid PPP server IPv4 address: '{projection.SzServerIpAddress}'.");
+            }
+        }
+
+        return new PppProjection(localAddress, serverAddress);
     }
 
     private async Task MonitorAsync(
@@ -251,10 +282,11 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
         var projectionTask = MonitorProjectionAsync(handle, context, monitorCancellation.Token);
         var routeTask = MonitorDefaultRoutesAsync(routeBaseline, monitorCancellation.Token);
+        var keepaliveTask = MonitorKeepaliveAsync(context, monitorCancellation.Token);
 
         try
         {
-            var completedTask = await Task.WhenAny(projectionTask, routeTask);
+            var completedTask = await Task.WhenAny(projectionTask, routeTask, keepaliveTask);
             await completedTask;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -267,8 +299,14 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 "vpn.monitor.fail_closed",
                 "Continuous L2TP guard rejected the active connection.",
                 ex,
-                new { context.EntryName, LocalIPv4 = context.LocalIPv4.ToString(), context.InterfaceIndex });
-            Console.Error.WriteLine($"L2TP fail-closed monitor rejected the active connection: {ex.Message}");
+                new
+                {
+                    VpnId = _options.Id,
+                    VpnName = _options.Name,
+                    context.EntryName,
+                    LocalIPv4 = context.LocalIPv4.ToString(),
+                    context.InterfaceIndex
+                });
         }
         finally
         {
@@ -276,7 +314,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
             try
             {
-                await Task.WhenAll(projectionTask, routeTask);
+                await Task.WhenAll(projectionTask, routeTask, keepaliveTask);
             }
             catch (OperationCanceledException) when (monitorCancellation.IsCancellationRequested)
             {
@@ -284,8 +322,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             }
             catch
             {
-                // The first failure has already been handled above. A concurrent secondary
-                // monitor failure does not change the fail-closed action below.
+                // The first failure has already been handled above.
             }
         }
 
@@ -297,7 +334,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             AppLog.Warning(
                 "vpn.ras.hangup",
                 "RAS connection was hung up after a continuous fail-closed guard failure.",
-                new { context.EntryName });
+                new { VpnId = _options.Id, VpnName = _options.Name, context.EntryName });
         }
     }
 
@@ -310,11 +347,11 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
         while (await timer.WaitForNextTickAsync(cancellationToken))
         {
-            var currentAddress = GetAssignedIPv4(handle);
-            if (!currentAddress.Equals(context.LocalIPv4))
+            var projection = GetProjection(handle);
+            if (!projection.LocalIPv4.Equals(context.LocalIPv4))
             {
                 throw new IOException(
-                    $"L2TP IPv4 changed from {context.LocalIPv4} to {currentAddress} while the connection was Ready.");
+                    $"L2TP IPv4 changed from {context.LocalIPv4} to {projection.LocalIPv4} while the connection was Ready.");
             }
         }
     }
@@ -333,6 +370,83 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         }
     }
 
+    private async Task MonitorKeepaliveAsync(VpnContext context, CancellationToken cancellationToken)
+    {
+        if (_options.Keepalive.Mode == L2tpKeepaliveMode.Off)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return;
+        }
+
+        var target = ResolveKeepaliveTarget(context);
+        var failureCount = 0;
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(_options.Keepalive.IntervalSeconds));
+
+        while (await timer.WaitForNextTickAsync(cancellationToken))
+        {
+            var result = await IcmpBoundPing.SendAsync(
+                context.LocalIPv4,
+                target,
+                TimeSpan.FromMilliseconds(_options.Keepalive.TimeoutMilliseconds),
+                cancellationToken);
+
+            if (result.Success && result.RoundTripTime is TimeSpan rtt)
+            {
+                var recovered = failureCount > 0;
+                failureCount = 0;
+                _metrics?.Ping.AddSuccessfulSample(rtt);
+
+                if (recovered)
+                {
+                    AppLog.Info(
+                        "vpn.keepalive.recovered",
+                        "L2TP keepalive recovered after previous failures.",
+                        new
+                        {
+                            VpnId = _options.Id,
+                            VpnName = _options.Name,
+                            Target = target.ToString(),
+                            RoundTripMilliseconds = rtt.TotalMilliseconds
+                        });
+                }
+
+                continue;
+            }
+
+            failureCount++;
+            AppLog.Warning(
+                "vpn.keepalive.failed",
+                "L2TP keepalive probe failed.",
+                new
+                {
+                    VpnId = _options.Id,
+                    VpnName = _options.Name,
+                    Target = target.ToString(),
+                    FailureCount = failureCount,
+                    FailureThreshold = _options.Keepalive.FailureThreshold,
+                    result.ErrorCode
+                });
+
+            if (failureCount >= _options.Keepalive.FailureThreshold)
+            {
+                throw new IOException(
+                    $"L2TP keepalive failed {failureCount} consecutive times for {target}.");
+            }
+        }
+    }
+
+    private IPAddress ResolveKeepaliveTarget(VpnContext context)
+    {
+        return _options.Keepalive.Mode switch
+        {
+            L2tpKeepaliveMode.VpnServerInternalIPv4 => context.ServerIPv4
+                ?? throw new InvalidOperationException(
+                    "RAS did not provide the PPP server IPv4 required by VpnServerInternalIPv4 keepalive."),
+            L2tpKeepaliveMode.CustomIPv4 => IPAddress.Parse(_options.Keepalive.CustomIPv4),
+            _ => throw new InvalidOperationException($"Unsupported keepalive mode '{_options.Keepalive.Mode}'.")
+        };
+    }
+
     private void ArmReconnectCooldown(string reason)
     {
         if (_options.ReconnectCooldownMilliseconds <= 0)
@@ -348,7 +462,8 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             "L2TP reconnect cooldown was armed after a fail-closed event.",
             new
             {
-                EntryName = _options.EntryName,
+                VpnId = _options.Id,
+                VpnName = _options.Name,
                 _options.ReconnectCooldownMilliseconds,
                 Reason = reason
             });
@@ -386,7 +501,14 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             AppLog.Info(
                 "vpn.state",
                 "VPN lifecycle state changed.",
-                new { Previous = previous.ToString(), Current = state.ToString(), EntryName = _options.EntryName });
+                new
+                {
+                    VpnId = _options.Id,
+                    VpnName = _options.Name,
+                    Previous = previous.ToString(),
+                    Current = state.ToString(),
+                    EntryName = _options.EntryName
+                });
         }
     }
 
@@ -407,7 +529,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 AppLog.Info(
                     "vpn.ras.hangup",
                     "RAS connection was disconnected.",
-                    new { EntryName = _options.EntryName });
+                    new { VpnId = _options.Id, VpnName = _options.Name, EntryName = _options.EntryName });
             }
         }
         finally
@@ -443,4 +565,5 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     }
 
     private sealed record ConnectionResult(nint Handle, VpnContext Context);
+    private readonly record struct PppProjection(IPAddress LocalIPv4, IPAddress? ServerIPv4);
 }
