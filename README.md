@@ -141,11 +141,10 @@ Open roadmap work currently includes:
 - #5 — settings UI/validation and real Windows interaction validation
 - #6 — real custom ephemeral L2TP endpoint validation
 - #7 — real keepalive/reconnect validation
-- #10 — runtime metrics/status acceptance against real L2TP traffic
 - #11 — ongoing process-wide performance/memory optimization
 - #13 — ongoing long-run memory/resource stability audit
 
-Completed roadmap milestones include #1, #3, #8, #9 and #12. Always query GitHub for the current issue state rather than relying on this README snapshot.
+Completed roadmap milestones include #1, #3, #8, #9, #10 and #12. Always query GitHub for the current issue state rather than relying on this README snapshot.
 
 ## New-chat handoff
 
