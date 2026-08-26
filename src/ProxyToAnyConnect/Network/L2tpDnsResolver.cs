@@ -254,33 +254,62 @@ internal sealed class L2tpDnsResolver
         }
     }
 
-    private static byte[] BuildQuery(string host, ushort transactionId)
+    internal static byte[] BuildQuery(string host, ushort transactionId)
     {
-        using var stream = new MemoryStream();
-        Span<byte> header = stackalloc byte[12];
-        BinaryPrimitives.WriteUInt16BigEndian(header, transactionId);
-        BinaryPrimitives.WriteUInt16BigEndian(header[2..], 0x0100);
-        BinaryPrimitives.WriteUInt16BigEndian(header[4..], 1);
-        stream.Write(header);
-
-        foreach (var label in host.Split('.'))
+        var qnameByteCount = 0;
+        var labelStart = 0;
+        while (labelStart <= host.Length)
         {
-            var bytes = Encoding.ASCII.GetBytes(label);
-            if (bytes.Length is 0 or > 63)
+            var remaining = host.AsSpan(labelStart);
+            var dot = remaining.IndexOf('.');
+            var label = dot < 0 ? remaining : remaining[..dot];
+            var labelByteCount = Encoding.ASCII.GetByteCount(label);
+            if (labelByteCount is 0 or > 63)
             {
                 throw new InvalidOperationException($"Invalid DNS label in '{host}'.");
             }
 
-            stream.WriteByte((byte)bytes.Length);
-            stream.Write(bytes);
+            qnameByteCount = checked(qnameByteCount + 1 + labelByteCount);
+            if (dot < 0)
+            {
+                break;
+            }
+
+            labelStart += dot + 1;
         }
 
-        stream.WriteByte(0);
-        Span<byte> questionTail = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt16BigEndian(questionTail, 1);
-        BinaryPrimitives.WriteUInt16BigEndian(questionTail[2..], 1);
-        stream.Write(questionTail);
-        return stream.ToArray();
+        var query = GC.AllocateUninitializedArray<byte>(
+            checked(12 + qnameByteCount + 1 + 4));
+        var destination = query.AsSpan();
+        destination[..12].Clear();
+        BinaryPrimitives.WriteUInt16BigEndian(destination, transactionId);
+        BinaryPrimitives.WriteUInt16BigEndian(destination[2..], 0x0100);
+        BinaryPrimitives.WriteUInt16BigEndian(destination[4..], 1);
+
+        var written = 12;
+        labelStart = 0;
+        while (labelStart <= host.Length)
+        {
+            var remaining = host.AsSpan(labelStart);
+            var dot = remaining.IndexOf('.');
+            var label = dot < 0 ? remaining : remaining[..dot];
+            var labelByteCount = Encoding.ASCII.GetByteCount(label);
+            destination[written++] = checked((byte)labelByteCount);
+            written += Encoding.ASCII.GetBytes(label, destination[written..]);
+
+            if (dot < 0)
+            {
+                break;
+            }
+
+            labelStart += dot + 1;
+        }
+
+        destination[written++] = 0;
+        BinaryPrimitives.WriteUInt16BigEndian(destination[written..], 1);
+        written += 2;
+        BinaryPrimitives.WriteUInt16BigEndian(destination[written..], 1);
+        return query;
     }
 
     internal static ParsedDnsResponse ParseResponse(ReadOnlySpan<byte> response, ushort transactionId)
