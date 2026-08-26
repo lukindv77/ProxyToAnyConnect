@@ -28,6 +28,33 @@ jobs:
             exit 1
           }
 
+      - name: Smoke-test Windows integration evidence
+        shell: pwsh
+        run: |
+          $output = './artifacts/integration-evidence-smoke'
+          ./tools/Invoke-WindowsIntegrationEvidence.ps1 `
+            -Stage Baseline `
+            -OutputDirectory $output `
+            -SkipExternalProbes | Write-Host
+
+          $evidencePath = Join-Path $output 'baseline/evidence.json'
+          $summaryPath = Join-Path $output 'baseline/summary.json'
+          if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf)) {
+            throw "Evidence harness did not create $evidencePath"
+          }
+          if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+            throw "Evidence harness did not create $summaryPath"
+          }
+
+          $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
+          $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+          if ($evidence.schemaVersion -ne 1 -or $evidence.stage -ne 'Baseline') {
+            throw 'Evidence harness emitted an unexpected schema/stage.'
+          }
+          if ($summary.stage -ne 'Baseline' -or $summary.failedAssertionCount -ne 0) {
+            throw 'Baseline evidence smoke test unexpectedly reported failed assertions.'
+          }
+
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:
