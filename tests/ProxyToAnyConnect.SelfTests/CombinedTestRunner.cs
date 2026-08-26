@@ -56,12 +56,17 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        if (VpnContextLifetimeSelfTests.Run() != 0)
+        {
+            return 1;
+        }
+
         if (await ProxyDataPathSelfTests.RunAsync() != 0)
         {
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
