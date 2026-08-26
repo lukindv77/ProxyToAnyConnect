@@ -51,7 +51,12 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed self-tests passed.");
+        if (await ProxyDataPathSelfTests.RunAsync() != 0)
+        {
+            return 1;
+        }
+
+        Console.WriteLine("All extended fail-closed and data-path self-tests passed.");
         return 0;
     }
 }
