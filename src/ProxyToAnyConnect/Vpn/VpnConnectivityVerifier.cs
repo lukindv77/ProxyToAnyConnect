@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Globalization;
 using System.Net;
 using System.Net.Security;
@@ -11,6 +12,8 @@ namespace ProxyToAnyConnect.Vpn;
 
 internal sealed class VpnConnectivityVerifier
 {
+    private const int InitialResponseBufferBytes = 4 * 1024;
+
     private readonly VerificationOptions _options;
     private readonly L2tpDnsResolver _dnsResolver;
 
@@ -153,31 +156,94 @@ internal sealed class VpnConnectivityVerifier
         return address;
     }
 
-    private static async Task<byte[]> ReadResponseAsync(
+    internal static async Task<byte[]> ReadResponseAsync(
         Stream stream,
         int maxResponseBytes,
         CancellationToken cancellationToken)
     {
-        using var response = new MemoryStream();
-        var buffer = new byte[4096];
-
-        while (true)
+        var pool = ArrayPool<byte>.Shared;
+        var maximumBufferedBytes = maxResponseBytes switch
         {
-            var read = await stream.ReadAsync(buffer, cancellationToken);
-            if (read == 0)
+            < 0 => 1,
+            int.MaxValue => int.MaxValue,
+            _ => maxResponseBytes + 1
+        };
+        var buffer = pool.Rent(Math.Max(1, Math.Min(InitialResponseBufferBytes, maximumBufferedBytes)));
+        var length = 0;
+
+        try
+        {
+            while (true)
             {
-                break;
+                var writable = Math.Min(
+                    buffer.Length - length,
+                    maximumBufferedBytes - length);
+                if (writable == 0)
+                {
+                    if (length == maximumBufferedBytes)
+                    {
+                        var overflowProbe = pool.Rent(1);
+                        try
+                        {
+                            var overflowRead = await stream.ReadAsync(
+                                overflowProbe.AsMemory(0, 1),
+                                cancellationToken);
+                            if (overflowRead == 0)
+                            {
+                                break;
+                            }
+
+                            throw new IOException(
+                                "L2TP verification response exceeded the configured size limit.");
+                        }
+                        finally
+                        {
+                            pool.Return(overflowProbe, clearArray: false);
+                        }
+                    }
+
+                    var doubledCapacity = buffer.Length <= int.MaxValue / 2
+                        ? buffer.Length * 2
+                        : int.MaxValue;
+                    var nextCapacity = Math.Min(
+                        maximumBufferedBytes,
+                        Math.Max(length + 1, doubledCapacity));
+                    var replacement = pool.Rent(nextCapacity);
+                    buffer.AsSpan(0, length).CopyTo(replacement);
+                    pool.Return(buffer, clearArray: false);
+                    buffer = replacement;
+                    continue;
+                }
+
+                var read = await stream.ReadAsync(
+                    buffer.AsMemory(length, writable),
+                    cancellationToken);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                length += read;
+                if (length > maxResponseBytes)
+                {
+                    throw new IOException(
+                        "L2TP verification response exceeded the configured size limit.");
+                }
             }
 
-            if (response.Length + read > maxResponseBytes)
+            if (length == 0)
             {
-                throw new IOException("L2TP verification response exceeded the configured size limit.");
+                return [];
             }
 
-            response.Write(buffer, 0, read);
+            var result = GC.AllocateUninitializedArray<byte>(length);
+            buffer.AsSpan(0, length).CopyTo(result);
+            return result;
         }
-
-        return response.ToArray();
+        finally
+        {
+            pool.Return(buffer, clearArray: false);
+        }
     }
 
     internal static byte[] ParseHttpSuccessBody(ReadOnlySpan<byte> response)
