@@ -2,27 +2,58 @@
 
 ## Goal
 
-ProxyToAnyConnect is a Windows 11 x64 local HTTP/HTTPS proxy. It owns the lifecycle of one configured Windows L2TP/RAS connection and sends proxy-originated traffic only through that connection.
+ProxyToAnyConnect is a Windows 11 x64 WinForms application that exposes one or more local HTTP/HTTPS forward-proxy listeners. Each proxy instance references one configured L2TP connection and sends its outbound traffic exclusively through the verified runtime context of that L2TP connection.
 
-The application is intentionally not a system-wide VPN client. Applications that do not use the local proxy must continue to use their normal Windows network path.
+The application is not a system-wide VPN client. Applications that do not use a ProxyToAnyConnect listener must continue to use their normal Windows network path. There is no DIRECT fallback inside ProxyToAnyConnect.
 
-## Fixed requirements
+`docs/requirements.md` is the product source of truth. This document describes the current implementation architecture.
 
-- C# / .NET 10 (`net10.0-windows`).
-- The application calls Windows RAS itself to establish the configured L2TP entry.
-- The IPv4 assigned by the L2TP server is discovered at runtime through RAS PPP projection information.
-- The RAS IPv4 is mapped to the corresponding Windows network interface to obtain its interface index and VPN DNS servers.
-- The proxy listens on loopback only.
-- HTTP proxying is supported.
-- HTTPS is supported through the standard HTTP `CONNECT` method; TLS is end-to-end and is not intercepted.
-- There is no DIRECT fallback inside the proxy.
-- DNS resolution for proxied hostnames is performed through sockets bound to the current L2TP IPv4 and interface.
-- Every proxy-originated TCP connection is bound to the current L2TP IPv4 and explicitly constrained to the current L2TP interface before `connect()`.
-- If the L2TP context disappears, its lifetime token is cancelled and active proxy tunnels are terminated.
-- If no verified L2TP context exists, an incoming proxy request may trigger a new `RasDial`; if dialing or verification fails, the request fails closed.
-- The host IPv4 default-route set is continuously monitored while the VPN is `Ready`; a change invalidates the current VPN context and tears down the RAS connection.
+## Runtime topology
 
-## VPN lifecycle
+Persistent configuration contains two independent catalogs:
+
+- `Proxies[]` — listener/runtime settings;
+- `VpnConnections[]` — L2TP settings.
+
+Each proxy has a stable ID, bind IPv4/port, timeouts, `maxConcurrentConnections`, enabled state and one referenced L2TP ID.
+
+Each L2TP configuration is either:
+
+- **shared** — multiple running proxies may lease the same verified RAS session;
+- **dedicated** — only one proxy may reference/use it.
+
+`ProxyRuntimeCoordinator` owns the configured proxy and L2TP runtime objects. `ProxyInstanceRuntime` owns one listener lifetime and one active VPN lease. `VpnLeaseManager` owns the L2TP runtime, DNS cache, aggregate metrics and maintenance/reconnect lifetime.
+
+The first active proxy lease establishes/verifies the L2TP connection. Additional shared leases reuse it. Releasing the last lease disconnects RAS and clears connection-scoped DNS state. Pause/Resume operates independently per proxy.
+
+Selective configuration reload replaces only changed proxy/L2TP groups. Unchanged independent groups remain running.
+
+## GUI lifecycle
+
+`ProxyToAnyConnect.exe` is always a WinForms GUI application.
+
+- Closing the main form with `X` hides it to the notification area.
+- Minimizing may hide it to the notification area.
+- The process exits only through explicit **Exit** from the application or tray menu.
+- Explicit exit disposes proxy runtimes first, drains accepted sessions, releases VPN leases, disconnects managed RAS sessions, removes ephemeral resources and then closes the GUI/tray lifetime.
+
+## L2TP connection modes
+
+### Existing Windows profile
+
+`WindowsVpnProfileInspector` enumerates and inspects Current User and All Users Windows VPN profiles. Before dialing, an existing profile must be L2TP and split tunnel. The correct private/global phonebook scope is passed to RAS when needed.
+
+The current profile enumeration/inspection implementation uses `Get-VpnConnection` through a bounded PowerShell child process. Default-route inspection itself is native IP Helper code.
+
+### Custom ephemeral L2TP
+
+`EphemeralRasPhonebook` creates an isolated private phonebook under `%TEMP%/ProxyToAnyConnect/ras/<session>/session.pbk`. It creates an L2TP-only RAS entry with the configured server, IPsec mode and PPP authentication/encryption options.
+
+Custom secrets are persisted only in Windows user-bound DPAPI-protected form. The private phonebook belongs to one concrete RAS session and is disposed after failed dial/verification, disconnect, fail-closed teardown or application exit. It does not create a persistent Windows Settings VPN profile.
+
+## Fail-closed VPN lifecycle
+
+Each configured L2TP runtime follows:
 
 ```text
 Disconnected
@@ -30,213 +61,219 @@ Disconnected
     v
 Dialing
     |
+    +-- existing profile: L2TP + split-tunnel preflight
+    +-- custom: prepare private ephemeral phonebook
+    +-- capture host IPv4 default-route baseline
+    +-- RasDial
+    |
     v
 Verifying
     |
-    +-- profile must be L2TP + split tunnel
-    +-- IPv4 default-route snapshot must remain unchanged
-    +-- HTTPS probe must succeed through L2TP-bound socket
-    +-- if expected public address is IPv4, observed public IPv4 must match
+    +-- discover PPP client/server IPv4
+    +-- map client IPv4 to interface index + VPN DNS
+    +-- default routes must still match baseline
+    +-- L2TP-bound HTTPS probe must succeed
+    +-- fixed expected public IPv4 must match when configured
     |
     v
 Ready
     |
-    +-- RAS/PPP IPv4 is monitored continuously
-    +-- host IPv4 default routes are monitored continuously
+    +-- monitor RAS/PPP projection
+    +-- monitor default-route baseline
+    +-- optional source-bound keepalive
     |
-    +-- any invariant violation -> Disconnected + RasHangUp
+    +-- any invariant failure
+            -> cancel VpnContext lifetime
+            -> terminate dependent proxy sessions
+            -> RasHangUp exact session
+            -> reconnect cooldown
+            -> reconnect only while active leases remain
 ```
 
-`VpnContext` is published to the proxy layer only in `Ready`. A physically established RAS connection in `Dialing` or `Verifying` is not usable by proxy traffic.
+A provisional RAS connection is not exposed to proxy traffic. `VpnContext` is published only after verification succeeds and state becomes `Ready`.
 
 ## Routing invariant
 
-ProxyToAnyConnect must not intentionally change the Windows default route.
+ProxyToAnyConnect must not intentionally modify the host default Internet route.
 
-Before every new `RasDial`, `WindowsVpnProfileInspector` queries the named Windows VPN profile and rejects it unless:
+Before and immediately after each `RasDial`, `WindowsDefaultRouteInspector` captures the active IPv4 default-route set using the native IP Helper route table API. A mismatch rejects the new connection before it becomes usable.
 
-- `TunnelType` is `L2tp`;
-- `SplitTunneling` is `true`.
+The pre-dial route set remains the baseline while the L2TP session is `Ready`. Any later mismatch is treated conservatively as fail-closed: the exact `VpnContext` is invalidated and the exact RAS handle is hung up.
 
-The application also captures the active Windows IPv4 default-route set immediately before and after `RasDial`. If that set changes, the newly created L2TP connection is immediately torn down and never reaches `Ready`.
+Every production outbound proxy TCP socket is constrained by both:
 
-The pre-dial snapshot becomes the `Ready` baseline. While the VPN is active, the application periodically captures the default-route set again using `l2tp.routeMonitorIntervalMilliseconds` (default: 5000 ms). Any difference from the pre-dial baseline invalidates the current `VpnContext`, cancels active proxy tunnels and calls `RasHangUp` for that exact RAS connection.
+1. `Bind()` to the IPv4 dynamically assigned to the selected L2TP session;
+2. Winsock `IP_UNICAST_IF` set to that L2TP interface index.
 
-This monitoring is intentionally conservative: an unrelated host default-route change also forces a fail-closed reconnect instead of allowing the proxy to continue under an unverified routing state.
+There is no alternate unbound/DIRECT production socket path.
 
 ## Active path verification
 
-`VpnConnectivityVerifier` performs a real HTTPS request before `Ready` using the same routing constraints as future proxy traffic:
+`VpnConnectivityVerifier` performs a real HTTPS request before `Ready` using the same L2TP routing constraints as proxy traffic:
 
-1. resolve the configured probe host through the L2TP DNS servers;
+1. resolve the probe host with `L2tpDnsResolver`;
 2. create an IPv4 TCP socket;
-3. apply `IP_UNICAST_IF = L2TP InterfaceIndex`;
-4. bind the socket source to the IPv4 assigned by the current RAS session;
-5. connect to the probe endpoint;
-6. perform TLS with the configured probe host as SNI/certificate target;
+3. set `IP_UNICAST_IF` to the L2TP interface;
+4. bind the source to the RAS-assigned L2TP IPv4;
+5. connect to the resolved target;
+6. perform TLS using the configured probe hostname;
 7. request the externally visible source IPv4.
 
-`l2tp.verification.publicAddress` means the expected public identity of traffic **after it exits through L2TP**, not the public address of the L2TP server itself.
+If `verification.publicAddress` is an IPv4 literal, the observed public IPv4 must match it. If it is a DNS name, only the equality check that requires a fixed expected IPv4 is skipped; the route guard, source/interface binding, L2TP DNS and real HTTPS probe remain mandatory.
 
-If `publicAddress` is an IPv4 address, the verifier requires the probe to report exactly that IPv4. A mismatch means verification fails, RAS is disconnected, and the proxy remains fail-closed.
-
-If `publicAddress` is a DNS name, checks that require a fixed expected IPv4 are deliberately skipped. The route-table, L2TP source-address, L2TP interface and real HTTPS probe checks remain mandatory.
-
-The verifier never creates a DIRECT control connection. Its own traffic is also constrained to L2TP.
-
-## Continuous health monitoring
-
-After `Ready`, two independent monitors run in parallel:
-
-- `monitorIntervalMilliseconds` (default 1000 ms): confirms the same RAS PPP IPv4 is still projected for the connection;
-- `routeMonitorIntervalMilliseconds` (default 5000 ms): confirms the host IPv4 default-route set still exactly matches the pre-dial baseline.
-
-The first monitor failure wins. The current `VpnContext` is marked disconnected, its lifetime cancellation token is triggered, active HTTP/HTTPS proxy streams are terminated, and the exact RAS handle is hung up. No DIRECT retry exists.
+Successful verification is projected into the bounded latest-status diagnostics together with the probe/egress and local IPv4/interface information.
 
 ## DNS behavior
 
-`L2tpDnsResolver` never uses the Windows system DNS resolver for proxied destination names.
+`L2tpDnsResolver` never uses `System.Net.Dns` for proxied destination hostnames.
 
-For every DNS transport socket it applies both routing constraints used elsewhere in the project:
-
-- source bind to the RAS-assigned L2TP IPv4;
-- `IP_UNICAST_IF` set to the L2TP interface index.
-
-The resolver currently supports:
+Every UDP/TCP DNS transport socket uses the same source IPv4 and `IP_UNICAST_IF` constraints as the proxy TCP path. The resolver supports:
 
 - IPv4 A queries;
-- IDN host conversion to ASCII;
-- multiple DNS servers supplied by the L2TP interface;
+- IDN conversion;
+- multiple DNS servers supplied by the active L2TP interface;
 - DNS compression pointers;
-- CNAME chains with loop detection and an 8-hop limit;
-- UDP DNS first;
-- automatic DNS-over-TCP fallback when the UDP reply has `TC=1`;
-- cancellation when the exact `VpnContext` disappears.
+- CNAME following with loop/hop protection;
+- UDP first;
+- TCP fallback for `TC=1` or conservative transport truncation;
+- cancellation with the concrete `VpnContext` lifetime.
+
+One bounded `L2tpDnsCache` belongs to each L2TP runtime and is shared by proxies leasing that runtime. Capacity is fixed (currently 512 names), DNS TTL is honored, TTL zero is not cached, and a new `VpnContext` clears old answers.
 
 There is no system-resolver or DIRECT DNS fallback.
 
-## Proxy behavior
+## Proxy data path
 
-`ProxyServer` listens only on the configured loopback address.
+`ProxyServer` listens on the configured local IPv4/port. Configuration validation requires enabled proxy listener endpoints to be unique.
 
-HTTPS uses standard HTTP `CONNECT`; ProxyToAnyConnect does not terminate or inspect destination TLS.
+HTTPS uses ordinary HTTP `CONNECT`; ProxyToAnyConnect does not terminate or inspect destination TLS. Plain HTTP proxy-form requests are rewritten to origin form and proxy-only/connection-scoped headers are stripped.
 
-Plain HTTP requests are rewritten from proxy-form to origin-form and the first implementation deliberately uses one origin connection per client request (`Connection: close`). Proxy-only headers such as `Proxy-Authorization` and `Proxy-Connection` are never forwarded to origin servers. Headers named by the incoming `Connection` header are also removed.
+The production `IProxyOutboundConnectionFactory` is `L2tpSocketFactory`. It obtains/retains the exact verified `VpnContext`, resolves through the L2TP DNS runtime, creates a source/interface-bound socket and connects without a DIRECT alternative.
 
-Unsupported request forms produce an explicit HTTP error instead of leaving an unobserved background task failure.
+Steady-state transfer characteristics:
 
-`ProxyServer` depends on the narrow `IProxyOutboundConnectionFactory` abstraction. The production application wires only `L2tpSocketFactory`, which has no DIRECT mode. The abstraction exists so the test project can inject a loopback-only outbound connection and exercise the real proxy server without requiring an Internet connection or L2TP credentials in CI.
+- bidirectional asynchronous copy with backpressure;
+- 32 KiB `ArrayPool<byte>` transfer buffers returned in `finally`;
+- no full tunnel/request/response buffering;
+- bounded header acquisition rather than `MemoryStream` plus redundant full copies;
+- low-cost atomic RX/TX counters;
+- no logging/GUI serialization on the byte-transfer loop.
 
-## Diagnostic mode
+`maxConcurrentConnections` bounds live user-space sessions per proxy. A slot is acquired before `AcceptTcpClientAsync`; when all slots are occupied, additional connections remain in the Windows TCP backlog instead of causing unbounded managed Task/CTS/buffer creation.
 
-The executable supports:
+On Pause/reconfigure/Exit, listener cancellation is followed by deterministic session drain. `ProxyServer.RunAsync` acquires the full bounded session semaphore before returning, which proves all accepted sessions have released their slots. The higher-level runtime releases its VPN lease only after that drain completes.
 
-```text
-ProxyToAnyConnect.exe [appsettings.json] --verify-only
-```
+## Keepalive and reconnect
 
-This mode performs the complete `Dialing -> Verifying -> Ready` sequence, prints the assigned L2TP IPv4, interface index, DNS servers and active probe result, then exits without starting the proxy listener. It is intended for the first Windows 11 integration test and troubleshooting of VPN/profile/routing configuration independently of Chrome.
+Per-L2TP keepalive modes are:
 
-## Data flow
+- `Off`;
+- `VpnServerInternalIPv4` — PPP server IPv4 from RAS projection;
+- `CustomIPv4` — explicitly configured target.
 
-```text
-Browser / client
-      |
-      | HTTP proxy 127.0.0.1:18080
-      v
-ProxyServer
-      |
-      +-- HTTP request forwarding
-      |
-      +-- HTTPS CONNECT tunnel
-      |
-      v
-L2tpSocketFactory (production IProxyOutboundConnectionFactory)
-      |
-      +-- require Ready VpnContext
-      +-- otherwise validate profile / RasDial / Verify
-      +-- resolve hostname using L2TP-bound DNS socket
-      +-- create TCP socket
-      +-- bind(source = L2TP assigned IPv4)
-      +-- IP_UNICAST_IF = L2TP InterfaceIndex
-      +-- connect(target IPv4)
-      v
-Windows L2TP/RAS interface
-      |
-      v
-Internet
-```
+`IcmpBoundPing` uses the L2TP-assigned local IPv4 as the ICMP source. Successful RTT samples feed a rolling five-minute average. Consecutive failures are counted against the configured threshold; reaching the threshold throws into the common fail-closed monitor path.
 
-## Current components
+`VpnLeaseManager` owns a maintenance task only while one or more active proxy leases exist. If the L2TP is unavailable, maintenance retries after the configured cooldown and runs the full dial/verify sequence. If the last lease disappears, maintenance stops and no reconnect is retained.
 
-### `WindowsVpnProfileInspector`
-Reads the configured Windows VPN profile before dialing. It fails closed unless the profile is L2TP with split tunneling enabled.
+## Lifetime and memory architecture
 
-### `WindowsDefaultRouteInspector`
-Captures the active IPv4 default-route set before and after `RasDial`, and continues checking the pre-dial baseline while the VPN is `Ready`.
+Long-run stability is an explicit architecture requirement; see `docs/memory-stability.md`.
+
+Important ownership rules implemented today include:
+
+- `VpnContext` uses manager + per-outbound-session reference ownership; its CTS is disposed after the final consumer releases it;
+- each RAS session owns one monitor CTS/task and an optional ephemeral phonebook;
+- old RAS monitors are cancelled/joined before replacement and cannot hang up a newer handle;
+- proxy runtime completion observers are tracked/joined;
+- proxy accepted sessions are bounded and deterministically drained;
+- L2TP maintenance exists only with active leases;
+- DNS cache, ping window and latest-status diagnostics are bounded;
+- GUI rows are stable-ID rows updated in place;
+- process memory diagnostics retain only the latest snapshot;
+- production code does not force GC or working-set trimming.
+
+Memory hardening must not add measurable proxy latency/jitter or reduce sustained throughput beyond measurement noise.
+
+## Runtime diagnostics
+
+Structured operational logs are append-only JSONL at `<log-root>/YYYY-MM/YYYY-MM-DD.jsonl`; history is not retained in memory.
+
+`VpnLatestStatusRegistry` keeps at most one structured latest-status snapshot per configured L2TP (hard maximum 256 entries). The snapshot preserves current/latest diagnostics without event history:
+
+- transient dial/verification activity;
+- latest successful verification summary;
+- latest keepalive RTT or failure count/threshold;
+- reconnect/cooldown state;
+- last fail-closed/rejection reason.
+
+The L2TP GUI table reads these snapshots outside the proxy byte-transfer path and also shows state, assigned IPv4/interface index, lease count, aggregate RX/TX and five-minute average ping. Stale status entries are removed when an L2TP runtime is disposed.
+
+## Main components
+
+### `ProxyRuntimeHost` / `ProxyRuntimeCoordinator`
+Own the current validated configuration runtime, start enabled proxies, expose snapshots and perform selective reconfiguration.
+
+### `ProxyInstanceRuntime`
+Owns one proxy listener lifecycle, metrics, cancellation/drain and its L2TP lease.
+
+### `VpnLeaseManager`
+Owns shared/dedicated lease semantics, one `RasConnectionManager`, one L2TP-scoped DNS cache, aggregate metrics and bounded reconnect maintenance.
 
 ### `RasConnectionManager`
-Owns the RAS connection handle and lifecycle state. It validates the profile, snapshots default routes, calls `RasDialW`, obtains the client IPv4 using `RasGetProjectionInfoW(RASP_PppIp)`, constructs a provisional `VpnContext`, runs active connectivity verification, publishes the context only after all checks pass, and supervises continuous RAS/route monitoring.
+Owns one current RAS session for a configured L2TP, including dial preparation, PPP projection, verification, route/RAS/keepalive monitors, reconnect cooldown, per-session monitor lifetime and ephemeral phonebook ownership.
 
 ### `VpnContext`
-Contains the L2TP entry name, assigned IPv4, Windows network-interface name/index, VPN DNS server list, and a cancellation token representing the lifetime of this exact VPN context.
+Represents one exact verified VPN session: assigned client IPv4, optional PPP server IPv4, interface/index, VPN DNS servers and lifetime cancellation/reference ownership.
 
 ### `VpnConnectivityVerifier`
-Performs the mandatory HTTPS path probe before `Ready`. If a fixed expected public IPv4 is configured, it also checks the externally observed IPv4.
+Performs mandatory L2TP-bound HTTPS path verification before `Ready`.
 
-### `WindowsSocketInterfaceBinder`
-Applies Winsock `IP_UNICAST_IF` to an IPv4 socket using the current L2TP `InterfaceIndex`. This is socket-local and does not alter the Windows default route.
-
-### `L2tpDnsResolver`
-Performs L2TP-bound IPv4 DNS resolution, including CNAME following and TCP fallback for truncated UDP responses.
+### `L2tpDnsResolver` / `L2tpDnsCache`
+Provide fail-closed L2TP-bound name resolution and bounded per-L2TP caching.
 
 ### `L2tpSocketFactory`
-The only production implementation of `IProxyOutboundConnectionFactory`. It has no DIRECT mode. Each socket is source-bound to the current L2TP IPv4 and receives `IP_UNICAST_IF` for the L2TP interface before connecting.
+Only production outbound proxy connection factory; creates source/interface-bound TCP connections and has no DIRECT mode.
 
 ### `ProxyServer`
-Listens only on loopback. Implements HTTP forwarding and HTTPS `CONNECT`. Active tunnels are linked to the outbound connection lifetime token, which is the exact `VpnContext` lifetime in production.
+Implements plain HTTP forwarding and bidirectional HTTPS `CONNECT` with bounded admission and deterministic shutdown drain.
 
-## Explicitly out of scope for the first milestone
+### `VpnLatestStatusRegistry`
+Projects selected VPN lifecycle log events plus latest successful keepalive into one bounded current diagnostic snapshot per L2TP.
 
-- TLS MITM/decryption.
-- SOCKS.
-- IPv6.
-- Domain-selection rules (those belong to the browser/PAC layer).
-- WFP/Windows Firewall kill switch.
-- Multi-VPN load balancing or fallback.
-- Embedding VPN credentials in repository configuration.
+## Explicitly out of scope
+
+- TLS MITM/decryption;
+- SOCKS;
+- IPv6 proxying in the current milestone;
+- domain-selection rules (browser/PAC owns them);
+- WFP/Windows Firewall as a baseline requirement;
+- VPN load balancing or fallback between L2TP connections;
+- plaintext VPN secrets in configuration.
 
 ## Automated checks
 
-The solution contains `ProxyToAnyConnect.SelfTests`, a dependency-free .NET 10 console test project. GitHub Actions builds the solution on `windows-latest`, runs self-tests, publishes a self-contained Windows x64 package and uploads it as a workflow artifact.
+The dependency-free `.NET 10` `ProxyToAnyConnect.SelfTests` project runs on `windows-latest`. Current coverage includes, among other checks:
 
-Current automated checks cover:
+- L2TP/split-tunnel profile rules and native default-route inspection;
+- fixed-public-IP vs DNS-name verification behavior;
+- L2TP-bound DNS parser, CNAME, UDP truncation/TCP fallback, TTL/capacity/context reset;
+- loopback HTTP forwarding and bidirectional CONNECT;
+- VPN-lifetime cancellation of active CONNECT sessions;
+- bounded proxy admission and multi-megabyte CONNECT transfer;
+- deterministic proxy shutdown drain;
+- append-only logging/retention;
+- traffic counters and rolling ping;
+- DPAPI secret protection;
+- native private ephemeral RAS phonebook + PSK create/cleanup smoke test;
+- `VpnContext` lifetime/collectability;
+- bounded latest L2TP status projection;
+- process-memory monitor lifetime;
+- repeated proxy lifecycle stress.
 
-- accepting L2TP + split-tunnel profiles;
-- rejecting full-tunnel profiles;
-- rejecting non-L2TP profiles;
-- accepting unchanged default routes;
-- rejecting changed default routes;
-- rejecting an invalid zero interface index;
-- enabling fixed-public-IPv4 equality checking when `publicAddress` is IPv4;
-- skipping that IP-equality check when `publicAddress` is a DNS name;
-- parsing DNS A responses;
-- parsing DNS CNAME responses;
-- detecting truncated DNS replies for TCP fallback;
-- CONNECT authority parsing with default and explicit ports;
-- rejecting IPv6 proxy authorities in the current IPv4-only milestone;
-- stripping proxy-only and connection-scoped headers before HTTP origin forwarding;
-- live loopback plain-HTTP forwarding through a real `ProxyServer` instance;
-- live loopback `CONNECT` establishment and byte-perfect bidirectional tunnel forwarding.
+The build workflow also publishes a self-contained `win-x64` single-file package and ZIP artifact. CI does not substitute for testing a real external L2TP endpoint.
 
-## Integration test
+## Real Windows integration boundary
 
-The reproducible Windows test procedure is maintained in [`windows-integration-test.md`](windows-integration-test.md).
+The reproducible real-environment procedure is maintained in [`windows-integration-test.md`](windows-integration-test.md).
 
-## Next hardening work
-
-1. Run the real Windows 11 + L2TP integration test and record results.
-2. Add structured logs and a Windows Service host mode.
-3. Replace the synchronous `RasDial` execution with a cancellable asynchronous RAS lifecycle after real-environment validation.
-4. Replace PowerShell-based route/profile inspection with native Windows APIs after the first real-environment validation.
-5. Add a reproducible installer in addition to the existing self-contained ZIP publish.
+The largest remaining validation boundary is Windows 11 + real L2TP endpoints for both existing-profile and custom-ephemeral modes, including actual authentication, PPP projection, keepalive/reconnect, shared/dedicated multi-proxy isolation and fail-closed behavior during real network loss.
