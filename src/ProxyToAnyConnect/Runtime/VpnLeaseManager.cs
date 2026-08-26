@@ -15,6 +15,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     private readonly CancellationTokenSource _lifetime = new();
 
     private Task? _maintenanceTask;
+    private int _activeProxyCount;
     private int _disposed;
 
     public VpnLeaseManager(L2tpOptions options)
@@ -30,17 +31,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     public L2tpOptions Options => _options;
     public RasConnectionManager ConnectionManager => _connectionManager;
     public L2tpRuntimeMetrics Metrics { get; }
-
-    public int ActiveProxyCount
-    {
-        get
-        {
-            lock (_consumers)
-            {
-                return _consumers.Count;
-            }
-        }
-    }
+    public int ActiveProxyCount => Volatile.Read(ref _activeProxyCount);
 
     public async Task<VpnLease> AcquireAsync(string proxyId, CancellationToken cancellationToken)
     {
@@ -62,6 +53,8 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
                     $"Proxy '{proxyId}' already holds L2TP lease '{_options.Name}'.");
             }
 
+            Volatile.Write(ref _activeProxyCount, _consumers.Count);
+
             try
             {
                 await _connectionManager.ConnectAsync(cancellationToken);
@@ -69,6 +62,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             catch
             {
                 _consumers.Remove(proxyId);
+                Volatile.Write(ref _activeProxyCount, _consumers.Count);
                 throw;
             }
 
@@ -110,6 +104,8 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             }
 
             var remaining = _consumers.Count;
+            Volatile.Write(ref _activeProxyCount, remaining);
+
             AppLog.Info(
                 "vpn.lease.released",
                 "Proxy released its L2TP runtime lease.",
@@ -231,6 +227,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         try
         {
             _consumers.Clear();
+            Volatile.Write(ref _activeProxyCount, 0);
             await _connectionManager.DisposeAsync();
         }
         finally
