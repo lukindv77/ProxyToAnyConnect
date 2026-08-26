@@ -80,7 +80,7 @@ Pause and selective reconfiguration must release, as applicable:
 - DNS cache contents tied to an obsolete VPN context;
 - temporary RAS resources.
 
-Unchanged proxy/L2TP groups stay running and must not be duplicated during a selective reload.
+Unchanged proxy/L2TP groups stay running and must not be duplicated or recreated during a selective reload. A proxy-only edit must leave unchanged L2TP runtime objects intact. An L2TP edit must replace only that L2TP runtime and its dependent proxy runtimes; independent groups retain the same runtime objects and therefore keep their existing listener/VPN lifetimes.
 
 Cleanup performed by Pause/Resume or reconfiguration must not add avoidable work to active byte-transfer loops. Teardown may wait for deterministic session cancellation/drain, but ordinary forwarding must remain free of cleanup-oriented synchronization.
 
@@ -114,6 +114,8 @@ Regression coverage should include:
 - long CONNECT transfers using pooled buffers;
 - bounded DNS cache capacity/TTL/context reset;
 - repeatable latency/throughput checks around memory-sensitive changes.
+
+The selective-reconfiguration regression exercises two independent disabled proxy/L2TP groups without requiring a real RAS endpoint. It verifies exact runtime-object identity for the unaffected group, verifies that changed proxy/VPN runtimes are replaced, and runs 250 repeated reconfiguration cycles while retaining only weak references to replaced `ProxyInstanceRuntime` and `VpnLeaseManager` instances. After test-only forced collection, retained replaced runtimes must be bounded by a small fixed async/JIT-root allowance rather than scale with the number of cycles. This guards both isolation and long-run object-graph retention without adding production instrumentation or data-path work.
 
 For performance-sensitive memory changes, compare before/after behavior under the same workload. At minimum, watch connection/request processing latency, sustained CONNECT throughput and allocation/GC behavior. Where practical, record p50/p95/p99 latency so an apparent average improvement cannot hide increased tail latency.
 
