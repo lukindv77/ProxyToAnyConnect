@@ -241,6 +241,8 @@ internal sealed class ProxyServer
         ReadOnlyMemory<byte> remainder,
         CancellationToken cancellationToken)
     {
+        EnsureInitialBodyRemainderFits(request.ContentLength, remainder.Length);
+
         var uri = ParseAbsoluteHttpUri(request.Target);
         var host = uri.IdnHost;
         var port = uri.IsDefaultPort ? 80 : uri.Port;
@@ -252,36 +254,125 @@ internal sealed class ProxyServer
         var originHeader = request.BuildOriginHeader(pathAndQuery);
         await upstreamStream.WriteAsync(originHeader, cancellationToken);
         RecordSent(originHeader.Length);
-        if (!remainder.IsEmpty)
-        {
-            await upstreamStream.WriteAsync(remainder, cancellationToken);
-            RecordSent(remainder.Length);
-        }
 
         using var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             upstream.LifetimeToken);
 
-        var clientToUpstream = PumpAsync(
+        if (request.ContentLength == 0)
+        {
+            await PumpAsync(
+                upstreamStream,
+                clientStream,
+                RecordReceived,
+                requestCancellation.Token);
+            return;
+        }
+
+        using var bodyCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            requestCancellation.Token);
+        var bodyUpload = ForwardRequestBodyAsync(
             clientStream,
             upstreamStream,
-            RecordSent,
-            requestCancellation.Token);
-        var upstreamToClient = PumpAsync(
+            remainder,
+            request.ContentLength,
+            bodyCancellation.Token);
+        var responseDownload = PumpAsync(
             upstreamStream,
             clientStream,
             RecordReceived,
             requestCancellation.Token);
 
+        var firstCompleted = await Task.WhenAny(bodyUpload, responseDownload);
+        if (ReferenceEquals(firstCompleted, responseDownload))
+        {
+            // An origin may reject a request before consuming the declared body.
+            // Stop reading client body bytes, but preserve the origin response/failure.
+            bodyCancellation.Cancel();
+            await IgnoreCancellationAsync(bodyUpload);
+            await responseDownload;
+            return;
+        }
+
         try
         {
-            await Task.WhenAny(clientToUpstream, upstreamToClient);
+            await bodyUpload;
+        }
+        catch
+        {
+            requestCancellation.Cancel();
+            await IgnoreCancellationAsync(responseDownload);
+            throw;
+        }
+
+        // The proxy handles exactly one plain-HTTP request per client connection.
+        // Once Content-Length bytes have been forwarded, no later client bytes are
+        // read or sent upstream; only the origin response remains active.
+        await responseDownload;
+    }
+
+    internal static void EnsureInitialBodyRemainderFits(long contentLength, int remainderLength)
+    {
+        if (contentLength < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(contentLength));
+        }
+
+        if (remainderLength < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(remainderLength));
+        }
+
+        if (remainderLength > contentLength)
+        {
+            throw new InvalidDataException(
+                "Bytes after the HTTP header exceed the declared request body length.");
+        }
+    }
+
+    private async Task ForwardRequestBodyAsync(
+        Stream clientStream,
+        Stream upstreamStream,
+        ReadOnlyMemory<byte> initialBody,
+        long contentLength,
+        CancellationToken cancellationToken)
+    {
+        var remaining = contentLength;
+        if (!initialBody.IsEmpty)
+        {
+            await upstreamStream.WriteAsync(initialBody, cancellationToken);
+            RecordSent(initialBody.Length);
+            remaining -= initialBody.Length;
+        }
+
+        if (remaining == 0)
+        {
+            return;
+        }
+
+        var buffer = ArrayPool<byte>.Shared.Rent(TransferBufferSize);
+        try
+        {
+            while (remaining > 0)
+            {
+                var requested = (int)Math.Min(remaining, TransferBufferSize);
+                var read = await clientStream.ReadAsync(
+                    buffer.AsMemory(0, requested),
+                    cancellationToken);
+                if (read == 0)
+                {
+                    throw new InvalidDataException(
+                        "Client closed before the declared HTTP request body was complete.");
+                }
+
+                await upstreamStream.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                RecordSent(read);
+                remaining -= read;
+            }
         }
         finally
         {
-            requestCancellation.Cancel();
-            await IgnoreCancellationAsync(clientToUpstream);
-            await IgnoreCancellationAsync(upstreamToClient);
+            ArrayPool<byte>.Shared.Return(buffer, clearArray: false);
         }
     }
 
@@ -521,17 +612,24 @@ internal sealed class ProxyServer
         // allocating a per-request List<HeaderLine> after header syntax validation.
         private static readonly List<HeaderLine> EmptyHeaders = [];
 
-        private ParsedProxyRequest(string method, string target, string version, List<HeaderLine> headers)
+        private ParsedProxyRequest(
+            string method,
+            string target,
+            string version,
+            List<HeaderLine> headers,
+            long contentLength)
         {
             Method = method;
             Target = target;
             Version = version;
             Headers = headers;
+            ContentLength = contentLength;
         }
 
         public string Method { get; }
         public string Target { get; }
         public string Version { get; }
+        public long ContentLength { get; }
         private List<HeaderLine> Headers { get; }
 
         public static ParsedProxyRequest Parse(ReadOnlySpan<byte> headerBytes)
@@ -562,10 +660,12 @@ internal sealed class ProxyServer
             if (method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
             {
                 ValidateHeaderLines(text, offset);
-                return new ParsedProxyRequest(method, target, version, EmptyHeaders);
+                return new ParsedProxyRequest(method, target, version, EmptyHeaders, contentLength: 0);
             }
 
             var headers = new List<HeaderLine>();
+            long? contentLength = null;
+            var hasTransferEncoding = false;
             while (offset < text.Length)
             {
                 var remaining = text.AsSpan(offset);
@@ -582,18 +682,105 @@ internal sealed class ProxyServer
 
                 var line = remaining[..lineEnd];
                 var separator = line.IndexOf(':');
-                if (separator <= 0)
+                if (separator <= 0 || char.IsWhiteSpace(line[separator - 1]))
                 {
                     throw new InvalidDataException("Invalid HTTP header line.");
                 }
 
-                headers.Add(new HeaderLine(
-                    line[..separator].Trim().ToString(),
-                    line[(separator + 1)..].Trim().ToString()));
+                var name = line[..separator];
+                if (!IsValidHeaderName(name))
+                {
+                    throw new InvalidDataException("Invalid HTTP header name.");
+                }
+
+                var value = line[(separator + 1)..].Trim();
+                var header = new HeaderLine(name.ToString(), value.ToString());
+                headers.Add(header);
+
+                if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (contentLength.HasValue)
+                    {
+                        throw new InvalidDataException(
+                            "Multiple Content-Length fields are not accepted by this proxy.");
+                    }
+
+                    contentLength = ParseContentLength(value);
+                }
+                else if (name.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasTransferEncoding = true;
+                }
+
                 offset += lineEnd + 2;
             }
 
-            return new ParsedProxyRequest(method, target, version, headers);
+            if (hasTransferEncoding && contentLength.HasValue)
+            {
+                throw new InvalidDataException(
+                    "Requests containing both Transfer-Encoding and Content-Length are rejected.");
+            }
+
+            if (hasTransferEncoding)
+            {
+                throw new NotSupportedException(
+                    "Transfer-Encoding request bodies are not supported; use Content-Length.");
+            }
+
+            return new ParsedProxyRequest(
+                method,
+                target,
+                version,
+                headers,
+                contentLength ?? 0);
+        }
+
+        private static long ParseContentLength(ReadOnlySpan<char> value)
+        {
+            if (value.IsEmpty)
+            {
+                throw new InvalidDataException("Content-Length is empty.");
+            }
+
+            long result = 0;
+            foreach (var character in value)
+            {
+                if (character is < '0' or > '9')
+                {
+                    throw new InvalidDataException(
+                        "Content-Length must be a non-negative decimal integer.");
+                }
+
+                var digit = character - '0';
+                if (result > (long.MaxValue - digit) / 10)
+                {
+                    throw new InvalidDataException("Content-Length is too large.");
+                }
+
+                result = result * 10 + digit;
+            }
+
+            return result;
+        }
+
+        private static bool IsValidHeaderName(ReadOnlySpan<char> name)
+        {
+            if (name.IsEmpty)
+            {
+                return false;
+            }
+
+            foreach (var character in name)
+            {
+                if (character > 0x7F ||
+                    !(char.IsAsciiLetterOrDigit(character) ||
+                      character is '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~'))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private static void ValidateHeaderLines(string text, int offset)
