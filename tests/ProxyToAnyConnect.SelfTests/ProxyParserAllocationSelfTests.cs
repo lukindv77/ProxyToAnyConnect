@@ -28,6 +28,7 @@ internal static class ProxyParserAllocationSelfTests
             RequestLineSpanSplitMatchesLegacySemantics();
             ByteSpanParserMatchesCurrentTextParser();
             OriginHeaderDirectSerializationMatchesCurrentBuilder();
+            ConnectionTokenStackPathMatchesHashSetFallback();
 
             var raw = BuildRepresentativeHeader();
 
@@ -65,21 +66,23 @@ internal static class ProxyParserAllocationSelfTests
             }
 
             var optimizedOriginBytes = MeasureOptimizedOrigin(optimizedRequest);
+            var currentHashSetOriginBytes = MeasureCurrentDirectOrigin(currentTextRequest);
             var currentBuilderOriginBytes = MeasureCurrentBuilderOrigin(currentTextRequest);
-            if (optimizedOriginBytes >= currentBuilderOriginBytes)
+            if (optimizedOriginBytes >= currentHashSetOriginBytes)
             {
                 throw new InvalidOperationException(
-                    $"Direct Latin-1 serialization allocated {optimizedOriginBytes} bytes versus " +
-                    $"{currentBuilderOriginBytes} bytes for the current StringBuilder path.");
+                    $"Stack Connection token path allocated {optimizedOriginBytes} bytes versus " +
+                    $"{currentHashSetOriginBytes} bytes for the immediate HashSet/token-string predecessor.");
             }
 
             Console.WriteLine(
                 $"PASS: proxy parser/origin paths reduce allocations " +
                 $"(parse bytes {optimizedParserBytes / (double)MeasurementIterations:F0} vs text " +
                 $"{currentTextParserBytes / (double)MeasurementIterations:F0} " +
-                $"(legacy {legacyParserBytes / (double)MeasurementIterations:F0}); origin direct " +
-                $"{optimizedOriginBytes / (double)MeasurementIterations:F0} vs builder " +
-                $"{currentBuilderOriginBytes / (double)MeasurementIterations:F0} bytes/request)");
+                $"(legacy {legacyParserBytes / (double)MeasurementIterations:F0}); origin stack " +
+                $"{optimizedOriginBytes / (double)MeasurementIterations:F0} vs hash " +
+                $"{currentHashSetOriginBytes / (double)MeasurementIterations:F0} " +
+                $"(builder {currentBuilderOriginBytes / (double)MeasurementIterations:F0}) bytes/request)");
             return 0;
         }
         catch (Exception ex)
@@ -221,6 +224,67 @@ internal static class ProxyParserAllocationSelfTests
         }
     }
 
+    private static void ConnectionTokenStackPathMatchesHashSetFallback()
+    {
+        var commonRaw = Encoding.Latin1.GetBytes(
+            "GET http://example.test/common HTTP/1.1\r\n" +
+            "Host: example.test\r\n" +
+            "Connection: X-One, , x-two, X-One\r\n" +
+            "Connection: keep-alive\r\n" +
+            "X-One: remove-one\r\n" +
+            "X-Two: remove-two\r\n" +
+            "X-Keep: retained\r\n\r\n");
+        AssertOriginMatchesCurrentHashSet(commonRaw, "/common");
+
+        var tokenCount = ProxyServer.ParsedProxyRequest.StackConnectionTokenCapacity + 3;
+        var builder = new StringBuilder();
+        builder.Append("GET http://example.test/overflow HTTP/1.1\r\n")
+            .Append("Host: example.test\r\n")
+            .Append("Connection: ");
+        for (var i = 0; i < tokenCount; i++)
+        {
+            if (i > 0)
+            {
+                builder.Append(", ");
+            }
+
+            builder.Append('X').Append(i);
+        }
+
+        builder.Append("\r\n");
+        for (var i = 0; i < tokenCount; i++)
+        {
+            builder.Append('X').Append(i).Append(": remove-").Append(i).Append("\r\n");
+        }
+
+        builder.Append("X-Keep: retained\r\n\r\n");
+        var overflowRaw = Encoding.Latin1.GetBytes(builder.ToString());
+        AssertOriginMatchesCurrentHashSet(overflowRaw, "/overflow");
+
+        var output = Encoding.Latin1.GetString(
+            ProxyServer.ParsedProxyRequest.Parse(overflowRaw).BuildOriginHeader("/overflow"));
+        if (!output.Contains("X-Keep: retained", StringComparison.Ordinal) ||
+            output.Contains("X0: remove-0", StringComparison.Ordinal) ||
+            output.Contains($"X{tokenCount - 1}: remove-{tokenCount - 1}", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Connection-token overflow fallback did not preserve hop-by-hop filtering.");
+        }
+    }
+
+    private static void AssertOriginMatchesCurrentHashSet(byte[] raw, string path)
+    {
+        var optimized = ProxyServer.ParsedProxyRequest.Parse(raw);
+        var current = CurrentTextSpanParse(raw);
+        var actual = optimized.BuildOriginHeader(path);
+        var expected = CurrentDirectBuildOriginHeader(current, path);
+        if (!actual.AsSpan().SequenceEqual(expected))
+        {
+            throw new InvalidOperationException(
+                $"Stack/fallback Connection token filtering changed current bytes for '{path}'.");
+        }
+    }
+
     private static long MeasureOptimizedParser(byte[] raw)
     {
         var before = GC.GetAllocatedBytesForCurrentThread();
@@ -260,6 +324,17 @@ internal static class ProxyParserAllocationSelfTests
         for (var i = 0; i < MeasurementIterations; i++)
         {
             GC.KeepAlive(request.BuildOriginHeader(OriginPath));
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    private static long MeasureCurrentDirectOrigin(CurrentTextRequest request)
+    {
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < MeasurementIterations; i++)
+        {
+            GC.KeepAlive(CurrentDirectBuildOriginHeader(request, OriginPath));
         }
 
         return GC.GetAllocatedBytesForCurrentThread() - before;
@@ -386,6 +461,68 @@ internal static class ProxyParserAllocationSelfTests
 
         return new LegacyRequest(requestLine[0], requestLine[1], requestLine[2], headers);
     }
+
+    // Test-only copy of the immediate pre-stack-token production path: direct
+    // exact-size Latin-1 serialization plus a temporary HashSet<string> containing
+    // materialized Connection tokens. This isolates the allocation saved by the
+    // bounded stack token references.
+    private static byte[] CurrentDirectBuildOriginHeader(CurrentTextRequest request, string pathAndQuery)
+    {
+        var connectionTokens = CollectCurrentConnectionTokens(request);
+        var byteCount = checked(
+            Encoding.Latin1.GetByteCount(request.Method) + 1 +
+            Encoding.Latin1.GetByteCount(pathAndQuery) + 1 +
+            Encoding.Latin1.GetByteCount(request.Version) + 2);
+
+        foreach (var header in request.Headers)
+        {
+            if (ShouldSkipCurrentOriginHeader(header, connectionTokens))
+            {
+                continue;
+            }
+
+            byteCount = checked(
+                byteCount + Encoding.Latin1.GetByteCount(header.Name) + 2 +
+                Encoding.Latin1.GetByteCount(header.Value) + 2);
+        }
+
+        byteCount = checked(byteCount + "Connection: close\r\n\r\n"u8.Length);
+        var result = GC.AllocateUninitializedArray<byte>(byteCount);
+        var destination = result.AsSpan();
+        var written = 0;
+        written += Encoding.Latin1.GetBytes(request.Method.AsSpan(), destination[written..]);
+        destination[written++] = (byte)' ';
+        written += Encoding.Latin1.GetBytes(pathAndQuery.AsSpan(), destination[written..]);
+        destination[written++] = (byte)' ';
+        written += Encoding.Latin1.GetBytes(request.Version.AsSpan(), destination[written..]);
+        "\r\n"u8.CopyTo(destination[written..]);
+        written += 2;
+
+        foreach (var header in request.Headers)
+        {
+            if (ShouldSkipCurrentOriginHeader(header, connectionTokens))
+            {
+                continue;
+            }
+
+            written += Encoding.Latin1.GetBytes(header.Name.AsSpan(), destination[written..]);
+            ": "u8.CopyTo(destination[written..]);
+            written += 2;
+            written += Encoding.Latin1.GetBytes(header.Value.AsSpan(), destination[written..]);
+            "\r\n"u8.CopyTo(destination[written..]);
+            written += 2;
+        }
+
+        "Connection: close\r\n\r\n"u8.CopyTo(destination[written..]);
+        return result;
+    }
+
+    private static bool ShouldSkipCurrentOriginHeader(
+        CurrentTextHeaderLine header,
+        HashSet<string>? connectionTokens) =>
+        header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+        LegacyFixedHopByHopHeaders.Contains(header.Name) ||
+        connectionTokens?.Contains(header.Name) == true;
 
     // Test-only copy of the production BuildOriginHeader shape immediately before
     // direct byte serialization. Connection tokenization is intentionally the
