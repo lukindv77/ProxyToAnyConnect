@@ -26,6 +26,7 @@ internal static class ProxyParserAllocationSelfTests
         try
         {
             RequestLineSpanSplitMatchesLegacySemantics();
+            OriginHeaderDirectSerializationMatchesCurrentBuilder();
 
             var raw = BuildRepresentativeHeader();
 
@@ -47,34 +48,34 @@ internal static class ProxyParserAllocationSelfTests
             var optimizedRequest = ProxyServer.ParsedProxyRequest.Parse(raw);
             var legacyRequest = LegacySplitParse(raw);
             var optimizedOrigin = optimizedRequest.BuildOriginHeader(OriginPath);
-            var legacyOrigin = LegacyBuildOriginHeader(legacyRequest, OriginPath);
-            if (!optimizedOrigin.AsSpan().SequenceEqual(legacyOrigin))
+            var currentBuilderOrigin = CurrentBuilderBuildOriginHeader(legacyRequest, OriginPath);
+            if (!optimizedOrigin.AsSpan().SequenceEqual(currentBuilderOrigin))
             {
                 throw new InvalidOperationException(
-                    "Optimized origin-header filtering changed the legacy output bytes.");
+                    "Direct origin-header serialization changed the current builder output bytes.");
             }
 
             for (var i = 0; i < WarmupIterations; i++)
             {
                 GC.KeepAlive(optimizedRequest.BuildOriginHeader(OriginPath));
-                GC.KeepAlive(LegacyBuildOriginHeader(legacyRequest, OriginPath));
+                GC.KeepAlive(CurrentBuilderBuildOriginHeader(legacyRequest, OriginPath));
             }
 
             var optimizedOriginBytes = MeasureOptimizedOrigin(optimizedRequest);
-            var legacyOriginBytes = MeasureLegacyOrigin(legacyRequest);
-            if (optimizedOriginBytes >= legacyOriginBytes)
+            var currentBuilderOriginBytes = MeasureCurrentBuilderOrigin(legacyRequest);
+            if (optimizedOriginBytes >= currentBuilderOriginBytes)
             {
                 throw new InvalidOperationException(
-                    $"Span Connection tokenization allocated {optimizedOriginBytes} bytes versus " +
-                    $"{legacyOriginBytes} bytes for the legacy Split/LINQ origin-header path.");
+                    $"Direct Latin-1 serialization allocated {optimizedOriginBytes} bytes versus " +
+                    $"{currentBuilderOriginBytes} bytes for the current StringBuilder path.");
             }
 
             Console.WriteLine(
-                $"PASS: proxy parser/origin span paths reduce allocations " +
+                $"PASS: proxy parser/origin paths reduce allocations " +
                 $"(parse {optimizedParserBytes / (double)MeasurementIterations:F0} vs " +
-                $"{legacyParserBytes / (double)MeasurementIterations:F0}; origin " +
-                $"{optimizedOriginBytes / (double)MeasurementIterations:F0} vs " +
-                $"{legacyOriginBytes / (double)MeasurementIterations:F0} bytes/request)");
+                $"{legacyParserBytes / (double)MeasurementIterations:F0}; origin direct " +
+                $"{optimizedOriginBytes / (double)MeasurementIterations:F0} vs builder " +
+                $"{currentBuilderOriginBytes / (double)MeasurementIterations:F0} bytes/request)");
             return 0;
         }
         catch (Exception ex)
@@ -113,6 +114,55 @@ internal static class ProxyParserAllocationSelfTests
         }
     }
 
+    private static void OriginHeaderDirectSerializationMatchesCurrentBuilder()
+    {
+        (string Raw, string Path)[] cases =
+        [
+            (
+                "GET http://example.test/simple HTTP/1.1\r\n" +
+                "Host: example.test\r\n" +
+                "X-Keep: yes\r\n\r\n",
+                "/simple"
+            ),
+            (
+                "GET http://example.test/filter HTTP/1.1\r\n" +
+                "Host: example.test\r\n" +
+                "Connection: X-Hop, keep-alive\r\n" +
+                "X-Hop: remove-me\r\n" +
+                "Proxy-Authorization: Basic secret\r\n" +
+                "TE: trailers\r\n" +
+                "X-Keep: retained\r\n\r\n",
+                "/filter"
+            ),
+            (
+                "GET http://example.test/multi HTTP/1.1\r\n" +
+                "Host: example.test\r\n" +
+                "connection: X-One\r\n" +
+                "Connection: x-two, , Upgrade\r\n" +
+                "X-One: remove-one\r\n" +
+                "X-Two: remove-two\r\n" +
+                "Upgrade: websocket\r\n" +
+                "X-Keep: caf\u00e9\r\n\r\n",
+                "/emoji-\ud83d\ude00?q=\u00f1"
+            )
+        ];
+
+        foreach (var testCase in cases)
+        {
+            var raw = Encoding.Latin1.GetBytes(testCase.Raw);
+            var optimized = ProxyServer.ParsedProxyRequest.Parse(raw);
+            var current = LegacySplitParse(raw);
+            var actual = optimized.BuildOriginHeader(testCase.Path);
+            var expected = CurrentBuilderBuildOriginHeader(current, testCase.Path);
+
+            if (!actual.AsSpan().SequenceEqual(expected))
+            {
+                throw new InvalidOperationException(
+                    $"Direct origin-header serialization changed current builder bytes for '{testCase.Path}'.");
+            }
+        }
+    }
+
     private static long MeasureOptimizedParser(byte[] raw)
     {
         var before = GC.GetAllocatedBytesForCurrentThread();
@@ -146,12 +196,12 @@ internal static class ProxyParserAllocationSelfTests
         return GC.GetAllocatedBytesForCurrentThread() - before;
     }
 
-    private static long MeasureLegacyOrigin(LegacyRequest request)
+    private static long MeasureCurrentBuilderOrigin(LegacyRequest request)
     {
         var before = GC.GetAllocatedBytesForCurrentThread();
         for (var i = 0; i < MeasurementIterations; i++)
         {
-            GC.KeepAlive(LegacyBuildOriginHeader(request, OriginPath));
+            GC.KeepAlive(CurrentBuilderBuildOriginHeader(request, OriginPath));
         }
 
         return GC.GetAllocatedBytesForCurrentThread() - before;
@@ -208,16 +258,13 @@ internal static class ProxyParserAllocationSelfTests
         return new LegacyRequest(requestLine[0], requestLine[1], requestLine[2], headers);
     }
 
-    // Test-only copy of the old BuildOriginHeader allocation shape.
-    private static byte[] LegacyBuildOriginHeader(LegacyRequest request, string pathAndQuery)
+    // Test-only copy of the production BuildOriginHeader shape immediately before
+    // direct byte serialization. Connection tokenization is intentionally the
+    // already-optimized span/lazy-set form so the allocation comparison isolates
+    // StringBuilder + ToString() + Encoding.GetBytes(byte[]) materialization.
+    private static byte[] CurrentBuilderBuildOriginHeader(LegacyRequest request, string pathAndQuery)
     {
-        var connectionTokens = request.Headers
-            .Where(header => header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
-            .SelectMany(header => header.Value.Split(','))
-            .Select(token => token.Trim())
-            .Where(token => token.Length > 0)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
+        var connectionTokens = CollectCurrentConnectionTokens(request);
         var builder = new StringBuilder();
         builder.Append(request.Method).Append(' ').Append(pathAndQuery).Append(' ').Append(request.Version).Append("\r\n");
 
@@ -225,7 +272,7 @@ internal static class ProxyParserAllocationSelfTests
         {
             if (header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
                 LegacyFixedHopByHopHeaders.Contains(header.Name) ||
-                connectionTokens.Contains(header.Name))
+                connectionTokens?.Contains(header.Name) == true)
             {
                 continue;
             }
@@ -235,6 +282,39 @@ internal static class ProxyParserAllocationSelfTests
 
         builder.Append("Connection: close\r\n\r\n");
         return Encoding.Latin1.GetBytes(builder.ToString());
+    }
+
+    private static HashSet<string>? CollectCurrentConnectionTokens(LegacyRequest request)
+    {
+        HashSet<string>? tokens = null;
+        foreach (var header in request.Headers)
+        {
+            if (!header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var remaining = header.Value.AsSpan();
+            while (!remaining.IsEmpty)
+            {
+                var comma = remaining.IndexOf(',');
+                var token = (comma < 0 ? remaining : remaining[..comma]).Trim();
+                if (!token.IsEmpty)
+                {
+                    (tokens ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase))
+                        .Add(token.ToString());
+                }
+
+                if (comma < 0)
+                {
+                    break;
+                }
+
+                remaining = remaining[(comma + 1)..];
+            }
+        }
+
+        return tokens;
     }
 
     private sealed record LegacyRequest(
