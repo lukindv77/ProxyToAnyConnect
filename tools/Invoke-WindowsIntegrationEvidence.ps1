@@ -24,7 +24,7 @@ $ErrorActionPreference = 'Stop'
 
 function ConvertTo-StableJson {
     param([Parameter(Mandatory = $true)] $Value)
-    return ($Value | ConvertTo-Json -Depth 8 -Compress)
+    return (ConvertTo-Json -InputObject $Value -Depth 8 -Compress)
 }
 
 function Get-Sha256Text {
