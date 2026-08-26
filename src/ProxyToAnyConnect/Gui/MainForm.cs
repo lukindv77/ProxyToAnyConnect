@@ -7,7 +7,7 @@ namespace ProxyToAnyConnect.Gui;
 internal sealed class MainForm : Form
 {
     private readonly string _configPath;
-    private readonly ProxyRuntimeCoordinator? _runtime;
+    private readonly ProxyRuntimeHost _runtimeHost;
     private AppOptions _options;
     private readonly DataGridView _proxyGrid = CreateGrid();
     private readonly DataGridView _vpnGrid = CreateGrid();
@@ -23,27 +23,23 @@ internal sealed class MainForm : Form
     private readonly Label _configurationStatus = new() { AutoSize = true };
     private bool _allowExit;
 
-    public MainForm(
-        AppOptions options,
-        string configPath,
-        ProxyRuntimeCoordinator? runtime,
-        string? configurationError)
+    public MainForm(AppOptions options, string configPath, ProxyRuntimeHost runtimeHost)
     {
         _options = options;
         _configPath = configPath;
-        _runtime = runtime;
+        _runtimeHost = runtimeHost;
 
         Text = "ProxyToAnyConnect";
-        Width = 1180;
-        Height = 680;
-        MinimumSize = new Size(900, 520);
+        Width = 1220;
+        Height = 720;
+        MinimumSize = new Size(920, 540);
         StartPosition = FormStartPosition.CenterScreen;
 
         var menu = BuildMenu();
         var tabs = new TabControl { Dock = DockStyle.Fill };
         tabs.TabPages.Add(BuildProxyTab());
         tabs.TabPages.Add(BuildVpnTab());
-        tabs.TabPages.Add(BuildSettingsTab(configurationError));
+        tabs.TabPages.Add(BuildSettingsTab());
 
         Controls.Add(tabs);
         Controls.Add(menu);
@@ -59,6 +55,21 @@ internal sealed class MainForm : Form
         };
 
         _proxyGrid.CellContentClick += ProxyGridOnCellContentClick;
+        _proxyGrid.CellDoubleClick += async (_, e) =>
+        {
+            if (e.RowIndex >= 0)
+            {
+                await EditSelectedProxyAsync();
+            }
+        };
+        _vpnGrid.CellDoubleClick += async (_, e) =>
+        {
+            if (e.RowIndex >= 0)
+            {
+                await EditSelectedVpnAsync();
+            }
+        };
+
         _refreshTimer.Tick += (_, _) => RefreshRuntimeViews();
         _refreshTimer.Start();
         RefreshRuntimeViews();
@@ -113,8 +124,24 @@ internal sealed class MainForm : Form
             UseColumnTextForButtonValue = false
         });
 
+        var toolbar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(6),
+            WrapContents = false
+        };
+        var add = new Button { Text = "Добавить", AutoSize = true };
+        var edit = new Button { Text = "Изменить", AutoSize = true };
+        var remove = new Button { Text = "Удалить", AutoSize = true };
+        add.Click += async (_, _) => await AddProxyAsync();
+        edit.Click += async (_, _) => await EditSelectedProxyAsync();
+        remove.Click += async (_, _) => await RemoveSelectedProxyAsync();
+        toolbar.Controls.AddRange([add, edit, remove]);
+
         var page = new TabPage("Proxies");
         page.Controls.Add(_proxyGrid);
+        page.Controls.Add(toolbar);
         return page;
     }
 
@@ -130,12 +157,28 @@ internal sealed class MainForm : Form
         _vpnGrid.Columns.Add(TextColumn("tx", "TX", 110));
         _vpnGrid.Columns.Add(TextColumn("ping", "Ping avg 5m", 110));
 
+        var toolbar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(6),
+            WrapContents = false
+        };
+        var add = new Button { Text = "Добавить", AutoSize = true };
+        var edit = new Button { Text = "Изменить", AutoSize = true };
+        var remove = new Button { Text = "Удалить", AutoSize = true };
+        add.Click += async (_, _) => await AddVpnAsync();
+        edit.Click += async (_, _) => await EditSelectedVpnAsync();
+        remove.Click += async (_, _) => await RemoveSelectedVpnAsync();
+        toolbar.Controls.AddRange([add, edit, remove]);
+
         var page = new TabPage("L2TP");
         page.Controls.Add(_vpnGrid);
+        page.Controls.Add(toolbar);
         return page;
     }
 
-    private TabPage BuildSettingsTab(string? configurationError)
+    private TabPage BuildSettingsTab()
     {
         var page = new TabPage("Settings");
         var layout = new TableLayoutPanel
@@ -167,9 +210,6 @@ internal sealed class MainForm : Form
         save.Click += async (_, _) => await SaveLoggingSettingsAsync();
         layout.Controls.Add(save, 1, 3);
 
-        _configurationStatus.Text = string.IsNullOrWhiteSpace(configurationError)
-            ? "Конфигурация runtime: OK"
-            : $"Конфигурация runtime: {configurationError}";
         layout.Controls.Add(_configurationStatus, 0, 5);
         layout.SetColumnSpan(_configurationStatus, 3);
 
@@ -182,56 +222,65 @@ internal sealed class MainForm : Form
         RefreshProxyGrid();
         RefreshVpnGrid();
         _effectiveLogPath.Text = AppLog.LogRootDirectory ?? AppContext.BaseDirectory;
+        _configurationStatus.Text = string.IsNullOrWhiteSpace(_runtimeHost.ConfigurationError)
+            ? "Конфигурация runtime: OK"
+            : $"Конфигурация runtime: {_runtimeHost.ConfigurationError}";
     }
 
     private void RefreshProxyGrid()
     {
+        var selectedId = SelectedRowId(_proxyGrid);
         _proxyGrid.Rows.Clear();
 
-        if (_runtime is null)
+        if (_runtimeHost.Current is null)
         {
             foreach (var proxy in _options.Proxies)
             {
                 var rowIndex = _proxyGrid.Rows.Add(
                     proxy.Name,
                     $"{proxy.ListenAddress}:{proxy.ListenPort}",
-                    proxy.VpnConnectionId,
+                    FindVpnName(proxy.VpnConnectionId),
                     "Error",
                     "0 B",
                     "0 B",
-                    "Конфигурация runtime недействительна",
+                    _runtimeHost.ConfigurationError ?? "Конфигурация runtime недействительна",
                     "Запустить");
                 _proxyGrid.Rows[rowIndex].Tag = proxy.Id;
             }
-            return;
+        }
+        else
+        {
+            foreach (var snapshot in _runtimeHost.GetProxySnapshots())
+            {
+                var action = snapshot.State is ProxyInstanceState.Running or ProxyInstanceState.Starting
+                    ? "Пауза"
+                    : "Запустить";
+                var rowIndex = _proxyGrid.Rows.Add(
+                    snapshot.Name,
+                    $"{snapshot.ListenAddress}:{snapshot.ListenPort}",
+                    FindVpnName(snapshot.VpnConnectionId),
+                    snapshot.State.ToString(),
+                    FormatBytes(snapshot.ReceivedBytes),
+                    FormatBytes(snapshot.SentBytes),
+                    snapshot.LastError ?? string.Empty,
+                    action);
+                _proxyGrid.Rows[rowIndex].Tag = snapshot.Id;
+            }
         }
 
-        foreach (var snapshot in _runtime.GetProxySnapshots())
-        {
-            var action = snapshot.State is ProxyInstanceState.Running or ProxyInstanceState.Starting
-                ? "Пауза"
-                : "Запустить";
-            var rowIndex = _proxyGrid.Rows.Add(
-                snapshot.Name,
-                $"{snapshot.ListenAddress}:{snapshot.ListenPort}",
-                snapshot.VpnConnectionId,
-                snapshot.State.ToString(),
-                FormatBytes(snapshot.ReceivedBytes),
-                FormatBytes(snapshot.SentBytes),
-                snapshot.LastError ?? string.Empty,
-                action);
-            _proxyGrid.Rows[rowIndex].Tag = snapshot.Id;
-        }
+        RestoreSelection(_proxyGrid, selectedId);
     }
 
     private void RefreshVpnGrid()
     {
+        var selectedId = SelectedRowId(_vpnGrid);
         _vpnGrid.Rows.Clear();
-        if (_runtime is null)
+
+        if (_runtimeHost.Current is null)
         {
             foreach (var vpn in _options.VpnConnections)
             {
-                _vpnGrid.Rows.Add(
+                var rowIndex = _vpnGrid.Rows.Add(
                     vpn.Name,
                     vpn.Mode.ToString(),
                     vpn.Shared ? "Shared" : "Dedicated",
@@ -241,31 +290,36 @@ internal sealed class MainForm : Form
                     "0 B",
                     "0 B",
                     "—");
+                _vpnGrid.Rows[rowIndex].Tag = vpn.Id;
             }
-            return;
+        }
+        else
+        {
+            foreach (var snapshot in _runtimeHost.GetL2tpSnapshots())
+            {
+                var rowIndex = _vpnGrid.Rows.Add(
+                    snapshot.Name,
+                    snapshot.Mode.ToString(),
+                    snapshot.Shared ? "Shared" : "Dedicated",
+                    snapshot.State.ToString(),
+                    snapshot.LocalIPv4 ?? string.Empty,
+                    snapshot.ActiveProxyCount,
+                    FormatBytes(snapshot.ReceivedBytes),
+                    FormatBytes(snapshot.SentBytes),
+                    snapshot.AveragePingMilliseconds is double ping
+                        ? $"{ping:F1} ms"
+                        : "—");
+                _vpnGrid.Rows[rowIndex].Tag = snapshot.Id;
+            }
         }
 
-        foreach (var snapshot in _runtime.GetL2tpSnapshots())
-        {
-            _vpnGrid.Rows.Add(
-                snapshot.Name,
-                snapshot.Mode.ToString(),
-                snapshot.Shared ? "Shared" : "Dedicated",
-                snapshot.State.ToString(),
-                snapshot.LocalIPv4 ?? string.Empty,
-                snapshot.ActiveProxyCount,
-                FormatBytes(snapshot.ReceivedBytes),
-                FormatBytes(snapshot.SentBytes),
-                snapshot.AveragePingMilliseconds is double ping
-                    ? $"{ping:F1} ms"
-                    : "—");
-        }
+        RestoreSelection(_vpnGrid, selectedId);
     }
 
     private async void ProxyGridOnCellContentClick(object? sender, DataGridViewCellEventArgs e)
     {
         var actionColumn = _proxyGrid.Columns["action"];
-        if (_runtime is null || actionColumn is null || e.RowIndex < 0 || e.ColumnIndex != actionColumn.Index)
+        if (actionColumn is null || e.RowIndex < 0 || e.ColumnIndex != actionColumn.Index)
         {
             return;
         }
@@ -275,18 +329,18 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var snapshot = _runtime.GetProxySnapshots().FirstOrDefault(item =>
+        var snapshot = _runtimeHost.GetProxySnapshots().FirstOrDefault(item =>
             item.Id.Equals(proxyId, StringComparison.OrdinalIgnoreCase));
 
         try
         {
             if (snapshot.State is ProxyInstanceState.Running or ProxyInstanceState.Starting)
             {
-                await _runtime.PauseProxyAsync(proxyId);
+                await _runtimeHost.PauseProxyAsync(proxyId);
             }
             else
             {
-                await _runtime.StartProxyAsync(proxyId);
+                await _runtimeHost.StartProxyAsync(proxyId);
             }
         }
         catch (Exception ex)
@@ -296,6 +350,220 @@ internal sealed class MainForm : Form
         finally
         {
             RefreshRuntimeViews();
+        }
+    }
+
+    private async Task AddProxyAsync()
+    {
+        if (_options.VpnConnections.Count == 0)
+        {
+            MessageBox.Show(this, "Сначала создайте L2TP соединение.", "ProxyToAnyConnect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new ProxySettingsDialog(null, _options.VpnConnections);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var proxies = _options.Proxies.ToList();
+        proxies.Add(dialog.Result);
+        await ApplyConfigurationAsync(new AppOptions
+        {
+            Proxies = proxies,
+            VpnConnections = _options.VpnConnections,
+            Logging = _options.Logging
+        });
+    }
+
+    private async Task EditSelectedProxyAsync()
+    {
+        var id = SelectedRowId(_proxyGrid);
+        if (id is null)
+        {
+            return;
+        }
+
+        var existing = _options.Proxies.FirstOrDefault(proxy => proxy.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+        if (existing is null)
+        {
+            return;
+        }
+
+        using var dialog = new ProxySettingsDialog(existing, _options.VpnConnections);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var replacement = dialog.Result;
+        var proxies = _options.Proxies
+            .Select(proxy => proxy.Id.Equals(id, StringComparison.OrdinalIgnoreCase) ? replacement : proxy)
+            .ToList();
+        await ApplyConfigurationAsync(new AppOptions
+        {
+            Proxies = proxies,
+            VpnConnections = _options.VpnConnections,
+            Logging = _options.Logging
+        });
+    }
+
+    private async Task RemoveSelectedProxyAsync()
+    {
+        var id = SelectedRowId(_proxyGrid);
+        if (id is null)
+        {
+            return;
+        }
+
+        if (_options.Proxies.Count <= 1)
+        {
+            MessageBox.Show(this, "Должна оставаться как минимум одна настройка proxy.", "ProxyToAnyConnect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var existing = _options.Proxies.FirstOrDefault(proxy => proxy.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+        if (existing is null || MessageBox.Show(
+                this,
+                $"Удалить proxy '{existing.Name}'?",
+                "ProxyToAnyConnect",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        var proxies = _options.Proxies
+            .Where(proxy => !proxy.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        await ApplyConfigurationAsync(new AppOptions
+        {
+            Proxies = proxies,
+            VpnConnections = _options.VpnConnections,
+            Logging = _options.Logging
+        });
+    }
+
+    private async Task AddVpnAsync()
+    {
+        using var dialog = new L2tpSettingsDialog(null);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var vpnConnections = _options.VpnConnections.ToList();
+        vpnConnections.Add(dialog.Result);
+        await ApplyConfigurationAsync(new AppOptions
+        {
+            Proxies = _options.Proxies,
+            VpnConnections = vpnConnections,
+            Logging = _options.Logging
+        });
+    }
+
+    private async Task EditSelectedVpnAsync()
+    {
+        var id = SelectedRowId(_vpnGrid);
+        if (id is null)
+        {
+            return;
+        }
+
+        var existing = _options.VpnConnections.FirstOrDefault(vpn => vpn.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+        if (existing is null)
+        {
+            return;
+        }
+
+        using var dialog = new L2tpSettingsDialog(existing);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var replacement = dialog.Result;
+        var vpnConnections = _options.VpnConnections
+            .Select(vpn => vpn.Id.Equals(id, StringComparison.OrdinalIgnoreCase) ? replacement : vpn)
+            .ToList();
+        await ApplyConfigurationAsync(new AppOptions
+        {
+            Proxies = _options.Proxies,
+            VpnConnections = vpnConnections,
+            Logging = _options.Logging
+        });
+    }
+
+    private async Task RemoveSelectedVpnAsync()
+    {
+        var id = SelectedRowId(_vpnGrid);
+        if (id is null)
+        {
+            return;
+        }
+
+        var existing = _options.VpnConnections.FirstOrDefault(vpn => vpn.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+        if (existing is null)
+        {
+            return;
+        }
+
+        var usedBy = _options.Proxies
+            .Where(proxy => proxy.VpnConnectionId.Equals(id, StringComparison.OrdinalIgnoreCase))
+            .Select(proxy => proxy.Name)
+            .ToArray();
+        if (usedBy.Length > 0)
+        {
+            MessageBox.Show(
+                this,
+                $"L2TP '{existing.Name}' используется proxy: {string.Join(", ", usedBy)}. Сначала переназначьте или удалите эти proxy.",
+                "ProxyToAnyConnect",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (_options.VpnConnections.Count <= 1)
+        {
+            MessageBox.Show(this, "Должна оставаться как минимум одна настройка L2TP.", "ProxyToAnyConnect", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (MessageBox.Show(
+                this,
+                $"Удалить L2TP '{existing.Name}'?",
+                "ProxyToAnyConnect",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        var vpnConnections = _options.VpnConnections
+            .Where(vpn => !vpn.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        await ApplyConfigurationAsync(new AppOptions
+        {
+            Proxies = _options.Proxies,
+            VpnConnections = vpnConnections,
+            Logging = _options.Logging
+        });
+    }
+
+    private async Task ApplyConfigurationAsync(AppOptions newOptions)
+    {
+        try
+        {
+            // SaveAsync validates the full graph before touching the file.
+            await newOptions.SaveAsync(_configPath, CancellationToken.None);
+            await _runtimeHost.ApplyOptionsAsync(newOptions, CancellationToken.None);
+            _options = newOptions;
+            RefreshRuntimeViews();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Не удалось применить настройки", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -349,6 +617,30 @@ internal sealed class MainForm : Form
         _logDirectory.Text = _options.Logging.Directory;
         _retentionDays.Value = Math.Clamp(_options.Logging.RetentionDays, 1, 3650);
         _effectiveLogPath.Text = AppLog.LogRootDirectory ?? AppContext.BaseDirectory;
+    }
+
+    private string FindVpnName(string vpnId) =>
+        _options.VpnConnections.FirstOrDefault(vpn => vpn.Id.Equals(vpnId, StringComparison.OrdinalIgnoreCase))?.Name
+        ?? vpnId;
+
+    private static string? SelectedRowId(DataGridView grid) =>
+        grid.SelectedRows.Count > 0 ? grid.SelectedRows[0].Tag as string : null;
+
+    private static void RestoreSelection(DataGridView grid, string? id)
+    {
+        if (id is null)
+        {
+            return;
+        }
+
+        foreach (DataGridViewRow row in grid.Rows)
+        {
+            if (row.Tag is string rowId && rowId.Equals(id, StringComparison.OrdinalIgnoreCase))
+            {
+                row.Selected = true;
+                break;
+            }
+        }
     }
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
