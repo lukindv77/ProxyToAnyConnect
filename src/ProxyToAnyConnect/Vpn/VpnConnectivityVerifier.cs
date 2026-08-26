@@ -104,8 +104,8 @@ internal sealed class VpnConnectivityVerifier
             sslStream,
             _options.MaxResponseBytes,
             cancellationToken);
-        var body = ParseHttpSuccessBody(response);
-        var observedText = Encoding.ASCII.GetString(body).Trim();
+        var body = ParseHttpSuccessBodyView(response);
+        var observedText = Encoding.ASCII.GetString(body.Span).Trim();
 
         var expectedIp = TryGetExpectedPublicIPv4(_options.PublicAddress);
         IPAddress? observedIp = null;
@@ -275,6 +275,27 @@ internal sealed class VpnConnectivityVerifier
 
     internal static byte[] ParseHttpSuccessBody(ReadOnlySpan<byte> response)
     {
+        var metadata = ParseHttpSuccessHeader(response);
+        var body = response[metadata.BodyOffset..];
+        return metadata.IsChunked ? DecodeChunkedBody(body) : body.ToArray();
+    }
+
+    internal static ReadOnlyMemory<byte> ParseHttpSuccessBodyView(byte[] response)
+    {
+        ArgumentNullException.ThrowIfNull(response);
+
+        var metadata = ParseHttpSuccessHeader(response);
+        var body = response.AsMemory(metadata.BodyOffset);
+        if (metadata.IsChunked)
+        {
+            return DecodeChunkedBody(body.Span);
+        }
+
+        return body;
+    }
+
+    private static HttpBodyMetadata ParseHttpSuccessHeader(ReadOnlySpan<byte> response)
+    {
         var headerEnd = FindHeaderEnd(response);
         if (headerEnd < 0)
         {
@@ -316,8 +337,7 @@ internal sealed class VpnConnectivityVerifier
             offset += lineEnd + 2;
         }
 
-        var body = response[(headerEnd + 4)..];
-        return isChunked ? DecodeChunkedBody(body) : body.ToArray();
+        return new HttpBodyMetadata(headerEnd + 4, isChunked);
     }
 
     private static bool TryParseStatusCode(ReadOnlySpan<char> statusLine, out int statusCode)
@@ -466,6 +486,8 @@ internal sealed class VpnConnectivityVerifier
     {
         return value == (byte)' ' || value is >= 0x09 and <= 0x0D;
     }
+
+    private readonly record struct HttpBodyMetadata(int BodyOffset, bool IsChunked);
 
     private static int FindCrlf(ReadOnlySpan<byte> data, int start)
     {
