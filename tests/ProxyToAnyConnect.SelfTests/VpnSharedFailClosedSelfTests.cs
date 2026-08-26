@@ -39,6 +39,7 @@ internal static class VpnSharedFailClosedSelfTests
         var secondLease = await manager.AcquireAsync("proxy-b", CancellationToken.None);
         var sharedContext = controller.Current
             ?? throw new InvalidOperationException("Shared controller did not publish the initial context.");
+        var successfulConnectionsBeforeFailure = controller.SuccessfulConnectionCount;
 
         if (!sharedContext.TryAcquireConnectionReference() ||
             !sharedContext.TryAcquireConnectionReference())
@@ -92,7 +93,7 @@ internal static class VpnSharedFailClosedSelfTests
                     "Last shared release did not cancel the in-progress reconnect attempt.");
             }
 
-            if (controller.SuccessfulReconnectCount != 0)
+            if (controller.SuccessfulConnectionCount != successfulConnectionsBeforeFailure)
             {
                 throw new InvalidOperationException(
                     "A reconnect completed after the shared VPN had been invalidated and all leases released.");
@@ -136,13 +137,13 @@ internal static class VpnSharedFailClosedSelfTests
         private VpnContext? _current;
         private int _blockReconnect;
         private int _reconnectCancellationObserved;
-        private int _successfulReconnectCount;
+        private int _successfulConnectionCount;
         private int _disposed;
 
         public Task ReconnectStarted => _reconnectStarted.Task;
         public bool ReconnectCancellationObserved =>
             Volatile.Read(ref _reconnectCancellationObserved) != 0;
-        public int SuccessfulReconnectCount => Volatile.Read(ref _successfulReconnectCount);
+        public int SuccessfulConnectionCount => Volatile.Read(ref _successfulConnectionCount);
         public VpnContext? Current => Volatile.Read(ref _current);
         public VpnConnectionState State => Current is { IsAlive: true }
             ? VpnConnectionState.Ready
@@ -176,7 +177,7 @@ internal static class VpnSharedFailClosedSelfTests
 
             var created = CreateContext("shared", 42);
             Volatile.Write(ref _current, created);
-            Interlocked.Increment(ref _successfulReconnectCount);
+            Interlocked.Increment(ref _successfulConnectionCount);
             return created;
         }
 
