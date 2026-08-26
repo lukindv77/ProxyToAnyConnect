@@ -19,6 +19,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     private nint _rasConnection;
     private VpnContext? _current;
     private VpnVerificationResult? _lastVerification;
+    private EphemeralRasPhonebook? _ephemeralPhonebook;
     private Task? _monitorTask;
     private long _retryNotBeforeTickCount64;
     private int _state = (int)VpnConnectionState.Disconnected;
@@ -62,38 +63,23 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                     $"L2TP reconnect cooldown is active for another {retryRemaining} ms.");
             }
 
-            if (_options.Mode != L2tpConnectionMode.ExistingWindowsProfile)
-            {
-                throw new NotSupportedException(
-                    $"L2TP connection '{_options.Name}' uses CustomEphemeral mode, which is not wired to RAS dialing yet.");
-            }
-
             SetState(VpnConnectionState.Dialing);
             ConnectionResult? result = null;
+            EphemeralRasPhonebook? localEphemeralPhonebook = null;
 
             try
             {
-                var profile = await _profileInspector.InspectAsync(_options.EntryName, cancellationToken);
-                WindowsVpnProfileInspector.ValidateForProxy(profile);
-                var phoneBook = WindowsVpnProfileInspector.ResolveRasPhoneBook(profile);
-
-                AppLog.Info(
-                    "vpn.profile.validated",
-                    "Windows VPN profile passed L2TP split-tunnel validation.",
-                    new
-                    {
-                        VpnId = _options.Id,
-                        VpnName = _options.Name,
-                        profile.Name,
-                        profile.TunnelType,
-                        profile.SplitTunneling,
-                        profile.AllUserConnection,
-                        PhoneBookScope = profile.AllUserConnection ? "AllUsers" : "CurrentUser"
-                    });
+                var preparation = await PrepareDialAsync(cancellationToken);
+                localEphemeralPhonebook = preparation.EphemeralPhonebook;
 
                 var routesBefore = await _routeInspector.CaptureIPv4Async(cancellationToken);
 
-                result = await Task.Run(() => ConnectCore(phoneBook), cancellationToken);
+                result = await Task.Run(
+                    () => ConnectCore(
+                        preparation.PhoneBookPath,
+                        preparation.EntryName,
+                        preparation.DialParams),
+                    cancellationToken);
                 SetState(VpnConnectionState.Verifying);
 
                 var routesAfter = await _routeInspector.CaptureIPv4Async(cancellationToken);
@@ -115,6 +101,14 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 _rasConnection = result.Handle;
                 _lastVerification = verification;
                 _current = result.Context;
+
+                var ownedEphemeralPhonebook = localEphemeralPhonebook;
+                if (ownedEphemeralPhonebook is not null)
+                {
+                    _ephemeralPhonebook = ownedEphemeralPhonebook;
+                    localEphemeralPhonebook = null;
+                }
+
                 Volatile.Write(ref _retryNotBeforeTickCount64, 0);
                 SetState(VpnConnectionState.Ready);
 
@@ -122,6 +116,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                     result.Handle,
                     result.Context,
                     routesBefore,
+                    ownedEphemeralPhonebook,
                     _shutdown.Token);
 
                 return result.Context;
@@ -141,10 +136,22 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                     "vpn.connection.rejected",
                     "L2TP connection did not pass fail-closed verification.",
                     ex,
-                    new { VpnId = _options.Id, VpnName = _options.Name, EntryName = _options.EntryName });
+                    new
+                    {
+                        VpnId = _options.Id,
+                        VpnName = _options.Name,
+                        Mode = _options.Mode.ToString(),
+                        EntryName = _options.Mode == L2tpConnectionMode.ExistingWindowsProfile
+                            ? _options.EntryName
+                            : null
+                    });
                 throw new InvalidOperationException(
                     $"L2TP connection '{_options.Name}' did not pass fail-closed verification.",
                     ex);
+            }
+            finally
+            {
+                localEphemeralPhonebook?.Dispose();
             }
         }
         finally
@@ -153,32 +160,117 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         }
     }
 
-    private ConnectionResult ConnectCore(string? phoneBook)
+    private async Task<DialPreparation> PrepareDialAsync(CancellationToken cancellationToken)
     {
-        var dialParams = new RasNative.RasDialParams
+        switch (_options.Mode)
         {
-            DwSize = (uint)Marshal.SizeOf<RasNative.RasDialParams>(),
-            SzEntryName = _options.EntryName
-        };
-
-        var getParamsResult = RasNative.RasGetEntryDialParamsW(phoneBook, dialParams, out var hasSavedPassword);
-        if (getParamsResult != RasNative.ErrorSuccess)
-        {
-            throw new InvalidOperationException(
-                $"Unable to load RAS entry '{_options.EntryName}': {RasNative.DescribeError(getParamsResult)}");
-        }
-
-        AppLog.Info(
-            "vpn.ras.parameters_loaded",
-            "RAS dial parameters were loaded from the Windows phone book.",
-            new
+            case L2tpConnectionMode.ExistingWindowsProfile:
             {
-                VpnId = _options.Id,
-                VpnName = _options.Name,
-                EntryName = _options.EntryName,
-                HasSavedPassword = hasSavedPassword,
-                PhoneBookScope = phoneBook is null ? "CurrentUserDefault" : "ExplicitAllUsers"
-            });
+                var profile = await _profileInspector.InspectAsync(_options.EntryName, cancellationToken);
+                WindowsVpnProfileInspector.ValidateForProxy(profile);
+                var phoneBook = WindowsVpnProfileInspector.ResolveRasPhoneBook(profile);
+
+                AppLog.Info(
+                    "vpn.profile.validated",
+                    "Windows VPN profile passed L2TP split-tunnel validation.",
+                    new
+                    {
+                        VpnId = _options.Id,
+                        VpnName = _options.Name,
+                        profile.Name,
+                        profile.TunnelType,
+                        profile.SplitTunneling,
+                        profile.AllUserConnection,
+                        PhoneBookScope = profile.AllUserConnection ? "AllUsers" : "CurrentUser"
+                    });
+
+                return new DialPreparation(phoneBook, _options.EntryName, null, null);
+            }
+
+            case L2tpConnectionMode.CustomEphemeral:
+            {
+                var ephemeral = EphemeralRasPhonebook.Create(_options);
+                try
+                {
+                    var dialParams = ephemeral.CreateDialParams(_options.Custom);
+                    AppLog.Info(
+                        "vpn.ephemeral.prepared",
+                        "Custom L2TP private phonebook is ready for RasDial.",
+                        new
+                        {
+                            VpnId = _options.Id,
+                            VpnName = _options.Name,
+                            ephemeral.EntryName,
+                            ServerAddress = _options.Custom.ServerAddress,
+                            _options.Custom.UseCurrentWindowsCredentials,
+                            IpsecAuthentication = _options.Custom.IpsecAuthentication.ToString()
+                        });
+                    return new DialPreparation(
+                        ephemeral.PhoneBookPath,
+                        ephemeral.EntryName,
+                        dialParams,
+                        ephemeral);
+                }
+                catch
+                {
+                    ephemeral.Dispose();
+                    throw;
+                }
+            }
+
+            default:
+                throw new NotSupportedException($"Unsupported L2TP mode '{_options.Mode}'.");
+        }
+    }
+
+    private ConnectionResult ConnectCore(
+        string? phoneBook,
+        string entryName,
+        RasNative.RasDialParams? explicitDialParams)
+    {
+        RasNative.RasDialParams dialParams;
+        if (explicitDialParams is null)
+        {
+            dialParams = new RasNative.RasDialParams
+            {
+                DwSize = checked((uint)Marshal.SizeOf<RasNative.RasDialParams>()),
+                SzEntryName = entryName
+            };
+
+            var getParamsResult = RasNative.RasGetEntryDialParamsW(phoneBook, dialParams, out var hasSavedPassword);
+            if (getParamsResult != RasNative.ErrorSuccess)
+            {
+                throw new InvalidOperationException(
+                    $"Unable to load RAS entry '{entryName}': {RasNative.DescribeError(getParamsResult)}");
+            }
+
+            AppLog.Info(
+                "vpn.ras.parameters_loaded",
+                "RAS dial parameters were loaded from the Windows phone book.",
+                new
+                {
+                    VpnId = _options.Id,
+                    VpnName = _options.Name,
+                    EntryName = entryName,
+                    HasSavedPassword = hasSavedPassword,
+                    PhoneBookScope = phoneBook is null ? "CurrentUserDefault" : "ExplicitPhoneBook"
+                });
+        }
+        else
+        {
+            dialParams = explicitDialParams;
+            AppLog.Info(
+                "vpn.ras.parameters_loaded",
+                "RAS dial parameters were prepared from the custom ephemeral L2TP configuration.",
+                new
+                {
+                    VpnId = _options.Id,
+                    VpnName = _options.Name,
+                    EntryName = entryName,
+                    Mode = "CustomEphemeral",
+                    HasExplicitUserName = !_options.Custom.UseCurrentWindowsCredentials
+                });
+        }
 
         var dialResult = RasNative.RasDialW(
             0,
@@ -191,7 +283,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         if (dialResult != RasNative.ErrorSuccess)
         {
             throw new InvalidOperationException(
-                $"Unable to establish RAS entry '{_options.EntryName}': {RasNative.DescribeError(dialResult)}");
+                $"Unable to establish RAS entry '{entryName}': {RasNative.DescribeError(dialResult)}");
         }
 
         try
@@ -199,7 +291,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             var projection = GetProjection(handle);
             var interfaceInfo = VpnInterfaceResolver.ResolveByAddress(projection.LocalIPv4);
             var context = new VpnContext(
-                _options.EntryName,
+                entryName,
                 projection.LocalIPv4,
                 interfaceInfo,
                 projection.ServerIPv4);
@@ -210,7 +302,8 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 {
                     VpnId = _options.Id,
                     VpnName = _options.Name,
-                    EntryName = _options.EntryName,
+                    EntryName = entryName,
+                    Mode = _options.Mode.ToString(),
                     LocalIPv4 = projection.LocalIPv4.ToString(),
                     ServerIPv4 = projection.ServerIPv4?.ToString(),
                     interfaceInfo.Name,
@@ -229,7 +322,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     {
         var projection = new RasNative.RasPppIp
         {
-            DwSize = (uint)Marshal.SizeOf<RasNative.RasPppIp>()
+            DwSize = checked((uint)Marshal.SizeOf<RasNative.RasPppIp>())
         };
 
         var size = projection.DwSize;
@@ -276,6 +369,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         nint handle,
         VpnContext context,
         DefaultRouteSnapshot routeBaseline,
+        EphemeralRasPhonebook? ephemeralPhonebook,
         CancellationToken cancellationToken)
     {
         using var monitorCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -318,11 +412,9 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             }
             catch (OperationCanceledException) when (monitorCancellation.IsCancellationRequested)
             {
-                // Expected after the first monitor completes/fails or on shutdown.
             }
             catch
             {
-                // The first failure has already been handled above.
             }
         }
 
@@ -331,6 +423,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             ArmReconnectCooldown("Continuous fail-closed monitor rejected the active VPN.");
             MarkCurrentDisconnected(context);
             _ = RasNative.RasHangUpW(handle);
+            ReleaseEphemeralPhonebook(ephemeralPhonebook);
             AppLog.Warning(
                 "vpn.ras.hangup",
                 "RAS connection was hung up after a continuous fail-closed guard failure.",
@@ -493,6 +586,21 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         _ = RasNative.RasHangUpW(result.Handle);
     }
 
+    private void ReleaseEphemeralPhonebook(EphemeralRasPhonebook? expected)
+    {
+        if (expected is null)
+        {
+            return;
+        }
+
+        if (ReferenceEquals(
+                Interlocked.CompareExchange(ref _ephemeralPhonebook, null, expected),
+                expected))
+        {
+            expected.Dispose();
+        }
+    }
+
     private void SetState(VpnConnectionState state)
     {
         var previous = (VpnConnectionState)Interlocked.Exchange(ref _state, (int)state);
@@ -507,7 +615,10 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                     VpnName = _options.Name,
                     Previous = previous.ToString(),
                     Current = state.ToString(),
-                    EntryName = _options.EntryName
+                    Mode = _options.Mode.ToString(),
+                    EntryName = _options.Mode == L2tpConnectionMode.ExistingWindowsProfile
+                        ? _options.EntryName
+                        : null
                 });
         }
     }
@@ -529,8 +640,17 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 AppLog.Info(
                     "vpn.ras.hangup",
                     "RAS connection was disconnected.",
-                    new { VpnId = _options.Id, VpnName = _options.Name, EntryName = _options.EntryName });
+                    new
+                    {
+                        VpnId = _options.Id,
+                        VpnName = _options.Name,
+                        Mode = _options.Mode.ToString(),
+                        EntryName = context?.EntryName
+                    });
             }
+
+            var ephemeral = Interlocked.Exchange(ref _ephemeralPhonebook, null);
+            ephemeral?.Dispose();
         }
         finally
         {
@@ -556,7 +676,6 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                // Normal application shutdown.
             }
         }
 
@@ -565,5 +684,12 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     }
 
     private sealed record ConnectionResult(nint Handle, VpnContext Context);
+
+    private sealed record DialPreparation(
+        string? PhoneBookPath,
+        string EntryName,
+        RasNative.RasDialParams? DialParams,
+        EphemeralRasPhonebook? EphemeralPhonebook);
+
     private readonly record struct PppProjection(IPAddress LocalIPv4, IPAddress? ServerIPv4);
 }
