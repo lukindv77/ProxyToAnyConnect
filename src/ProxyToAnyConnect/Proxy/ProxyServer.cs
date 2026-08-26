@@ -587,24 +587,62 @@ internal sealed class ProxyServer
         public byte[] BuildOriginHeader(string pathAndQuery)
         {
             var connectionTokens = CollectConnectionTokens();
-            var builder = new StringBuilder();
-            builder.Append(Method).Append(' ').Append(pathAndQuery).Append(' ').Append(Version).Append("\r\n");
+            var byteCount = checked(
+                Encoding.Latin1.GetByteCount(Method) + 1 +
+                Encoding.Latin1.GetByteCount(pathAndQuery) + 1 +
+                Encoding.Latin1.GetByteCount(Version) + 2);
 
             foreach (var header in Headers)
             {
-                if (header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
-                    FixedHopByHopHeaders.Contains(header.Name) ||
-                    connectionTokens?.Contains(header.Name) == true)
+                if (ShouldSkipOriginHeader(header, connectionTokens))
                 {
                     continue;
                 }
 
-                builder.Append(header.Name).Append(": ").Append(header.Value).Append("\r\n");
+                byteCount = checked(
+                    byteCount +
+                    Encoding.Latin1.GetByteCount(header.Name) + 2 +
+                    Encoding.Latin1.GetByteCount(header.Value) + 2);
             }
 
-            builder.Append("Connection: close\r\n\r\n");
-            return Encoding.Latin1.GetBytes(builder.ToString());
+            byteCount = checked(byteCount + "Connection: close\r\n\r\n"u8.Length);
+            var result = GC.AllocateUninitializedArray<byte>(byteCount);
+            var destination = result.AsSpan();
+            var written = 0;
+
+            written += Encoding.Latin1.GetBytes(Method.AsSpan(), destination[written..]);
+            destination[written++] = (byte)' ';
+            written += Encoding.Latin1.GetBytes(pathAndQuery.AsSpan(), destination[written..]);
+            destination[written++] = (byte)' ';
+            written += Encoding.Latin1.GetBytes(Version.AsSpan(), destination[written..]);
+            "\r\n"u8.CopyTo(destination[written..]);
+            written += 2;
+
+            foreach (var header in Headers)
+            {
+                if (ShouldSkipOriginHeader(header, connectionTokens))
+                {
+                    continue;
+                }
+
+                written += Encoding.Latin1.GetBytes(header.Name.AsSpan(), destination[written..]);
+                ": "u8.CopyTo(destination[written..]);
+                written += 2;
+                written += Encoding.Latin1.GetBytes(header.Value.AsSpan(), destination[written..]);
+                "\r\n"u8.CopyTo(destination[written..]);
+                written += 2;
+            }
+
+            "Connection: close\r\n\r\n"u8.CopyTo(destination[written..]);
+            return result;
         }
+
+        private static bool ShouldSkipOriginHeader(
+            HeaderLine header,
+            HashSet<string>? connectionTokens) =>
+            header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+            FixedHopByHopHeaders.Contains(header.Name) ||
+            connectionTokens?.Contains(header.Name) == true;
 
         private HashSet<string>? CollectConnectionTokens()
         {
