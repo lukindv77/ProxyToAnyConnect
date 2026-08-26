@@ -18,6 +18,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     private VpnContext? _current;
     private VpnVerificationResult? _lastVerification;
     private Task? _monitorTask;
+    private long _retryNotBeforeTickCount64;
     private int _state = (int)VpnConnectionState.Disconnected;
     private int _disposed;
 
@@ -43,6 +44,19 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             if (_current is { IsAlive: true } existing && State == VpnConnectionState.Ready)
             {
                 return existing;
+            }
+
+            var retryRemaining = GetReconnectCooldownRemainingMilliseconds(
+                Environment.TickCount64,
+                Volatile.Read(ref _retryNotBeforeTickCount64));
+            if (retryRemaining > 0)
+            {
+                AppLog.Warning(
+                    "vpn.reconnect.cooldown_active",
+                    "L2TP reconnect was skipped because a previous fail-closed attempt is cooling down.",
+                    new { EntryName = _options.EntryName, RetryAfterMilliseconds = retryRemaining });
+                throw new InvalidOperationException(
+                    $"L2TP reconnect cooldown is active for another {retryRemaining} ms.");
             }
 
             SetState(VpnConnectionState.Dialing);
@@ -90,6 +104,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 _rasConnection = result.Handle;
                 _lastVerification = verification;
                 _current = result.Context;
+                Volatile.Write(ref _retryNotBeforeTickCount64, 0);
                 SetState(VpnConnectionState.Ready);
 
                 _monitorTask = MonitorAsync(
@@ -110,6 +125,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             {
                 CleanupFailedConnection(result);
                 SetState(VpnConnectionState.Disconnected);
+                ArmReconnectCooldown("Dialing or verification failed.");
                 AppLog.Error(
                     "vpn.connection.rejected",
                     "L2TP connection did not pass fail-closed verification.",
@@ -275,6 +291,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
         if (!cancellationToken.IsCancellationRequested)
         {
+            ArmReconnectCooldown("Continuous fail-closed monitor rejected the active VPN.");
             MarkCurrentDisconnected(context);
             _ = RasNative.RasHangUpW(handle);
             AppLog.Warning(
@@ -315,6 +332,30 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             WindowsDefaultRouteInspector.EnsureUnchanged(routeBaseline, currentRoutes);
         }
     }
+
+    private void ArmReconnectCooldown(string reason)
+    {
+        if (_options.ReconnectCooldownMilliseconds <= 0)
+        {
+            Volatile.Write(ref _retryNotBeforeTickCount64, 0);
+            return;
+        }
+
+        var retryNotBefore = Environment.TickCount64 + _options.ReconnectCooldownMilliseconds;
+        Volatile.Write(ref _retryNotBeforeTickCount64, retryNotBefore);
+        AppLog.Warning(
+            "vpn.reconnect.cooldown_armed",
+            "L2TP reconnect cooldown was armed after a fail-closed event.",
+            new
+            {
+                EntryName = _options.EntryName,
+                _options.ReconnectCooldownMilliseconds,
+                Reason = reason
+            });
+    }
+
+    internal static long GetReconnectCooldownRemainingMilliseconds(long now, long retryNotBefore) =>
+        retryNotBefore <= now ? 0 : retryNotBefore - now;
 
     private void MarkCurrentDisconnected(VpnContext context)
     {
