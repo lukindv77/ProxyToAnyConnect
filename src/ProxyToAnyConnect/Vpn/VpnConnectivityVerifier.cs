@@ -190,28 +190,49 @@ internal sealed class VpnConnectivityVerifier
 
         var headerBytes = response[..headerEnd];
         var headerText = Encoding.Latin1.GetString(headerBytes);
-        var headerLines = headerText.Split("\r\n", StringSplitOptions.None);
-        if (headerLines.Length == 0 ||
-            !TryParseStatusCode(headerLines[0], out var statusCode) ||
+        var firstLineEnd = headerText.IndexOf("\r\n", StringComparison.Ordinal);
+        var statusLine = firstLineEnd < 0
+            ? headerText.AsSpan()
+            : headerText.AsSpan(0, firstLineEnd);
+        if (!TryParseStatusCode(statusLine, out var statusCode) ||
             statusCode is < 200 or >= 300)
         {
             throw new IOException(
-                $"Verification endpoint returned an unsuccessful HTTP status: '{headerLines.FirstOrDefault()}'.");
+                $"Verification endpoint returned an unsuccessful HTTP status: '{statusLine.ToString()}'.");
+        }
+
+        var isChunked = false;
+        var offset = firstLineEnd < 0 ? headerText.Length : firstLineEnd + 2;
+        while (offset < headerText.Length)
+        {
+            var remaining = headerText.AsSpan(offset);
+            var lineEnd = remaining.IndexOf("\r\n".AsSpan());
+            var line = lineEnd < 0 ? remaining : remaining[..lineEnd];
+            if (line.StartsWith("Transfer-Encoding:", StringComparison.OrdinalIgnoreCase) &&
+                line.Contains("chunked", StringComparison.OrdinalIgnoreCase))
+            {
+                isChunked = true;
+                break;
+            }
+
+            if (lineEnd < 0)
+            {
+                break;
+            }
+
+            offset += lineEnd + 2;
         }
 
         var body = response[(headerEnd + 4)..];
-        var isChunked = headerLines.Skip(1).Any(line =>
-            line.StartsWith("Transfer-Encoding:", StringComparison.OrdinalIgnoreCase) &&
-            line.Contains("chunked", StringComparison.OrdinalIgnoreCase));
-
         return isChunked ? DecodeChunkedBody(body) : body.ToArray();
     }
 
-    private static bool TryParseStatusCode(string statusLine, out int statusCode)
+    private static bool TryParseStatusCode(ReadOnlySpan<char> statusLine, out int statusCode)
     {
         statusCode = 0;
-        var parts = statusLine.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
-        return parts.Length >= 2 && int.TryParse(parts[1], out statusCode);
+        Span<Range> parts = stackalloc Range[3];
+        var partCount = statusLine.Split(parts, ' ', StringSplitOptions.RemoveEmptyEntries);
+        return partCount >= 2 && int.TryParse(statusLine[parts[1]], out statusCode);
     }
 
     private static int FindHeaderEnd(ReadOnlySpan<byte> data)
