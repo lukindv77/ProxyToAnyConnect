@@ -138,6 +138,17 @@ During this refactor, `main` may temporarily contain incomplete integration comm
 - #6 — custom ephemeral L2TP and protected credentials
 - #7 — L2TP keepalive and automatic reconnect
 
+## New-chat handoff
+
+The repository contains a reproducible handoff for continuing development in a new ChatGPT conversation without relying on the old chat history:
+
+- [`docs/handoff/NEW_CHAT_PROMPT.md`](docs/handoff/NEW_CHAT_PROMPT.md) — copy/paste startup prompt for the new chat;
+- [`docs/handoff/CURRENT_STATE.md`](docs/handoff/CURRENT_STATE.md) — implementation/progress snapshot;
+- [`docs/handoff/AUDIT_SNAPSHOT.md`](docs/handoff/AUDIT_SNAPSHOT.md) — preserved technical audit findings and reasons behind important architecture decisions;
+- [`docs/handoff/MANIFEST.md`](docs/handoff/MANIFEST.md) — files/state that must be checked at handoff.
+
+The `handoff` GitHub Actions workflow packages the exact checked-out commit into a `ProxyToAnyConnect-handoff-<sha>` ZIP artifact. The new chat must still query the current `main`, open issues and latest CI because GitHub remains authoritative over a snapshot.
+
 ## Documentation
 
 - [`docs/requirements.md`](docs/requirements.md) — current product requirements and runtime semantics
