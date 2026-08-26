@@ -45,6 +45,8 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
             if (!_options.Shared && _consumers.Count > 0 && !_consumers.Contains(proxyId))
             {
                 throw new InvalidOperationException(
@@ -102,6 +104,11 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         await _gate.WaitAsync();
         try
         {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
             if (!_consumers.Remove(proxyId))
             {
                 return;
@@ -279,7 +286,11 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         }
 
         _lifetime.Dispose();
-        _gate.Dispose();
+
+        // Do not race SemaphoreSlim.Dispose() against a VpnLease.DisposeAsync()
+        // caller that passed the pre-wait disposed check just before shutdown.
+        // AvailableWaitHandle is never used, so there is no OS wait handle to
+        // release; the managed gate becomes collectible with this manager.
     }
 
     internal sealed class VpnLease : IAsyncDisposable
