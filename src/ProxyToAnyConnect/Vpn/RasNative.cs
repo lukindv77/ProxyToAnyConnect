@@ -64,7 +64,7 @@ internal static class RasNative
     internal static extern uint RasGetEntryDialParamsW(
         string? phoneBook,
         [In, Out] RasDialParams dialParams,
-        out int hasPassword);
+        [MarshalAs(UnmanagedType.Bool)] out bool hasPassword);
 
     [DllImport("rasapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
     internal static extern uint RasDialW(
