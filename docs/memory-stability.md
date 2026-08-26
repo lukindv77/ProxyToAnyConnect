@@ -6,7 +6,26 @@
 
 Under a stable workload the process may fluctuate because of GC, socket buffers, Windows networking and active traffic, but repeated proxy sessions, L2TP reconnects, Pause/Resume operations and selective configuration reloads must not cause monotonic retained-memory or handle growth.
 
+**Memory optimization must not increase proxy data-path latency, latency jitter, or reduce sustained throughput.** This requirement has the same architectural priority as bounded memory use. A smaller working set is not an improvement if it makes request handling or byte forwarding slower.
+
 Production code must never force a full GC to hide retention problems.
+
+## Latency-preserving memory optimization
+
+Memory-hardening changes must preserve the fast path from accepted client bytes to the selected L2TP-bound outbound socket.
+
+The following rules apply:
+
+- do not introduce global locks, synchronous waits or blocking coordination on the proxy transfer hot path to reduce memory;
+- do not add extra byte-array/string copies, serialization, object materialization or per-buffer/per-packet allocations as a memory-saving technique;
+- do not shrink transfer buffers merely to reduce working set when that increases socket/system-call frequency or reduces throughput;
+- prefer pooling/reuse only when it reduces allocation/GC pressure without increasing contention or retaining an excessive pool working set;
+- prefer bounded ownership and deterministic cleanup over aggressive reclamation techniques that interrupt active traffic;
+- forced GC, working-set trimming and similar latency-spiking techniques are forbidden in production;
+- diagnostics, cleanup, retention and memory monitoring must run outside the byte-transfer critical path;
+- when two designs are functionally equivalent, prefer the design with bounded/predictable memory and lower forwarding latency rather than the design with the minimum possible memory footprint.
+
+A memory optimization is rejected if repeatable benchmarks show a proxy processing/forwarding latency regression, increased latency jitter, or reduced sustained throughput beyond measurement noise and the regression is caused solely by the memory optimization. Any intentional exception requires an explicit project-requirements change rather than being accepted implicitly during implementation.
 
 ## Ownership rules
 
@@ -63,6 +82,8 @@ Pause and selective reconfiguration must release, as applicable:
 
 Unchanged proxy/L2TP groups stay running and must not be duplicated during a selective reload.
 
+Cleanup performed by Pause/Resume or reconfiguration must not add avoidable work to active byte-transfer loops. Teardown may wait for deterministic session cancellation/drain, but ordinary forwarding must remain free of cleanup-oriented synchronization.
+
 ## GUI and diagnostics
 
 GUI refresh must update stable rows in place and must not recreate the full view every timer tick.
@@ -91,6 +112,9 @@ Regression coverage should include:
 - repeated proxy session admission/teardown;
 - repeated Pause/Resume and selective reconfigure cycles;
 - long CONNECT transfers using pooled buffers;
-- bounded DNS cache capacity/TTL/context reset.
+- bounded DNS cache capacity/TTL/context reset;
+- repeatable latency/throughput checks around memory-sensitive changes.
 
-Machine-specific absolute working-set thresholds should not be used as hard CI pass/fail gates. Tests should primarily verify ownership, bounded counts, collectability and absence of monotonic retained object graphs.
+For performance-sensitive memory changes, compare before/after behavior under the same workload. At minimum, watch connection/request processing latency, sustained CONNECT throughput and allocation/GC behavior. Where practical, record p50/p95/p99 latency so an apparent average improvement cannot hide increased tail latency.
+
+Machine-specific absolute working-set thresholds should not be used as hard CI pass/fail gates. Tests should primarily verify ownership, bounded counts, collectability and absence of monotonic retained object graphs, while performance checks must reject memory changes that measurably worsen the proxy data path beyond normal benchmark noise.
