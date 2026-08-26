@@ -20,6 +20,7 @@ The application is intentionally not a system-wide VPN client. Applications that
 - Every proxy-originated TCP connection is bound to the current L2TP IPv4 and explicitly constrained to the current L2TP interface before `connect()`.
 - If the L2TP context disappears, its lifetime token is cancelled and active proxy tunnels are terminated.
 - If no verified L2TP context exists, an incoming proxy request may trigger a new `RasDial`; if dialing or verification fails, the request fails closed.
+- The host IPv4 default-route set is continuously monitored while the VPN is `Ready`; a change invalidates the current VPN context and tears down the RAS connection.
 
 ## VPN lifecycle
 
@@ -39,6 +40,11 @@ Verifying
     |
     v
 Ready
+    |
+    +-- RAS/PPP IPv4 is monitored continuously
+    +-- host IPv4 default routes are monitored continuously
+    |
+    +-- any invariant violation -> Disconnected + RasHangUp
 ```
 
 `VpnContext` is published to the proxy layer only in `Ready`. A physically established RAS connection in `Dialing` or `Verifying` is not usable by proxy traffic.
@@ -53,6 +59,10 @@ Before every new `RasDial`, `WindowsVpnProfileInspector` queries the named Windo
 - `SplitTunneling` is `true`.
 
 The application also captures the active Windows IPv4 default-route set immediately before and after `RasDial`. If that set changes, the newly created L2TP connection is immediately torn down and never reaches `Ready`.
+
+The pre-dial snapshot becomes the `Ready` baseline. While the VPN is active, the application periodically captures the default-route set again using `l2tp.routeMonitorIntervalMilliseconds` (default: 5000 ms). Any difference from the pre-dial baseline invalidates the current `VpnContext`, cancels active proxy tunnels and calls `RasHangUp` for that exact RAS connection.
+
+This monitoring is intentionally conservative: an unrelated host default-route change also forces a fail-closed reconnect instead of allowing the proxy to continue under an unverified routing state.
 
 ## Active path verification
 
@@ -73,6 +83,25 @@ If `publicAddress` is an IPv4 address, the verifier requires the probe to report
 If `publicAddress` is a DNS name, checks that require a fixed expected IPv4 are deliberately skipped. The route-table, L2TP source-address, L2TP interface and real HTTPS probe checks remain mandatory.
 
 The verifier never creates a DIRECT control connection. Its own traffic is also constrained to L2TP.
+
+## Continuous health monitoring
+
+After `Ready`, two independent monitors run in parallel:
+
+- `monitorIntervalMilliseconds` (default 1000 ms): confirms the same RAS PPP IPv4 is still projected for the connection;
+- `routeMonitorIntervalMilliseconds` (default 5000 ms): confirms the host IPv4 default-route set still exactly matches the pre-dial baseline.
+
+The first monitor failure wins. The current `VpnContext` is marked disconnected, its lifetime cancellation token is triggered, active HTTP/HTTPS proxy streams are terminated, and the exact RAS handle is hung up. No DIRECT retry exists.
+
+## Diagnostic mode
+
+The executable supports:
+
+```text
+ProxyToAnyConnect.exe [appsettings.json] --verify-only
+```
+
+This mode performs the complete `Dialing -> Verifying -> Ready` sequence, prints the assigned L2TP IPv4, interface index, DNS servers and active probe result, then exits without starting the proxy listener. It is intended for the first Windows 11 integration test and troubleshooting of VPN/profile/routing configuration independently of Chrome.
 
 ## Data flow
 
@@ -110,10 +139,10 @@ Internet
 Reads the configured Windows VPN profile before dialing. It fails closed unless the profile is L2TP with split tunneling enabled.
 
 ### `WindowsDefaultRouteInspector`
-Captures the active IPv4 default-route set before and after `RasDial` and rejects the new VPN if that set changes.
+Captures the active IPv4 default-route set before and after `RasDial`, and continues checking the pre-dial baseline while the VPN is `Ready`.
 
 ### `RasConnectionManager`
-Owns the RAS connection handle and lifecycle state. It validates the profile, snapshots default routes, calls `RasDialW`, obtains the client IPv4 using `RasGetProjectionInfoW(RASP_PppIp)`, constructs a provisional `VpnContext`, runs active connectivity verification, and publishes the context only after all checks pass.
+Owns the RAS connection handle and lifecycle state. It validates the profile, snapshots default routes, calls `RasDialW`, obtains the client IPv4 using `RasGetProjectionInfoW(RASP_PppIp)`, constructs a provisional `VpnContext`, runs active connectivity verification, publishes the context only after all checks pass, and supervises continuous RAS/route monitoring.
 
 ### `VpnContext`
 Contains the L2TP entry name, assigned IPv4, Windows network-interface name/index, VPN DNS server list, and a cancellation token representing the lifetime of this exact VPN context.
@@ -145,7 +174,7 @@ Listens only on loopback. Implements HTTP forwarding and HTTPS `CONNECT`. Active
 
 ## Automated checks
 
-The solution contains `ProxyToAnyConnect.SelfTests`, a dependency-free .NET 10 console test project. GitHub Actions builds the solution on `windows-latest` and runs the self-tests.
+The solution contains `ProxyToAnyConnect.SelfTests`, a dependency-free .NET 10 console test project. GitHub Actions builds the solution on `windows-latest`, runs self-tests, publishes a self-contained Windows x64 package and uploads it as a workflow artifact.
 
 Current self-tests cover:
 
@@ -161,7 +190,7 @@ Current self-tests cover:
 ## Next hardening work
 
 1. Add an integration test against a real Windows L2TP environment.
-2. Add tests for HTTP parsing and HTTPS `CONNECT` behavior.
-3. Add tests for DNS packet parsing and CNAME handling.
+2. Harden DNS resolution (TCP fallback for truncated replies and explicit CNAME coverage).
+3. Add tests for HTTP parsing and HTTPS `CONNECT` behavior.
 4. Add structured logs and a Windows Service host mode.
-5. Add a reproducible installer/publish workflow for Windows 11 x64.
+5. Add a reproducible installer in addition to the existing self-contained ZIP publish.
