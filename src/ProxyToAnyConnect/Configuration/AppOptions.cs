@@ -12,6 +12,9 @@ internal sealed class AppOptions
     [JsonPropertyName("l2tp")]
     public L2tpOptions L2tp { get; init; } = new();
 
+    [JsonPropertyName("logging")]
+    public LoggingOptions Logging { get; init; } = new();
+
     public static async Task<AppOptions> LoadAsync(string path, CancellationToken cancellationToken)
     {
         await using var stream = File.OpenRead(path);
@@ -53,6 +56,11 @@ internal sealed class AppOptions
         if (L2tp.RouteMonitorIntervalMilliseconds is < 1000 or > 300000)
         {
             throw new InvalidOperationException("l2tp.routeMonitorIntervalMilliseconds is outside the allowed range.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(Logging.FilePath) && Logging.FilePath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+        {
+            throw new InvalidOperationException("logging.filePath contains invalid path characters.");
         }
 
         ValidateVerification(L2tp.Verification);
@@ -158,4 +166,17 @@ internal sealed class VerificationOptions
 
     [JsonPropertyName("maxResponseBytes")]
     public int MaxResponseBytes { get; init; } = 65536;
+}
+
+internal sealed class LoggingOptions
+{
+    // Relative paths are resolved against the directory containing appsettings.json.
+    // Empty/null disables file logging.
+    [JsonPropertyName("filePath")]
+    public string? FilePath { get; init; } = "logs/ProxyToAnyConnect.jsonl";
+
+    // Human-readable console status remains enabled independently. This option emits
+    // the same structured JSON entries to stdout as well, which is useful for services.
+    [JsonPropertyName("consoleJson")]
+    public bool ConsoleJson { get; init; }
 }
