@@ -50,6 +50,11 @@ internal sealed class AppOptions
             throw new InvalidOperationException("l2tp.monitorIntervalMilliseconds is outside the allowed range.");
         }
 
+        if (L2tp.RouteMonitorIntervalMilliseconds is < 1000 or > 300000)
+        {
+            throw new InvalidOperationException("l2tp.routeMonitorIntervalMilliseconds is outside the allowed range.");
+        }
+
         ValidateVerification(L2tp.Verification);
     }
 
@@ -121,8 +126,14 @@ internal sealed class L2tpOptions
     [JsonPropertyName("entryName")]
     public string EntryName { get; init; } = "ProxyToAnyConnect-L2TP";
 
+    // Fast RAS/PPP health check. This does not perform Internet traffic.
     [JsonPropertyName("monitorIntervalMilliseconds")]
     public int MonitorIntervalMilliseconds { get; init; } = 1000;
+
+    // Independent guard for the host's IPv4 default-route set while the VPN is Ready.
+    // A mismatch fails closed and tears down the L2TP connection.
+    [JsonPropertyName("routeMonitorIntervalMilliseconds")]
+    public int RouteMonitorIntervalMilliseconds { get; init; } = 5000;
 
     [JsonPropertyName("verification")]
     public VerificationOptions Verification { get; init; } = new();
