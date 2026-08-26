@@ -41,6 +41,11 @@ internal sealed class VpnContext : IDisposable
     public CancellationToken LifetimeToken => _lifetimeToken;
     public bool IsAlive => !_lifetimeToken.IsCancellationRequested;
 
+    // Internal diagnostics are intentionally scalar only: no history or
+    // connection registry is retained merely for observability.
+    internal int ReferenceCount => Math.Max(0, Volatile.Read(ref _references));
+    internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
     internal void MarkDisconnected()
     {
         if (!_lifetimeToken.IsCancellationRequested)
