@@ -73,6 +73,11 @@ internal sealed class ProxyServer
             {
                 // Normal shutdown.
             }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Unhandled proxy session error: {ex}");
+                await TryWriteErrorAsync(client, 500, "Internal Server Error", "Proxy session failed.", cancellationToken);
+            }
         }
     }
 
@@ -171,9 +176,14 @@ internal sealed class ProxyServer
         return new HttpDestination(host, authorityPort, relativeOriginTarget);
     }
 
-    private static (string Host, int Port) ParseAuthority(string authority, int defaultPort)
+    internal static (string Host, int Port) ParseAuthority(string authority, int defaultPort)
     {
         var value = authority.Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new InvalidDataException("Proxy target authority is empty.");
+        }
+
         if (value.StartsWith('['))
         {
             throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
@@ -186,7 +196,9 @@ internal sealed class ProxyServer
         }
 
         var host = value[..colon];
-        if (!int.TryParse(value[(colon + 1)..], out var port) || port is < 1 or > 65535)
+        if (string.IsNullOrWhiteSpace(host) ||
+            !int.TryParse(value[(colon + 1)..], out var port) ||
+            port is < 1 or > 65535)
         {
             throw new InvalidDataException($"Invalid target authority '{authority}'.");
         }
@@ -307,7 +319,7 @@ internal sealed class ProxyServer
     private sealed record HeaderReadResult(byte[] Header, byte[] Remainder);
     private sealed record HttpDestination(string Host, int Port, string OriginTarget);
 
-    private sealed class ParsedProxyRequest
+    internal sealed class ParsedProxyRequest
     {
         private ParsedProxyRequest(
             string method,
@@ -339,6 +351,11 @@ internal sealed class ProxyServer
             if (firstLine.Length != 3)
             {
                 throw new InvalidDataException("Malformed HTTP request line.");
+            }
+
+            if (!firstLine[2].StartsWith("HTTP/", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException($"Unsupported HTTP version token '{firstLine[2]}'.");
             }
 
             var headers = new List<KeyValuePair<string, string>>();
@@ -382,10 +399,18 @@ internal sealed class ProxyServer
             var builder = new StringBuilder();
             builder.Append(Method).Append(' ').Append(originTarget).Append(' ').Append(Version).Append("\r\n");
 
+            var connectionHeaderTokens = Headers
+                .Where(header => header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                .SelectMany(header => header.Value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
             foreach (var header in Headers)
             {
                 if (header.Key.Equals("Proxy-Connection", StringComparison.OrdinalIgnoreCase) ||
-                    header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                    header.Key.Equals("Proxy-Authorization", StringComparison.OrdinalIgnoreCase) ||
+                    header.Key.Equals("Proxy-Authenticate", StringComparison.OrdinalIgnoreCase) ||
+                    header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+                    connectionHeaderTokens.Contains(header.Key))
                 {
                     continue;
                 }
