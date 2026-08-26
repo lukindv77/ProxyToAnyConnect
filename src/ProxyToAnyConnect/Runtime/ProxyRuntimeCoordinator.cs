@@ -9,6 +9,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
 {
     private readonly Dictionary<string, VpnLeaseManager> _vpnById;
     private readonly Dictionary<string, ProxyInstanceRuntime> _proxyById;
+    private readonly HashSet<string> _pendingStartProxyIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _reconfigureGate = new(1, 1);
     private readonly object _collectionGate = new();
     private AppOptions _options;
@@ -48,11 +49,30 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         }
     }
 
-    public Task StartProxyAsync(string proxyId, CancellationToken cancellationToken = default) =>
-        GetProxy(proxyId).StartAsync(cancellationToken);
+    public async Task StartProxyAsync(string proxyId, CancellationToken cancellationToken = default)
+    {
+        var proxy = GetProxy(proxyId);
+        await proxy.StartAsync(cancellationToken);
 
-    public Task PauseProxyAsync(string proxyId, CancellationToken cancellationToken = default) =>
-        GetProxy(proxyId).PauseAsync(cancellationToken);
+        lock (_collectionGate)
+        {
+            if (_proxyById.TryGetValue(proxyId, out var current) && ReferenceEquals(current, proxy))
+            {
+                _pendingStartProxyIds.Remove(proxyId);
+            }
+        }
+    }
+
+    public async Task PauseProxyAsync(string proxyId, CancellationToken cancellationToken = default)
+    {
+        var proxy = GetProxy(proxyId);
+        await proxy.PauseAsync(cancellationToken);
+
+        lock (_collectionGate)
+        {
+            _pendingStartProxyIds.Remove(proxyId);
+        }
+    }
 
     public async Task ReconfigureAsync(AppOptions newOptions, CancellationToken cancellationToken = default)
     {
@@ -69,6 +89,12 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
             var newVpnOptions = newOptions.VpnConnections.ToDictionary(vpn => vpn.Id, StringComparer.OrdinalIgnoreCase);
             var oldProxyOptions = _options.Proxies.ToDictionary(proxy => proxy.Id, StringComparer.OrdinalIgnoreCase);
             var newProxyOptions = newOptions.Proxies.ToDictionary(proxy => proxy.Id, StringComparer.OrdinalIgnoreCase);
+
+            lock (_collectionGate)
+            {
+                _pendingStartProxyIds.RemoveWhere(id =>
+                    !newProxyOptions.TryGetValue(id, out var proxy) || !proxy.Enabled);
+            }
 
             var changedVpnIds = UnionIds(oldVpnOptions.Keys, newVpnOptions.Keys)
                 .Where(id => !oldVpnOptions.TryGetValue(id, out var oldValue) ||
@@ -171,15 +197,25 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
 
             // Preserve runtime Pause/Running state for existing proxies. A newly enabled proxy,
             // or a proxy that was in Error and whose configuration changed, gets another start attempt.
+            // Failed/cancelled desired starts remain pending so applying the same configuration again
+            // reconciles runtime state even when there is no longer a configuration diff.
+            var startCandidateIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            lock (_collectionGate)
+            {
+                foreach (var proxyId in _pendingStartProxyIds)
+                {
+                    if (_proxyById.ContainsKey(proxyId) &&
+                        newProxyOptions.TryGetValue(proxyId, out var pendingProxy) &&
+                        pendingProxy.Enabled)
+                    {
+                        startCandidateIds.Add(proxyId);
+                    }
+                }
+            }
+
             foreach (var proxyId in affectedProxyIds)
             {
-                ProxyInstanceRuntime? runtime;
-                lock (_collectionGate)
-                {
-                    _proxyById.TryGetValue(proxyId, out runtime);
-                }
-
-                if (runtime is null || !newProxyOptions.TryGetValue(proxyId, out var newProxy))
+                if (!newProxyOptions.TryGetValue(proxyId, out var newProxy))
                 {
                     continue;
                 }
@@ -200,16 +236,61 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
 
                 if (shouldStart)
                 {
-                    await TryStartProxyAsync(runtime, cancellationToken);
+                    startCandidateIds.Add(proxyId);
+                }
+            }
+
+            lock (_collectionGate)
+            {
+                foreach (var proxyId in startCandidateIds)
+                {
+                    _pendingStartProxyIds.Add(proxyId);
+                }
+            }
+
+            foreach (var proxyId in startCandidateIds)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                ProxyInstanceRuntime? runtime;
+                lock (_collectionGate)
+                {
+                    _proxyById.TryGetValue(proxyId, out runtime);
+                }
+
+                if (runtime is null ||
+                    !newProxyOptions.TryGetValue(proxyId, out var newProxy) ||
+                    !newProxy.Enabled)
+                {
+                    lock (_collectionGate)
+                    {
+                        _pendingStartProxyIds.Remove(proxyId);
+                    }
+
+                    continue;
+                }
+
+                if (await TryStartProxyAsync(runtime, cancellationToken))
+                {
+                    lock (_collectionGate)
+                    {
+                        if (_proxyById.TryGetValue(proxyId, out var current) &&
+                            ReferenceEquals(current, runtime))
+                        {
+                            _pendingStartProxyIds.Remove(proxyId);
+                        }
+                    }
                 }
             }
 
             int totalProxyCount;
             int affectedExistingProxyCount;
+            int pendingStartCount;
             lock (_collectionGate)
             {
                 totalProxyCount = _proxyById.Count;
                 affectedExistingProxyCount = affectedProxyIds.Count(_proxyById.ContainsKey);
+                pendingStartCount = _pendingStartProxyIds.Count;
             }
 
             AppLog.Info(
@@ -219,8 +300,17 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 {
                     ChangedVpnCount = changedVpnIds.Count,
                     AffectedProxyCount = affectedProxyIds.Count,
-                    UnaffectedProxyCount = Math.Max(0, totalProxyCount - affectedExistingProxyCount)
+                    UnaffectedProxyCount = Math.Max(0, totalProxyCount - affectedExistingProxyCount),
+                    PendingStartCount = pendingStartCount
                 });
+
+            if (pendingStartCount > 0)
+            {
+                AppLog.Warning(
+                    "runtime.reconfigure.start_pending",
+                    "Configuration is applied, but one or more desired proxy starts remain pending reconciliation.",
+                    new { PendingStartCount = pendingStartCount });
+            }
         }
         finally
         {
@@ -288,17 +378,25 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         }
     }
 
-    private static async Task TryStartProxyAsync(
+    private static async Task<bool> TryStartProxyAsync(
         ProxyInstanceRuntime proxy,
         CancellationToken cancellationToken)
     {
         try
         {
             await proxy.StartAsync(cancellationToken);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Caller cancellation is control flow, not an isolated proxy/L2TP failure.
+            // It must stop the foreground operation and remain visible to the caller.
+            throw;
         }
         catch
         {
             // One failed proxy/L2TP group must not prevent unrelated groups from starting/reloading.
+            return false;
         }
     }
 
@@ -326,6 +424,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 vpns = _vpnById.Values.ToArray();
                 _proxyById.Clear();
                 _vpnById.Clear();
+                _pendingStartProxyIds.Clear();
             }
 
             foreach (var proxy in proxies)
