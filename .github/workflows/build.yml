@@ -17,15 +17,21 @@ jobs:
       - name: Validate PowerShell tools
         shell: pwsh
         run: |
-          $tokens = $null
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path './tools/Invoke-WindowsIntegrationEvidence.ps1'),
-            [ref]$tokens,
-            [ref]$errors) | Out-Null
-          if ($errors.Count -ne 0) {
-            $errors | ForEach-Object { Write-Error $_.Message }
-            exit 1
+          $toolPaths = @(
+            './tools/Invoke-WindowsIntegrationEvidence.ps1',
+            './tools/Test-WindowsIntegrationEvidence.ps1'
+          )
+          foreach ($toolPath in $toolPaths) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $toolPath),
+              [ref]$tokens,
+              [ref]$errors) | Out-Null
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error "$toolPath: $($_.Message)" }
+              exit 1
+            }
           }
 
       - name: Smoke-test Windows integration evidence
@@ -37,22 +43,30 @@ jobs:
             -OutputDirectory $output `
             -SkipExternalProbes | Write-Host
 
+          ./tools/Test-WindowsIntegrationEvidence.ps1 `
+            -Stage Baseline `
+            -OutputDirectory $output | Write-Host
+
           $evidencePath = Join-Path $output 'baseline/evidence.json'
           $summaryPath = Join-Path $output 'baseline/summary.json'
-          if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf)) {
-            throw "Evidence harness did not create $evidencePath"
-          }
-          if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
-            throw "Evidence harness did not create $summaryPath"
+          $manifestPath = Join-Path $output 'baseline/manifest.json'
+          foreach ($requiredPath in @($evidencePath, $summaryPath, $manifestPath)) {
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+              throw "Evidence harness did not create $requiredPath"
+            }
           }
 
           $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
           $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
           if ($evidence.schemaVersion -ne 1 -or $evidence.stage -ne 'Baseline') {
             throw 'Evidence harness emitted an unexpected schema/stage.'
           }
           if ($summary.stage -ne 'Baseline' -or $summary.failedAssertionCount -ne 0) {
             throw 'Baseline evidence smoke test unexpectedly reported failed assertions.'
+          }
+          if ($manifest.stage -ne 'Baseline' -or $manifest.fileCount -lt 2) {
+            throw 'Evidence validator emitted an incomplete integrity manifest.'
           }
 
       - name: Setup .NET 10
