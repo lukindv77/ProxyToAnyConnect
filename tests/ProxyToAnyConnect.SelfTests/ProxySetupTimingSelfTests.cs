@@ -6,9 +6,9 @@ namespace ProxyToAnyConnect.SelfTests;
 
 internal static class ProxySetupTimingSelfTests
 {
-    private const int WarmupIterations = 256;
+    private const int WarmupIterations = 2048;
     private const int TimingRounds = 9;
-    private const int IterationsPerRound = 4096;
+    private const int IterationsPerRound = 32768;
     private const double MaxMedianSlowdownRatio = 1.25;
     private const string OriginPath = "/path?q=1";
 
