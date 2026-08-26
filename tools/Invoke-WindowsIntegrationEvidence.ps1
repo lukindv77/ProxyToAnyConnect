@@ -95,11 +95,12 @@ function Invoke-CurlProbe {
 }
 
 function Get-DefaultRouteSnapshot {
-    return @(
+    $items = @(
         Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
             Sort-Object ifIndex, NextHop, RouteMetric, PolicyStore |
             Select-Object ifIndex, InterfaceAlias, DestinationPrefix, NextHop, RouteMetric, InterfaceMetric, PolicyStore
     )
+    return ,$items
 }
 
 function Get-VpnProfileSnapshot {
@@ -137,11 +138,12 @@ function Get-VpnProfileSnapshot {
         }
     }
 
-    return @($items | Sort-Object Scope, Name)
+    $sorted = @($items | Sort-Object Scope, Name)
+    return ,$sorted
 }
 
 function Get-InterfaceSnapshot {
-    return @(
+    $items = @(
         Get-NetIPConfiguration -ErrorAction Stop |
             ForEach-Object {
                 [pscustomobject]@{
@@ -156,6 +158,7 @@ function Get-InterfaceSnapshot {
             } |
             Sort-Object InterfaceIndex
     )
+    return ,$items
 }
 
 function Copy-RecentJsonlLogs {
@@ -204,11 +207,12 @@ $routesCapture = Invoke-Capture 'defaultRoutes' { Get-DefaultRouteSnapshot }
 $vpnCapture = Invoke-Capture 'vpnProfiles' { Get-VpnProfileSnapshot }
 $interfacesCapture = Invoke-Capture 'interfaces' { Get-InterfaceSnapshot }
 $processCapture = Invoke-Capture 'process' {
-    @(
+    $items = @(
         Get-Process -Name 'ProxyToAnyConnect' -ErrorAction SilentlyContinue |
             Select-Object Id, ProcessName, StartTime, WorkingSet64, PrivateMemorySize64, HandleCount,
                 @{n='ThreadCount';e={$_.Threads.Count}}
     )
+    return ,$items
 }
 
 $routeFingerprint = $null
