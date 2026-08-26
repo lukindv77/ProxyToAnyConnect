@@ -1,171 +1,163 @@
 # New Chat Startup Prompt — ProxyToAnyConnect
 
-Copy the text below as the first message in a new ChatGPT conversation.
+Скопируй весь текст ниже первым сообщением в новый чат.
 
 ---
 
-Продолжаем разработку private GitHub-проекта **`lukindv77/ProxyToAnyConnect`**. Это перенос из предыдущего длинного чата. Не начинай проект заново и не переосмысливай уже зафиксированные требования без причины.
+Продолжаем разработку private GitHub-проекта **`lukindv77/ProxyToAnyConnect`** после длинного предыдущего чата. Не начинай проект заново и не переосмысливай зафиксированные требования. **Актуальный GitHub `main` — главный source of truth.**
 
-## Сначала синхронизируй контекст из GitHub
+## Сначала синхронизируйся с GitHub
 
-Используй подключённый GitHub и **до любых изменений**:
+До любых изменений:
 
-1. Прочитай на актуальном `main`:
+1. Получи текущий `main` SHA.
+2. Прочитай на актуальном `main`:
    - `docs/handoff/CURRENT_STATE.md`
    - `docs/handoff/AUDIT_SNAPSHOT.md`
    - `docs/handoff/ISSUES_SNAPSHOT.md`
    - `docs/handoff/MANIFEST.md`
-   - `docs/requirements.md` — основной source of truth требований
+   - `docs/requirements.md`
    - `docs/architecture.md`
    - `docs/memory-stability.md`
    - `docs/windows-integration-test.md`
    - `README.md`
    - `.github/workflows/build.yml`
    - `.github/workflows/handoff.yml`
-2. Получи latest commit `main` и не предполагай, что SHA из handoff всё ещё последний.
-3. Получи актуальные GitHub Issues и их новые комментарии/acceptance criteria. На момент handoff открыты были `#2, #4, #5, #6, #7, #10, #11, #12, #13`; закрыты `#1, #3, #8, #9`, но перепроверь это в GitHub.
-4. Проверь GitHub Actions для **текущего head**, а не старого commit. Проверь оба workflow: `build` и `handoff`. Не утверждай, что CI зелёный, пока это не подтверждено для актуального head.
-5. Просмотри текущую структуру `src/ProxyToAnyConnect` и `tests/ProxyToAnyConnect.SelfTests`, прежде чем писать код.
-6. Если GitHub расходится с этим prompt/handoff, **актуальный GitHub имеет приоритет**, кроме случаев, когда это очевидная незавершённая/сломанная промежуточная правка — тогда сначала разберись по commit history/issues/CI.
+3. Получи актуальные GitHub Issues и последние комментарии к open issues.
+4. Проверь `build` и `handoff` GitHub Actions **для текущего head**, а не для старого commit.
+5. Перед архитектурными изменениями просмотри текущие `src/ProxyToAnyConnect/Runtime`, `Proxy`, `Network`, `Vpn`, `Configuration`, `Gui` и соответствующие self-tests.
+6. Если prompt/handoff расходится с live GitHub, приоритет у live GitHub, кроме явно сломанной незавершённой промежуточной правки — тогда сначала разберись по commit history/issues/CI.
 
-## Что это за проект
+## Проект
 
-Windows 11 x64 GUI-приложение на **C# / .NET 10 (`net10.0-windows`)**, WinForms + system tray. Оно поднимает один или несколько локальных HTTP/HTTPS forward proxy и направляет трафик каждого proxy **исключительно через выбранное L2TP**.
+Windows 11 x64 GUI-приложение на **C# / .NET 10 (`net10.0-windows`)**, WinForms + tray. Поднимает несколько локальных HTTP/HTTPS forward proxy. Каждый proxy направляет трафик **только через выбранное L2TP**, без DIRECT fallback. Защищаемые домены выбираются внешним PAC/браузером; само приложение домены не маршрутизирует.
 
-Защищаемые домены выбираются снаружи, например Chrome PAC. Сам ProxyToAnyConnect не выбирает домены и **не имеет DIRECT fallback**.
+## Неподлежащие откату требования
 
-## Жёсткие требования, которые уже согласованы
+- Всегда GUI. `X` формы скрывает в tray; процесс завершается только явным **«Выйти»**.
+- Несколько proxy одновременно; у каждого bind IPv4, port, timeouts, `maxConcurrentConnections`, выбранный L2TP, state, RX/TX; независимые Pause/Resume.
+- L2TP — shared/dedicated catalog entities. Shared может иметь несколько active leases; dedicated — одну.
+- Running proxy держит L2TP lease. Первая lease dial+verify; последняя release вызывает disconnect / `RasHangUp`.
+- Existing Windows profile и CustomEphemeral private `.pbk` без постоянного Windows Settings VPN profile.
+- Custom fields: server, user/password/domain/current Windows creds, PSK/cert, PPP auth/encryption/timeouts.
+- Password/PSK — только Windows user-bound DPAPI, никогда plaintext.
+- Keepalive Off / PPP server internal IPv4 / CustomIPv4; source-bound к конкретному L2TP; threshold => fail-closed teardown + reconnect при оставшихся leases.
+- JSONL append-only `<root>/YYYY-MM/YYYY-MM-DD.jsonl`, retention, configurable root; никаких secrets/body/tunnel contents.
+- HTTPS через CONNECT без MITM.
 
-- .NET **10**, не .NET 8.
-- Приложение всегда GUI, может скрываться в tray.
-- `X` главной формы не завершает процесс, а скрывает его в tray.
-- Завершение только через явное **«Выйти»** в меню приложения или tray.
-- Несколько независимых proxy-настроек одновременно.
-- У каждого proxy свой bind IPv4, порт, timeouts, `maxConcurrentConnections`, выбранный L2TP, Running/Paused/Error, RX/TX.
-- Каждый proxy можно Pause/Resume независимо.
-- L2TP — отдельные сущности каталога: shared или dedicated.
-- Shared L2TP может использоваться несколькими активными proxy.
-- Dedicated — одним proxy.
-- Running proxy держит lease выбранного L2TP.
-- Первая lease поднимает/проверяет VPN, последняя освобождённая lease вызывает `RasHangUp`.
-- Если proxy поставлен на паузу и других активных proxy на его L2TP нет — L2TP отключается.
-- Два режима L2TP:
-  1. existing Windows L2TP profile;
-  2. custom ephemeral L2TP через private temporary `.pbk`, **без постоянного VPN-профиля в Windows Settings**.
-- Custom L2TP настраивает server, user/password/domain/current credentials, IPsec PSK/certificate, PPP auth/encryption, timeouts.
-- Password/PSK не хранятся plaintext; используется Windows user-bound DPAPI.
-- Keepalive L2TP: Off / PPP server internal IPv4 / arbitrary CustomIPv4, с interval, timeout, consecutive-failure threshold.
-- Keepalive идёт с source IPv4 конкретного L2TP; при threshold — fail-closed teardown + reconnect, если есть активные leases.
-- GUI показывает proxy RX/TX и L2TP aggregate RX/TX + average successful keepalive ping за последние 5 минут.
-- Логи JSONL append-only:
-  - настраиваемая log root folder, default папка приложения;
-  - retention days;
-  - `<root>/YYYY-MM/YYYY-MM-DD.jsonl`;
-  - новая строка только append, файл целиком не читается/не переписывается;
-  - password/PSK/body/tunnel contents не логируются.
+## Fail-closed invariants
 
-## Fail-closed / routing — нельзя ослаблять
+- Никогда DIRECT.
+- Все outbound proxy TCP sockets: `Bind()` к динамическому L2TP IPv4 + `IP_UNICAST_IF` L2TP ifIndex.
+- DNS proxy destinations — собственный L2TP-bound resolver, не `System.Net.Dns`.
+- Existing profile preflight: L2TP + split tunneling.
+- Default IPv4 route guard before/after dial + continuous.
+- Lifecycle `Disconnected -> Dialing -> Verifying -> Ready`; context недоступен proxy до Ready.
+- Реальный L2TP-bound HTTPS verification. Fixed public IPv4 обязан совпасть; DNS publicAddress пропускает только equality-to-fixed-IP check.
+- L2TP loss отменяет зависимые CONNECT/HTTP sessions.
+- Proxy runtime обязан полностью drain accepted sessions до освобождения L2TP lease.
 
-- Прокси-трафик никогда не должен уйти DIRECT.
-- Все outbound TCP proxy sockets используют:
-  - `Bind()` к динамически выданному L2TP IPv4;
-  - `IP_UNICAST_IF` = L2TP interface index.
-- DNS проксируемых destination выполняется своим L2TP-bound resolver, не `System.Net.Dns`.
-- Установка L2TP не должна менять default Internet route других приложений.
-- Existing Windows profile до `RasDial` проверяется на L2TP + split tunneling.
-- Default IPv4 routes снимаются до/после dial и непрерывно контролируются.
-- VPN lifecycle: `Disconnected -> Dialing -> Verifying -> Ready`.
-- До `Ready` proxy не получает VPN context.
-- Verification выполняет реальный L2TP-bound HTTPS probe.
-- Если configured public address — IPv4 literal, observed public IP обязан совпасть.
-- Если configured public address — DNS name, пропускаются только проверки, которые требуют заранее фиксированный expected IPv4; остальные проверки обязательны.
-- При L2TP loss активные зависимые CONNECT/HTTP sessions отменяются и закрываются.
-- HTTPS — обычный CONNECT, без MITM.
+## Performance/memory invariants
 
-## Performance + memory — также жёсткое требование
+Fail-closed, latency/throughput и bounded memory равноправны.
 
-Скорость data path и стабильность памяти равноправны с fail-closed.
+- Не добавлять global locks, sync waits, лишние copies/serialization/per-buffer allocations в hot path.
+- Не уменьшать buffers ради working set, если растёт syscall rate/latency или падает throughput.
+- Никакого production forced GC/working-set trim.
+- Любое in-memory state bounded.
+- Memory-only change не принимается, если repeatable benchmark ухудшает latency/tail/jitter/throughput больше measurement noise.
 
-- Минимизировать added latency и jitter.
-- Сохранять высокий sustained throughput.
-- Оптимизировать память **всего процесса**, не только одного соединения.
-- Не допускается memory-only оптимизация, если repeatable before/after тест показывает увеличение proxy latency/tail latency/jitter или снижение throughput выше measurement noise.
-- Не добавлять global locks/sync waits/лишние data copies/serialization/per-buffer allocations в byte-transfer hot path ради памяти.
-- Не уменьшать transfer buffers просто ради working set, если растёт syscall frequency или падает throughput.
-- Никакого forced GC/working-set trimming в production.
-- In-memory state должен быть bounded; никаких unbounded history/task/cache registries.
-- Если есть конфликт «минимальный footprint» против «bounded predictable memory + faster data path», выбирай второй вариант.
+## Реализованный baseline — не повторяй без проверки кода
 
-## Что уже реализовано — не делай повторно без проверки текущего кода
+Уже есть WinForms/tray, multi-proxy runtime, shared/dedicated `VpnLeaseManager`, Pause/Resume, Existing profile validation, CustomEphemeral phonebook + DPAPI, RAS client/server IPv4/interface/DNS discovery, source-IP + interface socket binding, route guard, HTTPS verification, L2TP-bound DNS UDP/TCP/CNAME/bounded cache, HTTP proxy + CONNECT, `ArrayPool<byte>` pumps, bounded connection admission, deterministic session drain, traffic/ping metrics, append-only logs, latest L2TP status GUI/backend, process-memory snapshot, deterministic `VpnContext` ownership, selective reconfigure isolation, cancellation reconciliation and long-run weak-reference tests.
 
-По handoff-состоянию в проекте уже есть:
+Important lifecycle fix history: per-RAS-session monitor CTS/task ownership уже реализован; старый monitor не должен переживать disconnect и не может hangup новый handle.
 
-- WinForms + tray lifecycle.
-- Multi-proxy runtime и shared/dedicated VPN lease manager.
-- Pause/Resume и disconnect L2TP при последней lease.
-- Existing Windows L2TP profile enumeration/validation.
-- Custom ephemeral private RAS phonebook + DPAPI secrets; native Windows CI smoke-test создания L2TP `.pbk` + PSK + cleanup.
-- Custom ephemeral mode уже подключён к `RasConnectionManager` common dial/verify path; реальный внешний endpoint ещё надо тестировать.
-- RAS PPP IPv4/interface/DNS discovery.
-- Source-IP binding + `IP_UNICAST_IF`.
-- Split-tunnel guard и native default-route snapshot/continuous guard.
-- Active HTTPS connectivity verification.
-- Custom L2TP-bound DNS: UDP, TCP fallback, CNAME, bounded TTL cache per L2TP, shared между proxy на одном shared VPN.
-- HTTP forward proxy + bidirectional CONNECT.
-- `ArrayPool<byte>` transfer buffers, no full tunnel buffering.
-- `maxConcurrentConnections` per proxy и accept-backpressure.
-- Deterministic proxy shutdown drain до освобождения VPN lease.
-- Runtime RX/TX metrics and rolling ping.
-- Append-only daily logs + retention.
-- Process memory-health snapshot and logging.
-- `VpnContext` ref-count lifetime; CTS dispose после последнего consumer.
-- Bounded latest-L2TP-status registry.
-- Proxy runtime completion observer tracked/joined при Pause/reconfigure/Exit.
-- Per-session RAS monitor CTS/task, join при disconnect/reconnect; stale old monitor не может hangup новый RAS handle.
-- Windows self-tests и self-contained win-x64 publish artifact.
+## Самые новые изменения перед этим handoff
 
-## Последний известный проверенный code baseline до handoff-doc commits
+### HTTP framing / request-smuggling — issue #14
 
-Commit `5c3955fce4896c0a02b78c021eaccd8078ada8f4` — `fix: own RAS monitor lifetime per VPN session`.
-GitHub Actions run #181 был полностью успешен: Build, Self-tests, Publish, ZIP, Upload artifact.
+Production commit **`f9db53f074d6740296e46452077622099b6f64ff`** — `fix: enforce plain HTTP request framing`.
 
-После него добавлялись docs/handoff/workflow commits. Поэтому **обязательно проверь CI текущего head** и используй текущий head как baseline. Handoff workflow создаёт `ProxyToAnyConnect-handoff-<sha>` source ZIP с `HANDOFF_BUILD_INFO.txt`; обычный build workflow отдельно публикует self-contained win-x64 ZIP.
+Plain HTTP теперь:
+- строго парсит request framing до outbound connect;
+- принимает только один валидный non-negative decimal `Content-Length`;
+- rejects duplicate/conflicting/comma-list CL;
+- rejects любой `Transfer-Encoding`, включая TE+CL;
+- no CL => body length 0;
+- initial bytes после header не могут превышать CL;
+- client→origin forwarding ограничен ровно CL bytes;
+- trailing/pipelined/smuggled bytes после body не отправляются origin;
+- early EOF before body completion fails session;
+- valid CL сохраняется в origin request;
+- CONNECT остаётся opaque tunnel.
 
-## Известные audit gaps / следующий приоритет
+Добавлен `ProxyHttpFramingSelfTests.cs`, в том числе loopback smuggling boundary/regression и pre-outbound rejection cases. `CombinedTestRunner` запускает этот suite.
 
-Главный незакрытый риск — не компиляция, а реальная Windows 11 + настоящий L2TP integration validation.
+### Timing guard stabilization attempt
 
-Проверь актуальные issues, но ожидай такие направления:
+Commit **`71a93e5d529225adfd0e1b5125a4302d81c58da5`** — `test: stabilize proxy setup timing guard` — увеличил только benchmark warmup/sample (`2048` warmup, `32768` ops/round), **порог 1.25x не ослаблен**.
 
-1. #2 — реальный Windows 11 E2E с существующим и custom ephemeral L2TP.
-2. #6/#7 — реальный custom L2TP + keepalive/reconnect validation.
-3. #10/#12 — bounded latest L2TP status backend есть; завершить/проверить GUI `Status / reason` с verification/keepalive/cooldown/fail-closed detail.
-4. #13 — продолжать long-run memory/resource audit: repeated Pause/Resume/reconnect/selective reconfigure, без monotonic retained graph/handles.
-5. #4/#5 — проверить все acceptance criteria multi-proxy/settings, особенно unique bind endpoint validation, bind IPv4 selector и selective reload isolation.
-6. #11 — performance/memory changes должны иметь repeatable regression coverage и не ухудшать data path.
-7. Обновлять `docs/windows-integration-test.md` результатами реального теста.
+Текущий известный exact-head CI для `71a93e5d...`:
+- build run **#271 / 32979967766**: **FAILED** на `ProxySetupTimingSelfTests`; build compile succeeded, но text-span parser median = **5859 ns/op** vs immediate-predecessor **3350 ns/op**, ratio **1.75x**, limit 1.25x.
+- предыдущий run #270 на `f9db53f...` тоже failed в том же timing gate: 5322 vs 3206 ns/op = 1.66x.
+- новый `ProxyHttpFramingSelfTests` из-за порядка runner ещё не успевает выполниться, потому что timing suite падает раньше.
+- handoff run **#83 / 32979967788** для `71a93e5d...`: **SUCCESS**, archive создан.
 
-## Правила работы в новом чате
+**Не называй текущий code head green.** Первая задача нового чата — выяснить, является ли 1.66–1.75x реальной регрессией production parser после framing bookkeeping или benchmark сравнивает несопоставимые predecessor/current paths. Порог не ослаблять просто ради CI. Нужен source-level разбор `ProxySetupTimingSelfTests` + `ParsedProxyRequest.Parse`, затем минимальный корректный fix и exact-head Windows CI до выполнения framing suite.
 
-- Общайся со мной по-русски, технически и прямо.
-- Не задавай повторно вопросы, ответы на которые уже есть в requirements/handoff/GitHub.
-- Делай best-effort архитектурные решения и сразу реализуй их.
-- При длительной работе давай короткие промежуточные обновления.
-- Пиши изменения непосредственно в GitHub `main`, как делалось ранее, если я не изменю workflow.
-- После значимых изменений проверяй CI и не называй код рабочим/зелёным без фактической проверки актуального head.
-- Фиксируй новые постоянные требования в `docs/requirements.md`, архитектурные решения/аудит — в соответствующих docs/issues.
-- Не откатывай уже принятые требования (нет DIRECT, .NET 10, GUI/tray, multi-proxy, custom ephemeral и т.д.).
+### Следующий lifecycle bug — issue #15
 
-### Начни сейчас
+Создана open issue **#15 `Make proxy startup ownership transactional and drain-safe`**.
 
-Синхронизируйся с GitHub по шагам выше, кратко сообщи:
+Подтверждённый audit finding: `ProxyInstanceRuntime.StartAsync` после создания `runTask` присваивает `_lease`, `_runCancellation`, `_runTask`, затем ждёт `WaitUntilListeningAsync`. Если wait throws/cancel, catch отменяет/Dispose локальные ресурсы, но может не очистить уже назначенные fields и не await/drain exact `runTask`. Это допускает stale disposed ownership и release L2TP lease до полного listener/session drain.
 
-1. актуальный head SHA;
-2. статус последних `build` и `handoff` workflow для него;
-3. какие roadmap issues сейчас open/closed;
-4. есть ли расхождения между handoff и текущим кодом;
-5. какой следующий конкретный кодовый шаг ты выбираешь.
+Acceptance #15:
+- start attempt = единая generation/ownership transaction;
+- на fail/cancel после создания runTask: cancel run CTS -> await exact runTask drain -> clear fields той же generation -> dispose CTS -> release exact lease once;
+- caller cancellation остаётся cancellation;
+- retry безопасен;
+- bind/start failure retryable;
+- Pause/Dispose idempotent без double release;
+- observer tasks не теряются;
+- successful Running lifecycle не меняется.
 
-После этого **сразу продолжай разработку**, не ожидая дополнительного подтверждения, если GitHub не обнаружил критическое противоречие.
+План testability seam: небольшой internal orchestration seam в `ProxyInstanceRuntime` (injectable lease acquisition + server-lifetime abstraction с `RunAsync`/`WaitUntilListeningAsync`), при этом production constructor продолжает текущую цепочку `VpnLeaseManager -> L2tpDnsResolver -> L2tpSocketFactory -> ProxyServer`; network/data path не менять.
+
+## Актуальная issue-карта на момент handoff
+
+Open: **#2, #4, #5, #6, #7, #11, #13, #14, #15**.
+Closed: **#1, #3, #8, #9, #10, #12**.
+
+Перепроверь live GitHub. #2 — обязательная реальная Windows 11 + L2TP E2E; #4/#5/#6/#7 требуют остаточной real-environment acceptance; #11 performance/memory ongoing; #13 long-run stability ongoing; #14 сейчас блокируется timing verdict; #15 следующий lifecycle implementation block.
+
+## Недавние важные regression/hardening результаты
+
+- canonical listener endpoint validation использует parsed `IPAddress`, поэтому эквивалентные IPv4 spellings (`127.1` == `127.0.0.1`) не обходят collision guard;
+- selective reconfigure сохраняет exact object identity независимой группы;
+- 250 repeated selective reconfigure cycles: retained replaced `ProxyInstanceRuntime` = 0/250, `VpnLeaseManager` = 0/250 в Windows CI test;
+- incremental CRLFCRLF header scan не пересканирует весь prefix при fragmented reads;
+- runtime start/reconfigure cancellation reconciliation regression есть и проходит до текущего timing gate;
+- shutdown drain regression гарантирует `ProxyServer.RunAsync` не возвращается до cleanup accepted sessions.
+
+## Правила работы
+
+- Общайся по-русски, технически и прямо.
+- Не задавай повторно вопросы, ответы на которые есть в GitHub/handoff/requirements.
+- Делай best-effort решения и реализуй сразу.
+- При длительной работе давай короткие progress updates.
+- Изменения обычно пишутся прямо в `main`, если пользователь не изменит workflow.
+- Новые цели/находки фиксируй в GitHub issues/docs до или вместе с кодом.
+- После значимых изменений проверяй exact-head `build` и `handoff`; green можно утверждать только по exact current head.
+- Не откатывай `.NET 10`, GUI/tray, multi-proxy, custom ephemeral, no-DIRECT, custom DNS, route guard, deterministic ownership и performance/memory invariants.
+
+## Начни работу так
+
+1. Синхронизируй live `main`, Actions, issues/comments и handoff docs.
+2. Кратко сообщи current SHA, exact-head CI и расхождения с snapshot.
+3. **Сначала разберись и исправь текущий `ProxySetupTimingSelfTests` / parser regression без ослабления 1.25x policy**, добейся прохождения suite до `ProxyHttpFramingSelfTests` и проверь framing tests.
+4. Если #14 проходит semantic + performance gates, обнови/закрой #14.
+5. Затем реализуй #15 transactional startup ownership с детерминированными tests и exact-head CI.
+6. После этого продолжай крупными блоками по #11/#13 и real-environment acceptance roadmap, не ограничиваясь одной мелкой задачей.
 
 ---

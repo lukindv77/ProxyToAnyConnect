@@ -1,22 +1,22 @@
 # ProxyToAnyConnect handoff manifest
 
-This file defines the minimum repository material that a new development conversation must inspect before continuing.
+This manifest defines the minimum material a new development chat must inspect before continuing. Live GitHub is authoritative.
 
-## Required handoff documents
+## Required reading
 
-1. `docs/handoff/NEW_CHAT_PROMPT.md` — first-message prompt for a new ChatGPT conversation.
-2. `docs/handoff/CURRENT_STATE.md` — implementation/product state snapshot.
-3. `docs/handoff/AUDIT_SNAPSHOT.md` — important audit findings, discovered races/ABI issues and the reasons behind current architecture.
-4. `docs/handoff/ISSUES_SNAPSHOT.md` — roadmap issue state/remaining acceptance snapshot.
-5. `docs/requirements.md` — authoritative product/runtime requirements.
-6. `docs/architecture.md` — current system architecture.
-7. `docs/memory-stability.md` — long-run ownership/memory rules and latency-neutral optimization invariant.
-8. `docs/windows-integration-test.md` — real Windows validation procedure.
-9. `README.md` — repository-level overview and invariants.
+1. `docs/handoff/NEW_CHAT_PROMPT.md` — first-message prompt for the new chat.
+2. `docs/handoff/CURRENT_STATE.md` — exact implementation/CI snapshot.
+3. `docs/handoff/AUDIT_SNAPSHOT.md` — engineering findings, races and architectural rationale.
+4. `docs/handoff/ISSUES_SNAPSHOT.md` — roadmap snapshot.
+5. `docs/requirements.md` — normative product/runtime requirements.
+6. `docs/architecture.md` — system architecture.
+7. `docs/memory-stability.md` — deterministic ownership, bounded memory and latency-neutral optimization rules.
+8. `docs/windows-integration-test.md` — real Windows/L2TP validation plan.
+9. `README.md`.
+10. `.github/workflows/build.yml` and `.github/workflows/handoff.yml`.
 
-## Code areas that must be reviewed before changing architecture
+## Code areas to inspect before architecture changes
 
-- `src/ProxyToAnyConnect/Program.cs`
 - `src/ProxyToAnyConnect/Configuration/`
 - `src/ProxyToAnyConnect/Gui/`
 - `src/ProxyToAnyConnect/Runtime/`
@@ -25,42 +25,49 @@ This file defines the minimum repository material that a new development convers
 - `src/ProxyToAnyConnect/Vpn/`
 - `src/ProxyToAnyConnect/Diagnostics/`
 - `tests/ProxyToAnyConnect.SelfTests/`
-- `.github/workflows/build.yml`
-- `.github/workflows/handoff.yml`
 
-## Live GitHub state that cannot be frozen only in documentation
+## Live state the next chat must query
 
-A new conversation must query GitHub for:
+- exact current `main` SHA;
+- exact-head `build` and `handoff` Actions status;
+- current open/closed issues and newest comments;
+- commits made after this snapshot;
+- latest build and handoff artifacts.
 
-- latest `main` commit SHA;
-- latest GitHub Actions run for that head;
-- current open/closed state and comments of roadmap issues;
-- commits made after this handoff snapshot;
-- current workflow artifacts.
+Never infer green CI from an older head.
 
-The repository and current CI always outrank stale snapshot metadata.
+## Handoff source archive
 
-## Handoff archive contents
+`.github/workflows/handoff.yml` runs on every `main` push and creates an Actions artifact:
 
-The GitHub Actions `handoff` workflow creates a ZIP artifact from the exact checked-out commit. The archive should contain:
+`ProxyToAnyConnect-handoff-<github.sha>`
+
+The ZIP contains the exact checked-out revision of:
 
 - `src/`
 - `tests/`
-- `docs/`
+- `docs/` including this manifest and `NEW_CHAT_PROMPT.md`
 - `.github/`
 - `README.md`
 - `ProxyToAnyConnect.sln`
-- root configuration/support text files needed to understand/build the repository
-- generated `HANDOFF_BUILD_INFO.txt` containing commit SHA, run number and UTC creation time
+- `.gitignore`
+- generated `HANDOFF_BUILD_INFO.txt` with repository, exact commit SHA, ref, workflow run, creation UTC, startup prompt path and read-first list.
 
-Build output directories (`bin`, `obj`) and `.git` are intentionally not included in the source handoff archive. The normal build workflow separately creates the self-contained Windows executable ZIP.
+`bin`, `obj` and `.git` are intentionally excluded. The normal `build` workflow separately creates the self-contained win-x64 application ZIP when its build/self-tests pass.
 
-## Baseline validation at handoff creation
+## Snapshot code/CI baseline immediately before this handoff docs commit
 
-The last code-level commit explicitly verified before handoff documentation packaging was:
+- `f9db53f074d6740296e46452077622099b6f64ff` — HTTP framing/request-smuggling production hardening.
+- `71a93e5d529225adfd0e1b5125a4302d81c58da5` — timing benchmark sample stabilization only; current code head before docs packaging.
+- build #270 on `f9db53f...`: failed in `ProxySetupTimingSelfTests` at 1.66x vs 1.25x limit after successful compilation and earlier suites.
+- build #271 on `71a93e5d...`: failed in the same test at 1.75x vs 1.25x limit. Compilation succeeded; framing suite is later in runner and has not yet executed in exact Windows CI.
+- handoff #83 on `71a93e5d...`: success and source archive uploaded.
 
-`5c3955fce4896c0a02b78c021eaccd8078ada8f4` — `fix: own RAS monitor lifetime per VPN session`
+The final handoff documentation commit will have its own `build`/`handoff` runs. The next chat must inspect those exact runs; docs-only commit does not magically make the inherited code-level timing failure green.
 
-GitHub Actions run #181 completed successfully through Build, Self-tests, self-contained `win-x64` publish, ZIP and artifact upload.
+## Immediate continuation order
 
-Subsequent handoff documentation/workflow commits must have their own current CI checked before starting the next chat.
+1. Resolve `ProxySetupTimingSelfTests` / current parser performance verdict without casually widening the 1.25x threshold.
+2. Reach and execute `ProxyHttpFramingSelfTests` on Windows CI; complete #14 only if semantic + performance gates pass.
+3. Implement #15 transactional `ProxyInstanceRuntime.StartAsync` ownership: cancel -> drain exact run -> clear same generation -> dispose CTS -> release lease once.
+4. Continue #11/#13 performance/memory/lifetime hardening and real Windows #2/#4/#5/#6/#7 acceptance.

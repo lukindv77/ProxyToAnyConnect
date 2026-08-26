@@ -1,143 +1,87 @@
 # ProxyToAnyConnect — GitHub issues snapshot
 
-Snapshot taken during the new-chat handoff preparation on 2026-08-26. **The next chat must still query GitHub because issue state/comments may change after this snapshot.**
+Snapshot prepared 2026-08-26. The next chat must still query live GitHub issue state/comments.
 
 ## Closed
 
-- **#1 — Enforce split-tunnel RAS profile before dialing** — closed/completed. Existing-profile L2TP/split-tunnel preflight, default-route before/after guard, provisional verification and L2TP socket binding were implemented.
-- **#3 — GUI lifecycle: tray-first WinForms application with explicit Exit only** — closed/completed.
-- **#8 — restore green CI after GUI/multi-proxy refactor** — closed/completed.
-- **#9 — Daily append-only L2TP logs with monthly folders and retention** — closed/completed. GUI-configurable root/retention, `YYYY-MM/YYYY-MM-DD.jsonl`, append-only writes and cleanup are implemented/tested.
+- **#1 — Enforce split-tunnel RAS profile before dialing** — completed.
+- **#3 — GUI lifecycle: tray-first WinForms application with explicit Exit only** — completed.
+- **#8 — Restore green CI after GUI + multi-proxy configuration refactor** — completed.
+- **#9 — Daily append-only L2TP logs with monthly folders and retention** — completed.
+- **#10 — Runtime proxy/L2TP traffic counters and 5-minute ping metrics in GUI** — completed/closed. Metrics plus L2TP status presentation are now present.
+- **#12 — L2TP runtime diagnostics: meaningful GUI status and last fail-closed reason** — completed/closed. Bounded latest-status registry and `Status / reason` GUI surface are implemented/tested.
 
 ## Open
 
 ### #2 — Windows 11 integration test with real L2TP endpoint
 
-**Highest external-validation priority.**
-
-Requires real Windows 11 x64 + real L2TP endpoints. Acceptance includes:
-
-- RAS client/server IP and interface detection;
-- unchanged host default routes;
-- verification/expected public egress;
-- HTTP and CONNECT traffic;
-- unrelated apps stay on ordinary route;
-- fail-closed active tunnel loss;
-- shared and dedicated multi-proxy lease scenarios;
-- Pause last/shared lease behavior;
-- keepalive failure/reconnect;
-- custom ephemeral connection and cleanup;
-- structured test logs/snapshots.
-
-CI cannot substitute for this issue.
+Highest external-validation priority. CI cannot substitute for a real Windows 11 x64 + real L2TP server test. Covers existing/custom L2TP, real assigned/PPP IPs, route behavior, public egress verification, HTTP/CONNECT, loss/fail-closed, shared/dedicated leases, keepalive/reconnect and cleanup.
 
 ### #4 — Multi-proxy runtime with shared/dedicated L2TP leases and Pause/Resume
 
-Open. Much of the implementation is already present:
-
-- multiple proxy runtimes;
-- shared/dedicated lease manager;
-- independent Pause/Resume;
-- last-lease disconnect;
-- fail-closed shared-group behavior architecture;
-- selective runtime reconfiguration groundwork.
-
-Before closing, inspect current code against every acceptance item, especially unique enabled bind endpoint validation and independent-group behavior under real failure/reconfigure.
+Implementation is substantially present. Additional hardening completed after original issue creation includes canonical listener endpoint collision validation and selective-reconfigure object-identity regression. Real active-L2TP multi-proxy acceptance remains tied to #2.
 
 ### #5 — Settings UI for proxy instances, Windows L2TP selection and timeouts
 
-Open. Substantially implemented, including proxy/L2TP add/edit/delete dialogs, interactive Windows L2TP enumeration and controlled/selective runtime reload.
-
-Remaining acceptance must be checked on current head, especially:
-
-- selecting bind IPv4 from actual local interfaces rather than free text where required;
-- completeness of all timeout fields;
-- unsafe-combination validation;
-- L2TP last status/error visibility;
-- selective reload isolation.
+Substantially implemented. Selective reload preserves independent runtime groups in deterministic tests. Remaining acceptance is primarily real Windows/profile/address interaction polish/validation together with #2.
 
 ### #6 — Custom ephemeral L2TP with protected credentials and private temporary RAS phonebook
 
-Open.
-
-Implemented:
-
-- ExistingWindowsProfile vs CustomEphemeral model;
-- DPAPI protected password/PSK;
-- private temporary `.pbk` builder;
-- Windows native smoke test creates L2TP entry + PSK + cleanup;
-- integration with `RasConnectionManager` common `RasDial -> Verifying -> Ready` path;
-- cleanup ownership architecture.
-
-Still requires real external L2TP endpoint/Windows 11 validation before closure, including actual auth/encryption combinations and persistent-profile absence/cleanup after real hangup.
+Private `.pbk`, DPAPI secrets, native Windows creation/PSK/cleanup smoke test and common dial/verify integration exist. Real external custom endpoint/auth/encryption validation remains.
 
 ### #7 — L2TP keepalive with internal-server/custom IPv4 targets and automatic reconnect
 
-Open.
-
-Implementation is present for Off / PPP internal server IPv4 / CustomIPv4, source-bound ICMP, interval/timeout/failure threshold, rolling RTT, fail-closed teardown and maintenance reconnect while active leases exist.
-
-Still requires real L2TP validation and final GUI diagnostic/status acceptance.
-
-### #10 — Runtime proxy/L2TP traffic counters and 5-minute ping metrics in GUI
-
-Open.
-
-Implemented:
-
-- per-proxy live RX/TX from data pumps;
-- aggregate L2TP payload RX/TX;
-- rolling successful keepalive RTT average over 5 minutes;
-- Proxies and L2TP GUI metrics columns;
-- regression tests.
-
-The issue body explicitly says the remaining item before closing is a dedicated L2TP GUI status/details field for latest keepalive/verification/error information. This overlaps #12.
+Implementation exists for Off / PPP server IPv4 / CustomIPv4, source-bound probing, threshold fail-closed teardown and maintenance reconnect while leases remain. Needs real L2TP validation.
 
 ### #11 — Performance and memory: low-latency proxy path and efficient process-wide memory use
 
-Open/ongoing architectural goal.
+Ongoing architectural goal. Recent work includes incremental header terminator scanning and HTTP framing hardening. Memory changes must not worsen proxy latency/jitter/throughput beyond measurement noise.
 
-Important invariant: scope is the entire process. Implemented work includes pooled proxy/DNS buffers, reduced header copies, bounded session admission, bounded shared DNS cache, low-churn GUI refresh, bounded background/runtime state and performance regressions.
-
-Newest permanent requirement: **memory optimization must not increase proxy processing/forwarding latency, jitter or reduce throughput beyond repeatable measurement noise.** See `docs/requirements.md` and `docs/memory-stability.md`.
-
-### #12 — L2TP runtime diagnostics: meaningful GUI status and last fail-closed reason
-
-Open.
-
-Backend work already present:
-
-- bounded latest-status registry;
-- one latest status per VPN ID;
-- max 256 entries;
-- replaces status in place;
-- stale status removed when VPN runtime is disposed;
-- self-test coverage.
-
-Acceptance still requires checking/finishing the L2TP grid `Status / reason` column and exposing verification, keepalive, reconnect cooldown and fail-closed reasons without retaining event history in memory.
+Current immediate blocker relevant to #11: `ProxySetupTimingSelfTests` reports current text-span parser 1.66–1.75x slower than its immediate-predecessor benchmark after framing bookkeeping. The 1.25x policy threshold has not been relaxed. Next chat must establish whether this is a real production regression or benchmark comparability problem.
 
 ### #13 — Long-run memory stability: deterministic ownership and process memory health
 
-Open/ongoing audit goal.
+Ongoing. Selective-reconfigure stress now runs 250 cycles while preserving independent-group object identity. Observed retained replaced objects in the Windows test: `ProxyInstanceRuntime` 0/250, `VpnLeaseManager` 0/250. Continue broader Pause/Resume/reconnect/start-failure/resource-lifetime audit.
 
-Implemented/audited items include:
+### #14 — Harden HTTP request framing and request-smuggling boundary
 
-- deterministic `VpnContext` lifetime/ref counting;
-- collectability tests;
-- latest-only process memory-health snapshot;
-- bounded status/cache/metrics state;
-- proxy shutdown drain;
-- tracked/joined proxy runtime observer;
-- runtime/lease semaphore-disposal race hardening;
-- per-RAS-session monitor CTS/task ownership and stale-handle protection;
-- stress tests for proxy lifecycle and monitor/context cleanup.
+**Open. Production code is implemented but acceptance is not yet declared complete.**
 
-Permanent acceptance constraint: memory hardening must preserve or improve repeatable latency/throughput; memory-only regressions to proxy data path are rejected.
+Production commit: `f9db53f074d6740296e46452077622099b6f64ff`.
 
-## Current open issue set at snapshot
+Implemented:
+- strict single non-negative decimal `Content-Length`;
+- reject duplicate/conflicting/comma-list CL;
+- reject any Transfer-Encoding and TE+CL;
+- no CL => body length zero;
+- reject initial post-header bytes beyond CL before outbound connect;
+- forward exactly CL bytes and no later pipelined/smuggled bytes;
+- fail on early EOF;
+- preserve valid CL in origin request;
+- CONNECT unchanged;
+- new `ProxyHttpFramingSelfTests` parser + loopback boundary suite.
 
-`#2, #4, #5, #6, #7, #10, #11, #12, #13`
+Current blocker: build #270 and #271 both compile but fail earlier in `ProxySetupTimingSelfTests`; therefore exact Windows CI has not yet reached the new framing suite. #14 must remain open until timing verdict is resolved and framing tests execute green on exact current head.
 
-## Current closed issue set at snapshot
+### #15 — Make proxy startup ownership transactional and drain-safe
 
-`#1, #3, #8, #9`
+**Newest audit issue, implementation pending.**
+
+Finding: `ProxyInstanceRuntime.StartAsync` can publish `_lease/_runCancellation/_runTask`, then fail/cancel while waiting for listener readiness. Catch cleanup may release/dispose local resources without awaiting exact `runTask` drain or clearing already-published fields.
+
+Acceptance:
+- startup attempt has generation-scoped ownership;
+- fail/cancel after run creation: cancel exact run -> await drain -> clear matching fields -> dispose CTS -> release exact lease once;
+- never release L2TP lease before `ProxyServer.RunAsync` session drain completes;
+- cancellation propagation and retry remain correct;
+- Pause/Dispose idempotent, no double release;
+- no unobserved observers;
+- successful Running path unchanged.
+
+Planned test seam is orchestration-only; production L2TP/network/data path must not change.
+
+## Snapshot sets
+
+Open: `#2, #4, #5, #6, #7, #11, #13, #14, #15`
+
+Closed: `#1, #3, #8, #9, #10, #12`
