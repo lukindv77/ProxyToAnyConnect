@@ -8,36 +8,27 @@
 - Branch: `main`
 - Windows 11 x64 / C# / .NET 10 `net10.0-windows` / WinForms + tray
 - HTTP framing production commit: `f9db53f074d6740296e46452077622099b6f64ff`
-- setup timing test commit: `71a93e5d529225adfd0e1b5125a4302d81c58da5`
+- setup timing methodology fix: `ceb591cf5bf62c43dc08a4611744acf445fa7286`
+- framing reset-test fix: `d1f9edd7dbbaaeba2ebd858b9565507f159754e4`
 - handoff status-doc commits observed during packaging: `b3fbe1f96c0ffa7d031cb72b81793ec6ea9c2858`, `b304a4331b8527b8280396047d3c649cfaed80f3`
 
-## Important CI fact: timing gate is currently non-reproducible on hosted runners
+## Current timing/framing hardening progress
 
-Current `ProxySetupTimingSelfTests` source uses paired alternating current/predecessor measurement, warmup 2048, 9 rounds, 32768 iterations/round and unchanged `MaxMedianSlowdownRatio = 1.25`.
+The timing audit found a source-level comparability bug, not evidence for widening the policy: after framing commit `f9db53f...`, production parsing performs mandatory header-name and CL/TE framing validation while the old `LegacySplitParse` timing baseline still measured the lighter pre-framing semantics. The test therefore charged required security work as a parser regression while calling the baseline the immediate predecessor.
 
-With no production/parser code change between docs-only heads:
+Commit `ceb591cf5bf62c43dc08a4611744acf445fa7286` changes only the self-test harness and keeps `MaxMedianSlowdownRatio = 1.25` unchanged. It uses a Split-strategy framing-equivalent parser baseline, stronger interleaved warmup, test-only GC phase normalization, adjacent order-balanced batches, per-pair ratios and a median of paired round ratios. Production/hot-path code is unchanged.
 
-- build #272 on `b3fbe1f...`: timing PASS — parser `1999 vs 2042 ns/op = 0.98x`, origin `973 vs 1222 = 0.80x`;
-- build #273 on `b304a433...`: timing FAIL — parser `5218 vs 2917 ns/op = 1.79x`, limit 1.25x.
+The framing/RST audit then confirmed the proxy intentionally stops client reads after exactly declared Content-Length bytes and waits only for the origin response. A malicious post-CL tail is therefore intentionally unread on the client socket; Windows may report WSAECONNRESET 10054 when that socket closes. Clean TCP EOF is not an HTTP correctness requirement in this attack case.
 
-Therefore the next chat must treat this as benchmark-methodology instability until proven otherwise. Do not simply widen 1.25x and do not change production parser solely to appease one noisy runner. Make compared work equivalent and measurement stable.
+Commit `d1f9edd7dbbaaeba2ebd858b9565507f159754e4` changes only the framing self-test: it must first receive and validate the complete Content-Length-framed origin response (status/header/exact body). Reset before the complete response still fails. Only after complete response delivery does the test accept clean EOF or Windows ConnectionReset. The origin-side assertion that no post-CL byte arrives is unchanged. TE and TE+CL rejection likewise validate complete framed error responses instead of requiring clean EOF with unread invalid input.
 
-## Important CI fact: when timing passes, framing suite exposes a real close/reset issue
+Historical hosted-runner evidence on the old methodology remains useful:
 
-Build #272 reached `ProxyHttpFramingSelfTests` and failed `ExactContentLengthBoundsClientToOriginBytesAsync`:
+- build #272 on `b3fbe1f...`: timing PASS — parser `1999 vs 2042 ns/op = 0.98x`, origin `973 vs 1222 = 0.80x`; framing then hit 10054;
+- build #273 on docs-only `b304a433...`: timing FAIL — parser `5218 vs 2917 ns/op = 1.79x`;
+- build #274 on docs-only `f0336f2...`: timing FAIL — parser `2777 vs 1974 ns/op = 1.41x`.
 
-- `ReadToEndAsync` on the proxy client response threw `IOException`;
-- inner Windows `SocketException 10054`: connection forcibly closed by remote host.
-
-This must also be resolved. Strict Content-Length smuggling boundary must remain: bytes after declared CL never reach origin.
-
-Hypotheses to verify:
-
-- Windows RST may be produced because proxy closes its client socket with intentionally unread malicious trailing bytes after forwarding exactly CL bytes;
-- proxy may instead close before a complete origin response;
-- test may incorrectly require clean EOF after a complete response in a deliberate trailing-byte attack case.
-
-Prefer evidence from deterministic stream/response framing tests; do not blindly drain and forward/discard extra client bytes if that adds latency or weakens request boundary semantics.
+#14 remains open until a Windows build succeeds on the exact current head containing both test fixes. Do not infer green from an older SHA. At the time of this update GitHub Actions scheduling itself has also been unstable: build #275 for `ceb591c...` initially reported `startup_failure` and a rerun remained queued; handoff #87 for `d1f9edd...` initially reported `startup_failure` and was retriggered. Treat those scheduler states as infrastructure evidence, not code verdicts.
 
 ## Handoff workflow/artifacts observed
 
@@ -97,7 +88,7 @@ A final handoff-doc commit after this snapshot will create another artifact. New
 
 Production code in `f9db53f...` validates framing before outbound connect, allows one valid non-negative decimal Content-Length, rejects duplicate/conflicting/comma-list CL and any Transfer-Encoding, treats no CL as zero body, rejects initial remainder beyond CL, forwards exactly CL bytes, rejects early EOF, preserves valid CL and leaves CONNECT unchanged.
 
-`ProxyHttpFramingSelfTests` is wired into the runner. #14 stays open until both timing gate methodology and the framing reset test are stable/green on exact-head Windows CI.
+`ProxyHttpFramingSelfTests` is wired into the runner. Timing methodology is now corrected in `ceb591c...` and response-before-reset semantics in `d1f9edd...`; #14 stays open until exact-current-head Windows CI is green through the framing suite.
 
 ## Issue #15 — transactional proxy startup ownership
 
@@ -119,9 +110,7 @@ Closed: `#1, #3, #8, #9, #10, #12`
 
 ## Immediate continuation order
 
-1. Fetch live current head/actions/issues.
-2. Stabilize/make honest `ProxySetupTimingSelfTests` without merely widening 1.25x; use #272 PASS vs #273 FAIL on docs-only heads as evidence of hosted-runner variance.
-3. Then reproduce/audit framing SocketException 10054; preserve exact CL boundary and make response/close test deterministic.
-4. Get exact-head Windows CI green through `ProxyHttpFramingSelfTests`; update/close #14 only after acceptance.
-5. Implement #15 transactional startup ownership with deterministic fail/cancel/drain/retry/single-release tests.
-6. Continue #11/#13 and real Windows #2/#4/#5/#6/#7 acceptance.
+1. Get exact-current-head Windows `build` and `handoff` runs executing normally.
+2. Confirm corrected paired timing gate and full `ProxyHttpFramingSelfTests` suite green on that exact head; update/close #14 only after acceptance.
+3. Implement #15 transactional startup ownership with deterministic fail/cancel/drain/retry/single-release tests.
+4. Continue #11/#13 and real Windows #2/#4/#5/#6/#7 acceptance.
