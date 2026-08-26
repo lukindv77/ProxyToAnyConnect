@@ -8,12 +8,14 @@ internal sealed class ProxyApplicationContext : ApplicationContext
     private readonly MainForm _mainForm;
     private readonly ProxyRuntimeHost _runtimeHost;
     private readonly NotifyIcon _notifyIcon;
+    private readonly ProcessMemoryHealthMonitor _memoryHealthMonitor;
     private int _exitStarted;
 
     public ProxyApplicationContext(MainForm mainForm, ProxyRuntimeHost runtimeHost)
     {
         _mainForm = mainForm;
         _runtimeHost = runtimeHost;
+        _memoryHealthMonitor = new ProcessMemoryHealthMonitor();
 
         var trayMenu = new ContextMenuStrip();
         var openItem = new ToolStripMenuItem("Открыть");
@@ -74,6 +76,18 @@ internal sealed class ProxyApplicationContext : ApplicationContext
         catch (Exception ex)
         {
             AppLog.Error("application.shutdown.failed", "Runtime cleanup failed during application exit.", ex);
+        }
+
+        try
+        {
+            await _memoryHealthMonitor.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warning(
+                "process.memory.monitor_shutdown_failed",
+                "Process memory health monitor cleanup failed during application exit.",
+                new { Error = ex.Message });
         }
         finally
         {
