@@ -177,6 +177,18 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
 
                     await _connectionManager.ConnectAsync(cancellationToken);
 
+                    // A proxy may have been paused while RasDial/verification was running.
+                    // Never leave a freshly reconnected L2TP alive with zero consumers.
+                    if (ActiveProxyCount == 0)
+                    {
+                        await _connectionManager.DisconnectAsync();
+                        AppLog.Info(
+                            "vpn.maintenance.reconnect_discarded",
+                            "Reconnect completed after the last proxy lease was released; L2TP was disconnected again.",
+                            new { VpnId = _options.Id, VpnName = _options.Name });
+                        continue;
+                    }
+
                     AppLog.Info(
                         "vpn.maintenance.reconnected",
                         "L2TP reconnect and verification completed while active proxy leases were present.",
@@ -188,8 +200,6 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
                 }
                 catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException or NotSupportedException)
                 {
-                    // ConnectAsync already applies fail-closed verification and reconnect cooldown.
-                    // Keep trying while active proxy leases exist; unrelated VPN groups are unaffected.
                     AppLog.Warning(
                         "vpn.maintenance.reconnect_pending",
                         "L2TP is still unavailable; active dependent proxies remain fail-closed.",
