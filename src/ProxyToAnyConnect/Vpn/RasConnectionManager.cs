@@ -20,6 +20,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
     private VpnContext? _current;
     private VpnVerificationResult? _lastVerification;
     private EphemeralRasPhonebook? _ephemeralPhonebook;
+    private CancellationTokenSource? _monitorCancellation;
     private Task? _monitorTask;
     private long _retryNotBeforeTickCount64;
     private int _state = (int)VpnConnectionState.Disconnected;
@@ -45,10 +46,17 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
             if (_current is { IsAlive: true } existing && State == VpnConnectionState.Ready)
             {
                 return existing;
             }
+
+            // A previous fail-closed monitor may already be completed while its
+            // session CTS/task are still referenced by the manager. Join and dispose
+            // that bounded per-session state before considering a new connection.
+            await StopMonitorLockedAsync();
 
             var retryRemaining = GetReconnectCooldownRemainingMilliseconds(
                 Environment.TickCount64,
@@ -112,12 +120,14 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 Volatile.Write(ref _retryNotBeforeTickCount64, 0);
                 SetState(VpnConnectionState.Ready);
 
+                var monitorCancellation = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
+                _monitorCancellation = monitorCancellation;
                 _monitorTask = MonitorAsync(
                     result.Handle,
                     result.Context,
                     routesBefore,
                     ownedEphemeralPhonebook,
-                    _shutdown.Token);
+                    monitorCancellation.Token);
 
                 return result.Context;
             }
@@ -418,17 +428,27 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             }
         }
 
-        if (!cancellationToken.IsCancellationRequested)
+        // Explicit DisconnectAsync removes Current before cancelling this session
+        // monitor. That makes this check robust even if cancellation races the
+        // fail-closed branch between two instructions.
+        if (cancellationToken.IsCancellationRequested || !ReferenceEquals(Current, context))
         {
-            ArmReconnectCooldown("Continuous fail-closed monitor rejected the active VPN.");
-            MarkCurrentDisconnected(context);
-            _ = RasNative.RasHangUpW(handle);
-            ReleaseEphemeralPhonebook(ephemeralPhonebook);
-            AppLog.Warning(
-                "vpn.ras.hangup",
-                "RAS connection was hung up after a continuous fail-closed guard failure.",
-                new { VpnId = _options.Id, VpnName = _options.Name, context.EntryName });
+            return;
         }
+
+        ArmReconnectCooldown("Continuous fail-closed monitor rejected the active VPN.");
+        MarkCurrentDisconnected(context);
+
+        if (Interlocked.CompareExchange(ref _rasConnection, 0, handle) == handle)
+        {
+            _ = RasNative.RasHangUpW(handle);
+        }
+
+        ReleaseEphemeralPhonebook(ephemeralPhonebook);
+        AppLog.Warning(
+            "vpn.ras.hangup",
+            "RAS connection was hung up after a continuous fail-closed guard failure.",
+            new { VpnId = _options.Id, VpnName = _options.Name, context.EntryName });
     }
 
     private async Task MonitorProjectionAsync(
@@ -570,6 +590,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         context.MarkDisconnected();
         if (ReferenceEquals(Interlocked.CompareExchange(ref _current, null, context), context))
         {
+            Volatile.Write(ref _lastVerification, null);
             SetState(VpnConnectionState.Disconnected);
         }
     }
@@ -598,6 +619,45 @@ internal sealed class RasConnectionManager : IAsyncDisposable
                 expected))
         {
             expected.Dispose();
+        }
+    }
+
+    private async Task StopMonitorLockedAsync()
+    {
+        var cancellation = _monitorCancellation;
+        var task = _monitorTask;
+        _monitorCancellation = null;
+        _monitorTask = null;
+
+        if (cancellation is null)
+        {
+            if (task is not null)
+            {
+                try
+                {
+                    await task;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+            return;
+        }
+
+        cancellation.Cancel();
+        try
+        {
+            if (task is not null)
+            {
+                await task;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            cancellation.Dispose();
         }
     }
 
@@ -630,10 +690,16 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         {
             var context = Interlocked.Exchange(ref _current, null);
             context?.MarkDisconnected();
+            Volatile.Write(ref _lastVerification, null);
             SetState(VpnConnectionState.Disconnected);
 
-            var handle = _rasConnection;
-            _rasConnection = 0;
+            // Remove the current handle before cancelling the old monitor. Even if
+            // the monitor was already entering fail-closed cleanup, its compare-
+            // exchange cannot act on a future/replacement RAS session.
+            var handle = Interlocked.Exchange(ref _rasConnection, 0);
+
+            await StopMonitorLockedAsync();
+
             if (handle != 0)
             {
                 _ = RasNative.RasHangUpW(handle);
@@ -667,20 +733,12 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
         _shutdown.Cancel();
         await DisconnectAsync();
-
-        if (_monitorTask is not null)
-        {
-            try
-            {
-                await _monitorTask;
-            }
-            catch (OperationCanceledException)
-            {
-            }
-        }
-
         _shutdown.Dispose();
-        _gate.Dispose();
+
+        // As with the higher-level runtime gates, AvailableWaitHandle is never
+        // requested. Avoid racing SemaphoreSlim.Dispose() against a ConnectAsync
+        // caller that passed its pre-wait disposed check just before shutdown;
+        // the managed gate is collectible with this manager.
     }
 
     private sealed record ConnectionResult(nint Handle, VpnContext Context);
