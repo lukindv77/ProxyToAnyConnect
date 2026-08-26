@@ -1,7 +1,5 @@
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
-using ProxyToAnyConnect.Network;
-using ProxyToAnyConnect.Proxy;
 
 namespace ProxyToAnyConnect.Runtime;
 
@@ -17,10 +15,10 @@ internal enum ProxyInstanceState
 internal sealed class ProxyInstanceRuntime : IAsyncDisposable
 {
     private readonly ProxyOptions _options;
-    private readonly VpnLeaseManager _vpn;
+    private readonly IProxyInstanceStartFactory _startFactory;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
-    private VpnLeaseManager.VpnLease? _lease;
+    private IAsyncDisposable? _lease;
     private CancellationTokenSource? _runCancellation;
     private Task? _runTask;
     private Task? _observerTask;
@@ -30,9 +28,14 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
     private int _disposed;
 
     public ProxyInstanceRuntime(ProxyOptions options, VpnLeaseManager vpn)
+        : this(options, new ProductionProxyInstanceStartFactory(vpn))
+    {
+    }
+
+    internal ProxyInstanceRuntime(ProxyOptions options, IProxyInstanceStartFactory startFactory)
     {
         _options = options;
-        _vpn = vpn;
+        _startFactory = startFactory;
     }
 
     public ProxyOptions Options => _options;
@@ -57,29 +60,33 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
             SetState(ProxyInstanceState.Starting);
             Volatile.Write(ref _lastError, null);
 
-            VpnLeaseManager.VpnLease? lease = null;
+            IAsyncDisposable? lease = null;
             CancellationTokenSource? runCancellation = null;
+            Task? runTask = null;
             try
             {
-                lease = await _vpn.AcquireAsync(_options.Id, cancellationToken);
+                var attempt = await _startFactory.CreateAsync(
+                    _options,
+                    Metrics,
+                    cancellationToken);
+                lease = attempt.Lease;
                 runCancellation = new CancellationTokenSource();
 
-                var dnsResolver = new L2tpDnsResolver(
-                    _options.DnsTimeoutMilliseconds,
-                    lease.DnsCache);
-                var socketFactory = new L2tpSocketFactory(lease.ConnectionManager, dnsResolver);
-                var proxyServer = new ProxyServer(_options, socketFactory, Metrics, _vpn.Metrics);
-
                 var generation = unchecked(++_generation);
-                var runTask = proxyServer.RunAsync(runCancellation.Token);
+                runTask = attempt.Server.RunAsync(runCancellation.Token);
+
+                // Startup ownership is deliberately unpublished until the listener is
+                // confirmed ready. A failed/cancelled readiness wait therefore has one
+                // local owner that can deterministically cancel and drain this exact run
+                // before its exact VPN lease is released.
+                await attempt.Server.WaitUntilListeningAsync(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
 
                 _lease = lease;
                 _runCancellation = runCancellation;
                 _runTask = runTask;
 
-                await proxyServer.WaitUntilListeningAsync(cancellationToken);
                 SetState(ProxyInstanceState.Running);
-
                 AppLog.Info(
                     "proxy.running",
                     "Proxy listener entered Running state.",
@@ -94,14 +101,42 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
                 _observerTask = ObserveRunCompletionAsync(runTask, generation);
                 lease = null;
                 runCancellation = null;
+                runTask = null;
             }
             catch (Exception ex)
             {
                 runCancellation?.Cancel();
+                if (runTask is not null)
+                {
+                    await DrainFailedStartRunAsync(runTask);
+                }
+
                 runCancellation?.Dispose();
                 if (lease is not null)
                 {
-                    await lease.DisposeAsync();
+                    try
+                    {
+                        await lease.DisposeAsync();
+                    }
+                    catch (Exception cleanupError)
+                    {
+                        AppLog.Warning(
+                            "proxy.start.cleanup_failed",
+                            "Proxy startup ownership cleanup failed after the start attempt was already rejected.",
+                            new
+                            {
+                                ProxyId = _options.Id,
+                                ProxyName = _options.Name,
+                                Error = cleanupError.Message
+                            });
+                    }
+                }
+
+                if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                {
+                    Volatile.Write(ref _lastError, null);
+                    SetState(ProxyInstanceState.Paused);
+                    throw;
                 }
 
                 Volatile.Write(ref _lastError, ex.Message);
@@ -117,6 +152,27 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
         finally
         {
             _gate.Release();
+        }
+    }
+
+    private static async Task DrainFailedStartRunAsync(Task runTask)
+    {
+        try
+        {
+            await runTask;
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or IOException or System.Net.Sockets.SocketException)
+        {
+            // The exact run task has been observed and drained. Its shutdown exception
+            // must not replace the readiness/caller-cancellation exception that rejected
+            // the startup transaction.
+            System.Diagnostics.Debug.WriteLine(ex);
+        }
+        catch (Exception ex)
+        {
+            // Likewise observe an unexpected run failure while preserving the original
+            // startup rejection as the caller-visible failure.
+            System.Diagnostics.Debug.WriteLine(ex);
         }
     }
 
