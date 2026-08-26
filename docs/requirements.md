@@ -14,6 +14,28 @@ This document is the current source of truth for product behavior. Later impleme
   - from the application menu.
 - On explicit Exit, proxy listeners are stopped, active proxy sessions are cancelled, managed L2TP sessions are disconnected, ephemeral resources are removed, and the process terminates cleanly.
 
+## Performance and memory invariants
+
+Proxy data-path performance is a first-class architectural requirement, equal in importance to fail-closed correctness.
+
+The implementation must be designed for:
+
+- minimum added latency between accepting an inbound proxy connection and forwarding bytes to the selected L2TP-bound outbound socket;
+- high sustained throughput for long-lived HTTP/HTTPS `CONNECT` streams;
+- bounded and predictable memory consumption per active connection;
+- minimal managed allocations on the steady-state bidirectional byte-transfer hot path;
+- no full-request/full-response buffering for tunneled traffic;
+- backpressure through asynchronous socket/stream reads and writes rather than unbounded application queues;
+- no logging, GUI refresh, metrics aggregation, DNS maintenance or keepalive work that synchronously blocks the proxy byte-transfer hot path;
+- pooled/reused buffers where this reduces allocation/GC pressure without retaining excessive memory;
+- avoiding unnecessary byte-array copies during request-header parsing and tunnel setup;
+- low-cost atomic counters for runtime RX/TX metrics rather than per-packet/per-buffer object allocation;
+- no periodic global GC forcing or other latency-spiking memory management techniques.
+
+Optimizations must not weaken fail-closed routing, VPN verification, source/interface binding, cancellation on L2TP loss or security invariants.
+
+Performance-sensitive changes should be covered by repeatable local/CI micro or integration tests where practical, including allocation-sensitive tests for the proxy forwarding path.
+
 ## Multi-proxy model
 
 The application supports multiple independent proxy instances at the same time.
