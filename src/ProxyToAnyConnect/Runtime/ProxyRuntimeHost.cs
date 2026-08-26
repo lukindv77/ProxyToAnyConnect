@@ -33,38 +33,34 @@ internal sealed class ProxyRuntimeHost : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(options);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-
-        // Build and validate the replacement before touching the currently running runtime.
-        var replacement = new ProxyRuntimeCoordinator(options);
+        options.Validate();
 
         await _gate.WaitAsync(cancellationToken);
         try
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-            var previous = Interlocked.Exchange(ref _current, replacement);
-            Volatile.Write(ref _configurationError, null);
-
-            if (previous is not null)
+            var current = Current;
+            if (current is null)
             {
-                await previous.DisposeAsync();
+                var replacement = new ProxyRuntimeCoordinator(options);
+                Volatile.Write(ref _current, replacement);
+                Volatile.Write(ref _configurationError, null);
+                await replacement.StartEnabledAsync(cancellationToken);
+                return;
             }
 
-            await replacement.StartEnabledAsync(cancellationToken);
-            AppLog.Info(
-                "runtime.reconfigured",
-                "Runtime configuration was reloaded from GUI settings.",
-                new
-                {
-                    ProxyCount = options.Proxies.Count,
-                    L2tpCount = options.VpnConnections.Count
-                });
+            await current.ReconfigureAsync(options, cancellationToken);
+            Volatile.Write(ref _configurationError, null);
         }
-        catch
+        catch (Exception ex)
         {
-            // If replacement startup fails catastrophically, keep the replacement as the current
-            // runtime because its per-proxy StartEnabledAsync already isolates normal group errors.
-            // Validation failures happen before the swap and therefore leave the old runtime intact.
+            // Existing unaffected runtime groups remain alive if selective reconfiguration fails.
+            Volatile.Write(ref _configurationError, ex.Message);
+            AppLog.Error(
+                "runtime.reconfigure.failed",
+                "Selective runtime reconfiguration failed.",
+                ex);
             throw;
         }
         finally
