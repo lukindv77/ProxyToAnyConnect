@@ -6,6 +6,7 @@ namespace ProxyToAnyConnect.Vpn;
 internal static class RasNative
 {
     internal const uint ErrorSuccess = 0;
+    internal const uint ErrorBufferTooSmall = 603;
     internal const int MaxPath = 260;
     internal const int RasMaxEntryName = 256;
     internal const int RasMaxPhoneNumber = 128;
@@ -183,15 +184,15 @@ internal static class RasNative
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 4)]
-    internal sealed class RasDevInfo
+    internal struct RasDevInfo
     {
         public uint DwSize;
 
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = RasMaxDeviceType + 1)]
-        public string SzDeviceType = string.Empty;
+        public string SzDeviceType;
 
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = RasMaxDeviceName + 1)]
-        public string SzDeviceName = string.Empty;
+        public string SzDeviceName;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 4)]
