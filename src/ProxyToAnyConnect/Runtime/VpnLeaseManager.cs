@@ -271,6 +271,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             await StopMaintenanceLockedAsync();
             await _connectionManager.DisposeAsync();
             DnsCache.Clear();
+            VpnLatestStatusRegistry.Remove(_options.Id);
         }
         finally
         {
