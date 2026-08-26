@@ -1,187 +1,91 @@
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
-using ProxyToAnyConnect.Network;
-using ProxyToAnyConnect.Proxy;
-using ProxyToAnyConnect.Vpn;
+using ProxyToAnyConnect.Gui;
+using ProxyToAnyConnect.Runtime;
 
 namespace ProxyToAnyConnect;
 
 internal static class Program
 {
-    private const string VerifyOnlyArgument = "--verify-only";
-    private const string HelpArgument = "--help";
-
-    public static async Task<int> Main(string[] args)
+    [STAThread]
+    public static void Main(string[] args)
     {
         if (!OperatingSystem.IsWindows())
-        {
-            Console.Error.WriteLine("ProxyToAnyConnect supports Windows only.");
-            return 2;
-        }
-
-        if (args.Any(argument => argument.Equals(HelpArgument, StringComparison.OrdinalIgnoreCase)))
-        {
-            PrintUsage();
-            return 0;
-        }
-
-        using var shutdown = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, eventArgs) =>
-        {
-            eventArgs.Cancel = true;
-            shutdown.Cancel();
-        };
-
-        try
-        {
-            var verifyOnly = args.Any(argument =>
-                argument.Equals(VerifyOnlyArgument, StringComparison.OrdinalIgnoreCase));
-
-            var configArgument = args.FirstOrDefault(argument => !argument.StartsWith("--", StringComparison.Ordinal));
-            var configPath = configArgument is not null
-                ? Path.GetFullPath(configArgument)
-                : Path.Combine(AppContext.BaseDirectory, "appsettings.json");
-
-            var unknownArguments = args.Where(argument =>
-                    argument.StartsWith("--", StringComparison.Ordinal) &&
-                    !argument.Equals(VerifyOnlyArgument, StringComparison.OrdinalIgnoreCase))
-                .ToArray();
-            if (unknownArguments.Length > 0)
-            {
-                Console.Error.WriteLine($"Unknown argument(s): {string.Join(", ", unknownArguments)}");
-                PrintUsage();
-                return 2;
-            }
-
-            var options = await AppOptions.LoadAsync(configPath, shutdown.Token);
-            AppLog.Configure(
-                options.Logging,
-                Path.GetDirectoryName(configPath) ?? AppContext.BaseDirectory);
-            AppLog.Info(
-                "application.start",
-                "ProxyToAnyConnect started.",
-                new
-                {
-                    VerifyOnly = verifyOnly,
-                    ProxyListenAddress = options.Proxy.ListenAddress,
-                    ProxyListenPort = options.Proxy.ListenPort,
-                    L2tpEntryName = options.L2tp.EntryName
-                });
-
-            await using var rasConnectionManager = new RasConnectionManager(options.L2tp);
-
-            try
-            {
-                var vpn = await rasConnectionManager.ConnectAsync(shutdown.Token);
-                PrintVpnContext(vpn, rasConnectionManager.LastVerification);
-                LogVerifiedVpn(vpn, rasConnectionManager.LastVerification);
-
-                if (verifyOnly)
-                {
-                    AppLog.Info(
-                        "verification.complete",
-                        "Verification-only mode completed successfully.");
-                    Console.WriteLine("Verification-only mode completed successfully. Proxy listener was not started.");
-                    return 0;
-                }
-            }
-            catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException)
-            {
-                AppLog.Error(
-                    "verification.failed",
-                    "Initial L2TP connection or verification failed.",
-                    ex,
-                    new { EntryName = options.L2tp.EntryName });
-                Console.Error.WriteLine($"Initial L2TP connection/verification failed: {ex.Message}");
-
-                if (verifyOnly)
-                {
-                    Console.Error.WriteLine("Verification-only mode failed. Proxy listener was not started.");
-                    return 3;
-                }
-
-                Console.Error.WriteLine("Proxy remains fail-closed and will retry L2TP verification on demand.");
-            }
-
-            var dnsResolver = new L2tpDnsResolver();
-            var socketFactory = new L2tpSocketFactory(rasConnectionManager, dnsResolver);
-            var proxyServer = new ProxyServer(options.Proxy, socketFactory);
-
-            await proxyServer.RunAsync(shutdown.Token);
-            AppLog.Info("application.stop", "ProxyToAnyConnect stopped normally.");
-            return 0;
-        }
-        catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
-        {
-            AppLog.Info("application.stop", "ProxyToAnyConnect shutdown was requested.");
-            return 0;
-        }
-        catch (Exception ex)
-        {
-            AppLog.Error("application.fatal", "ProxyToAnyConnect terminated with a fatal error.", ex);
-            Console.Error.WriteLine(ex);
-            return 1;
-        }
-    }
-
-    private static void PrintUsage()
-    {
-        Console.WriteLine("Usage:");
-        Console.WriteLine("  ProxyToAnyConnect.exe [appsettings.json]");
-        Console.WriteLine("  ProxyToAnyConnect.exe [appsettings.json] --verify-only");
-        Console.WriteLine();
-        Console.WriteLine("--verify-only establishes L2TP, runs all fail-closed verification guards,");
-        Console.WriteLine("prints the verified VPN context, and exits without starting the proxy listener.");
-    }
-
-    private static void PrintVpnContext(VpnContext vpn, VpnVerificationResult? verification)
-    {
-        Console.WriteLine($"L2TP READY: {vpn.EntryName}");
-        Console.WriteLine($"  IPv4: {vpn.LocalIPv4}");
-        Console.WriteLine($"  Interface: {vpn.InterfaceName} (index {vpn.InterfaceIndex})");
-        Console.WriteLine(
-            vpn.DnsServers.Count == 0
-                ? "  DNS: none"
-                : $"  DNS: {string.Join(", ", vpn.DnsServers)}");
-
-        if (verification is null)
         {
             return;
         }
 
-        Console.WriteLine($"  Verification target IPv4: {verification.ProbeTargetIPv4}");
-        if (verification.PublicIPv4ComparisonPerformed)
+        ApplicationConfiguration.Initialize();
+
+        var configPath = ResolveConfigPath(args);
+        AppOptions options;
+        try
         {
-            Console.WriteLine($"  Expected public IPv4: {verification.ExpectedPublicIPv4}");
-            Console.WriteLine($"  Observed public IPv4: {verification.ObservedPublicIPv4}");
-            Console.WriteLine("  Public IPv4 verification: PASSED");
+            options = AppOptions.LoadForEditingAsync(configPath, CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
         }
-        else
+        catch (Exception ex)
         {
-            Console.WriteLine("  Public IPv4 equality check: SKIPPED (publicAddress is a DNS name)");
-            if (verification.ObservedPublicIPv4 is not null)
-            {
-                Console.WriteLine($"  Probe observed public IPv4: {verification.ObservedPublicIPv4}");
-            }
+            MessageBox.Show(
+                $"Не удалось прочитать настройки:\n{ex.Message}",
+                "ProxyToAnyConnect",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            options = new AppOptions();
+        }
+
+        AppLog.Configure(options.Logging);
+        AppLog.Info(
+            "application.start",
+            "ProxyToAnyConnect GUI started.",
+            new { ConfigPath = configPath });
+
+        ProxyRuntimeCoordinator? runtime = null;
+        string? configurationError = null;
+        try
+        {
+            options.Validate();
+            runtime = new ProxyRuntimeCoordinator(options);
+        }
+        catch (Exception ex)
+        {
+            configurationError = ex.Message;
+            AppLog.Error(
+                "configuration.invalid",
+                "Runtime was not started because configuration validation failed.",
+                ex);
+        }
+
+        try
+        {
+            var form = new MainForm(options, configPath, runtime, configurationError);
+            var context = new ProxyApplicationContext(form, runtime);
+            Application.Run(context);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("application.fatal", "ProxyToAnyConnect GUI terminated with a fatal error.", ex);
+            MessageBox.Show(
+                ex.ToString(),
+                "ProxyToAnyConnect — fatal error",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            AppLog.Info("application.stop", "ProxyToAnyConnect GUI stopped.");
         }
     }
 
-    private static void LogVerifiedVpn(VpnContext vpn, VpnVerificationResult? verification)
+    private static string ResolveConfigPath(string[] args)
     {
-        AppLog.Info(
-            "vpn.ready",
-            "L2TP connection passed verification and is available to proxy traffic.",
-            new
-            {
-                vpn.EntryName,
-                LocalIPv4 = vpn.LocalIPv4.ToString(),
-                vpn.InterfaceName,
-                vpn.InterfaceIndex,
-                DnsServers = vpn.DnsServers.Select(address => address.ToString()).ToArray(),
-                ProbeTargetIPv4 = verification?.ProbeTargetIPv4.ToString(),
-                ObservedPublicIPv4 = verification?.ObservedPublicIPv4?.ToString(),
-                ExpectedPublicIPv4 = verification?.ExpectedPublicIPv4?.ToString(),
-                PublicIPv4ComparisonPerformed = verification?.PublicIPv4ComparisonPerformed
-            });
+        var explicitPath = args.FirstOrDefault(argument =>
+            !string.IsNullOrWhiteSpace(argument) &&
+            !argument.StartsWith("--", StringComparison.Ordinal));
+
+        return explicitPath is null
+            ? Path.Combine(AppContext.BaseDirectory, "appsettings.json")
+            : Path.GetFullPath(explicitPath);
     }
 }
