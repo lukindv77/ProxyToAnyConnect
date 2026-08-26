@@ -531,30 +531,48 @@ internal sealed class ProxyServer
         public static ParsedProxyRequest Parse(ReadOnlySpan<byte> headerBytes)
         {
             var text = Encoding.Latin1.GetString(headerBytes);
-            var lines = text.Split("\r\n", StringSplitOptions.None);
-            if (lines.Length < 2)
+            var requestLineEnd = text.IndexOf("\r\n", StringComparison.Ordinal);
+            if (requestLineEnd < 0)
             {
                 throw new InvalidDataException("Invalid HTTP proxy request.");
             }
 
-            var requestLine = lines[0].Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+            // Keep the existing request-line split semantics. Only the header-line
+            // traversal is changed here so this remains an allocation-only refactor.
+            var requestLine = text[..requestLineEnd]
+                .Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
             if (requestLine.Length != 3)
             {
                 throw new InvalidDataException("Invalid HTTP proxy request line.");
             }
 
             var headers = new List<HeaderLine>();
-            for (var i = 1; i < lines.Length && lines[i].Length > 0; i++)
+            var offset = requestLineEnd + 2;
+            while (offset < text.Length)
             {
-                var separator = lines[i].IndexOf(':');
+                var remaining = text.AsSpan(offset);
+                var lineEnd = remaining.IndexOf("\r\n".AsSpan());
+                if (lineEnd < 0)
+                {
+                    throw new InvalidDataException("Invalid HTTP proxy request.");
+                }
+
+                if (lineEnd == 0)
+                {
+                    break;
+                }
+
+                var line = remaining[..lineEnd];
+                var separator = line.IndexOf(':');
                 if (separator <= 0)
                 {
                     throw new InvalidDataException("Invalid HTTP header line.");
                 }
 
                 headers.Add(new HeaderLine(
-                    lines[i][..separator].Trim(),
-                    lines[i][(separator + 1)..].Trim()));
+                    line[..separator].Trim().ToString(),
+                    line[(separator + 1)..].Trim().ToString()));
+                offset += lineEnd + 2;
             }
 
             return new ParsedProxyRequest(requestLine[0], requestLine[1], requestLine[2], headers);
