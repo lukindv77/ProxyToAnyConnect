@@ -86,6 +86,11 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        if (ProxyHeaderScanSelfTests.Run() != 0)
+        {
+            return 1;
+        }
+
         if (await ProxyLifecycleStressSelfTests.RunAsync() != 0)
         {
             return 1;
@@ -96,7 +101,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, bounded-status, memory-health, configuration/reconfigure, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, bounded-status, memory-health, configuration/reconfigure, incremental-header, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
