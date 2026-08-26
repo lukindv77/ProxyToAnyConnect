@@ -100,11 +100,11 @@ internal sealed class VpnConnectivityVerifier
         await sslStream.WriteAsync(request, cancellationToken);
         await sslStream.FlushAsync(cancellationToken);
 
-        var response = await ReadResponseAsync(
+        using var response = await ReadPooledResponseAsync(
             sslStream,
             _options.MaxResponseBytes,
             cancellationToken);
-        var body = ParseHttpSuccessBodyView(response);
+        var body = ParseHttpSuccessBodyView(response.Memory);
         var observedText = Encoding.ASCII.GetString(body.Span).Trim();
 
         var expectedIp = TryGetExpectedPublicIPv4(_options.PublicAddress);
@@ -188,6 +188,25 @@ internal sealed class VpnConnectivityVerifier
         int maxResponseBytes,
         CancellationToken cancellationToken)
     {
+        using var response = await ReadPooledResponseAsync(
+            stream,
+            maxResponseBytes,
+            cancellationToken);
+        if (response.Length == 0)
+        {
+            return [];
+        }
+
+        var result = GC.AllocateUninitializedArray<byte>(response.Length);
+        response.Memory.Span.CopyTo(result);
+        return result;
+    }
+
+    internal static async Task<PooledResponseOwner> ReadPooledResponseAsync(
+        Stream stream,
+        int maxResponseBytes,
+        CancellationToken cancellationToken)
+    {
         var pool = ArrayPool<byte>.Shared;
         var maximumBufferedBytes = maxResponseBytes switch
         {
@@ -258,18 +277,12 @@ internal sealed class VpnConnectivityVerifier
                 }
             }
 
-            if (length == 0)
-            {
-                return [];
-            }
-
-            var result = GC.AllocateUninitializedArray<byte>(length);
-            buffer.AsSpan(0, length).CopyTo(result);
-            return result;
+            return new PooledResponseOwner(buffer, length);
         }
-        finally
+        catch
         {
             pool.Return(buffer, clearArray: false);
+            throw;
         }
     }
 
@@ -283,9 +296,13 @@ internal sealed class VpnConnectivityVerifier
     internal static ReadOnlyMemory<byte> ParseHttpSuccessBodyView(byte[] response)
     {
         ArgumentNullException.ThrowIfNull(response);
+        return ParseHttpSuccessBodyView(response.AsMemory());
+    }
 
-        var metadata = ParseHttpSuccessHeader(response);
-        var body = response.AsMemory(metadata.BodyOffset);
+    internal static ReadOnlyMemory<byte> ParseHttpSuccessBodyView(ReadOnlyMemory<byte> response)
+    {
+        var metadata = ParseHttpSuccessHeader(response.Span);
+        var body = response[metadata.BodyOffset..];
         if (metadata.IsChunked)
         {
             return DecodeChunkedBody(body.Span);
@@ -411,7 +428,8 @@ internal sealed class VpnConnectivityVerifier
 
             if (offset > body.Length - 2 || chunkSize > body.Length - offset - 2)
             {
-                throw new IOException("Truncated chunked verification response.");
+                throw new IOException(
+                    "Truncated chunked verification response.");
             }
 
             if (copyPayload)
@@ -500,6 +518,37 @@ internal sealed class VpnConnectivityVerifier
         }
 
         return -1;
+    }
+
+    internal sealed class PooledResponseOwner : IDisposable
+    {
+        private byte[]? _buffer;
+
+        internal PooledResponseOwner(byte[] buffer, int length)
+        {
+            _buffer = buffer;
+            Length = length;
+        }
+
+        internal int Length { get; }
+
+        internal ReadOnlyMemory<byte> Memory
+        {
+            get
+            {
+                var buffer = _buffer ?? throw new ObjectDisposedException(nameof(PooledResponseOwner));
+                return buffer.AsMemory(0, Length);
+            }
+        }
+
+        public void Dispose()
+        {
+            var buffer = Interlocked.Exchange(ref _buffer, null);
+            if (buffer is not null)
+            {
+                ArrayPool<byte>.Shared.Return(buffer, clearArray: false);
+            }
+        }
     }
 }
 
