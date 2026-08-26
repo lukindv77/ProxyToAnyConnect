@@ -7,11 +7,12 @@ This file defines the minimum repository material that a new development convers
 1. `docs/handoff/NEW_CHAT_PROMPT.md` — first-message prompt for a new ChatGPT conversation.
 2. `docs/handoff/CURRENT_STATE.md` — implementation/product state snapshot.
 3. `docs/handoff/AUDIT_SNAPSHOT.md` — important audit findings, discovered races/ABI issues and the reasons behind current architecture.
-4. `docs/requirements.md` — authoritative product/runtime requirements.
-5. `docs/architecture.md` — current system architecture.
-6. `docs/memory-stability.md` — long-run ownership/memory rules and latency-neutral optimization invariant.
-7. `docs/windows-integration-test.md` — real Windows validation procedure.
-8. `README.md` — repository-level overview and invariants.
+4. `docs/handoff/ISSUES_SNAPSHOT.md` — roadmap issue state/remaining acceptance snapshot.
+5. `docs/requirements.md` — authoritative product/runtime requirements.
+6. `docs/architecture.md` — current system architecture.
+7. `docs/memory-stability.md` — long-run ownership/memory rules and latency-neutral optimization invariant.
+8. `docs/windows-integration-test.md` — real Windows validation procedure.
+9. `README.md` — repository-level overview and invariants.
 
 ## Code areas that must be reviewed before changing architecture
 
