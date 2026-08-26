@@ -13,11 +13,31 @@ internal sealed class AppOptions
         WriteIndented = true
     };
 
-    [JsonPropertyName("proxy")]
-    public ProxyOptions Proxy { get; init; } = new();
+    [JsonPropertyName("proxies")]
+    public List<ProxyOptions> Proxies { get; init; } =
+    [
+        new ProxyOptions
+        {
+            Id = "proxy-1",
+            Name = "Proxy 1",
+            ListenAddress = "127.0.0.1",
+            ListenPort = 18080,
+            VpnConnectionId = "vpn-1"
+        }
+    ];
 
-    [JsonPropertyName("l2tp")]
-    public L2tpOptions L2tp { get; init; } = new();
+    [JsonPropertyName("vpnConnections")]
+    public List<L2tpOptions> VpnConnections { get; init; } =
+    [
+        new L2tpOptions
+        {
+            Id = "vpn-1",
+            Name = "L2TP 1",
+            Shared = false,
+            Mode = L2tpConnectionMode.ExistingWindowsProfile,
+            EntryName = "ProxyToAnyConnect-L2TP"
+        }
+    ];
 
     [JsonPropertyName("logging")]
     public LoggingOptions Logging { get; init; } = new();
@@ -66,8 +86,62 @@ internal sealed class AppOptions
 
     internal void Validate()
     {
-        ValidateProxy();
-        ValidateL2tp();
+        if (Proxies.Count == 0)
+        {
+            throw new InvalidOperationException("At least one proxy configuration is required.");
+        }
+
+        if (VpnConnections.Count == 0)
+        {
+            throw new InvalidOperationException("At least one L2TP connection configuration is required.");
+        }
+
+        EnsureUniqueIds(Proxies.Select(proxy => proxy.Id), "proxy");
+        EnsureUniqueIds(VpnConnections.Select(vpn => vpn.Id), "L2TP connection");
+
+        foreach (var proxy in Proxies)
+        {
+            ValidateProxy(proxy);
+        }
+
+        foreach (var vpn in VpnConnections)
+        {
+            ValidateL2tp(vpn);
+        }
+
+        var vpnById = VpnConnections.ToDictionary(vpn => vpn.Id, StringComparer.OrdinalIgnoreCase);
+        foreach (var proxy in Proxies)
+        {
+            if (!vpnById.ContainsKey(proxy.VpnConnectionId))
+            {
+                throw new InvalidOperationException(
+                    $"Proxy '{proxy.Name}' references missing L2TP connection '{proxy.VpnConnectionId}'.");
+            }
+        }
+
+        foreach (var dedicated in VpnConnections.Where(vpn => !vpn.Shared))
+        {
+            var referenceCount = Proxies.Count(proxy =>
+                proxy.VpnConnectionId.Equals(dedicated.Id, StringComparison.OrdinalIgnoreCase));
+            if (referenceCount > 1)
+            {
+                throw new InvalidOperationException(
+                    $"L2TP connection '{dedicated.Name}' is dedicated but referenced by {referenceCount} proxies. " +
+                    "Mark it as shared or assign a separate L2TP connection to each proxy.");
+            }
+        }
+
+        var endpointDuplicates = Proxies
+            .Where(proxy => proxy.Enabled)
+            .GroupBy(
+                proxy => $"{proxy.ListenAddress}:{proxy.ListenPort}",
+                StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (endpointDuplicates is not null)
+        {
+            throw new InvalidOperationException(
+                $"Multiple enabled proxies use the same listener endpoint {endpointDuplicates.Key}.");
+        }
 
         if (!string.IsNullOrWhiteSpace(Logging.FilePath) &&
             Logging.FilePath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
@@ -76,122 +150,153 @@ internal sealed class AppOptions
         }
     }
 
-    private void ValidateProxy()
+    private static void EnsureUniqueIds(IEnumerable<string> ids, string kind)
     {
-        if (!IPAddress.TryParse(Proxy.ListenAddress, out var listenAddress) ||
+        var duplicate = ids
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .GroupBy(id => id, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicate is not null)
+        {
+            throw new InvalidOperationException($"Duplicate {kind} id '{duplicate.Key}'.");
+        }
+
+        if (ids.Any(string.IsNullOrWhiteSpace))
+        {
+            throw new InvalidOperationException($"Every {kind} must have a non-empty id.");
+        }
+    }
+
+    private static void ValidateProxy(ProxyOptions proxy)
+    {
+        if (string.IsNullOrWhiteSpace(proxy.Name))
+        {
+            throw new InvalidOperationException($"Proxy '{proxy.Id}' must have a name.");
+        }
+
+        if (string.IsNullOrWhiteSpace(proxy.VpnConnectionId))
+        {
+            throw new InvalidOperationException($"Proxy '{proxy.Name}' must reference an L2TP connection.");
+        }
+
+        if (!IPAddress.TryParse(proxy.ListenAddress, out var listenAddress) ||
             listenAddress.AddressFamily != AddressFamily.InterNetwork)
         {
-            throw new InvalidOperationException("proxy.listenAddress must be an IPv4 address.");
+            throw new InvalidOperationException($"Proxy '{proxy.Name}' listenAddress must be an IPv4 address.");
         }
 
         if (!IsLocalIPv4(listenAddress))
         {
             throw new InvalidOperationException(
-                $"proxy.listenAddress '{listenAddress}' is not assigned to this computer.");
+                $"Proxy '{proxy.Name}' listenAddress '{listenAddress}' is not assigned to this computer.");
         }
 
-        if (Proxy.ListenPort is < 1 or > 65535)
+        if (proxy.ListenPort is < 1 or > 65535)
         {
-            throw new InvalidOperationException("proxy.listenPort must be between 1 and 65535.");
+            throw new InvalidOperationException($"Proxy '{proxy.Name}' listenPort must be between 1 and 65535.");
         }
 
-        if (Proxy.MaxHeaderBytes is < 4096 or > 1024 * 1024)
+        if (proxy.MaxHeaderBytes is < 4096 or > 1024 * 1024)
         {
-            throw new InvalidOperationException("proxy.maxHeaderBytes is outside the allowed range.");
+            throw new InvalidOperationException($"Proxy '{proxy.Name}' maxHeaderBytes is outside the allowed range.");
         }
 
-        if (Proxy.ClientHeaderTimeoutSeconds is < 1 or > 300)
+        if (proxy.ClientHeaderTimeoutSeconds is < 1 or > 300)
         {
-            throw new InvalidOperationException("proxy.clientHeaderTimeoutSeconds must be between 1 and 300.");
+            throw new InvalidOperationException($"Proxy '{proxy.Name}' clientHeaderTimeoutSeconds must be between 1 and 300.");
         }
 
-        if (Proxy.OutboundConnectTimeoutSeconds is < 1 or > 300)
+        if (proxy.OutboundConnectTimeoutSeconds is < 1 or > 300)
         {
-            throw new InvalidOperationException("proxy.outboundConnectTimeoutSeconds must be between 1 and 300.");
+            throw new InvalidOperationException($"Proxy '{proxy.Name}' outboundConnectTimeoutSeconds must be between 1 and 300.");
         }
 
-        if (Proxy.DnsTimeoutMilliseconds is < 250 or > 60000)
+        if (proxy.DnsTimeoutMilliseconds is < 250 or > 60000)
         {
-            throw new InvalidOperationException("proxy.dnsTimeoutMilliseconds must be between 250 and 60000.");
+            throw new InvalidOperationException($"Proxy '{proxy.Name}' dnsTimeoutMilliseconds must be between 250 and 60000.");
         }
     }
 
-    private void ValidateL2tp()
+    private static void ValidateL2tp(L2tpOptions l2tp)
     {
-        if (L2tp.MonitorIntervalMilliseconds is < 250 or > 60000)
+        if (string.IsNullOrWhiteSpace(l2tp.Name))
         {
-            throw new InvalidOperationException("l2tp.monitorIntervalMilliseconds is outside the allowed range.");
+            throw new InvalidOperationException($"L2TP connection '{l2tp.Id}' must have a name.");
         }
 
-        if (L2tp.RouteMonitorIntervalMilliseconds is < 1000 or > 300000)
+        if (l2tp.MonitorIntervalMilliseconds is < 250 or > 60000)
         {
-            throw new InvalidOperationException("l2tp.routeMonitorIntervalMilliseconds is outside the allowed range.");
+            throw new InvalidOperationException($"L2TP '{l2tp.Name}' monitorIntervalMilliseconds is outside the allowed range.");
         }
 
-        if (L2tp.ReconnectCooldownMilliseconds is < 0 or > 300000)
+        if (l2tp.RouteMonitorIntervalMilliseconds is < 1000 or > 300000)
         {
-            throw new InvalidOperationException("l2tp.reconnectCooldownMilliseconds is outside the allowed range.");
+            throw new InvalidOperationException($"L2TP '{l2tp.Name}' routeMonitorIntervalMilliseconds is outside the allowed range.");
         }
 
-        switch (L2tp.Mode)
+        if (l2tp.ReconnectCooldownMilliseconds is < 0 or > 300000)
+        {
+            throw new InvalidOperationException($"L2TP '{l2tp.Name}' reconnectCooldownMilliseconds is outside the allowed range.");
+        }
+
+        switch (l2tp.Mode)
         {
             case L2tpConnectionMode.ExistingWindowsProfile:
-                if (string.IsNullOrWhiteSpace(L2tp.EntryName))
+                if (string.IsNullOrWhiteSpace(l2tp.EntryName))
                 {
-                    throw new InvalidOperationException("l2tp.entryName is required for ExistingWindowsProfile mode.");
+                    throw new InvalidOperationException($"L2TP '{l2tp.Name}' entryName is required.");
                 }
                 break;
 
             case L2tpConnectionMode.CustomEphemeral:
-                ValidateCustomL2tp(L2tp.Custom);
+                ValidateCustomL2tp(l2tp.Name, l2tp.Custom);
                 break;
 
             default:
-                throw new InvalidOperationException($"Unsupported l2tp.mode '{L2tp.Mode}'.");
+                throw new InvalidOperationException($"Unsupported l2tp.mode '{l2tp.Mode}'.");
         }
 
-        ValidateVerification(L2tp.Verification);
+        ValidateVerification(l2tp.Name, l2tp.Verification);
     }
 
-    private static void ValidateCustomL2tp(CustomL2tpOptions custom)
+    private static void ValidateCustomL2tp(string name, CustomL2tpOptions custom)
     {
         if (string.IsNullOrWhiteSpace(custom.ServerAddress) ||
-            (IPAddress.TryParse(custom.ServerAddress, out _) is false &&
+            (!IPAddress.TryParse(custom.ServerAddress, out _) &&
              Uri.CheckHostName(custom.ServerAddress) != UriHostNameType.Dns))
         {
-            throw new InvalidOperationException("l2tp.custom.serverAddress must be an IP address or DNS host name.");
+            throw new InvalidOperationException($"L2TP '{name}' custom serverAddress must be an IP address or DNS host name.");
         }
 
         if (!custom.UseCurrentWindowsCredentials && string.IsNullOrWhiteSpace(custom.UserName))
         {
-            throw new InvalidOperationException(
-                "l2tp.custom.userName is required unless current Windows credentials are used.");
+            throw new InvalidOperationException($"L2TP '{name}' custom userName is required.");
         }
 
         if (!custom.UseCurrentWindowsCredentials && string.IsNullOrWhiteSpace(custom.ProtectedPassword))
         {
-            throw new InvalidOperationException("l2tp.custom password is required.");
+            throw new InvalidOperationException($"L2TP '{name}' custom password is required.");
         }
 
         if (custom.IpsecAuthentication == L2tpIpsecAuthentication.PreSharedKey &&
             string.IsNullOrWhiteSpace(custom.ProtectedPreSharedKey))
         {
-            throw new InvalidOperationException("l2tp.custom pre-shared key is required for PSK authentication.");
+            throw new InvalidOperationException($"L2TP '{name}' custom pre-shared key is required.");
         }
 
         if (!custom.AllowPap && !custom.AllowChap && !custom.AllowMsChapV2)
         {
             throw new InvalidOperationException(
-                "At least one PPP authentication protocol must be enabled for custom L2TP.");
+                $"L2TP '{name}' must enable at least one PPP authentication protocol.");
         }
     }
 
-    private static void ValidateVerification(VerificationOptions verification)
+    private static void ValidateVerification(string name, VerificationOptions verification)
     {
         if (string.IsNullOrWhiteSpace(verification.PublicAddress))
         {
             throw new InvalidOperationException(
-                "l2tp.verification.publicAddress is required and must contain the expected public IPv4 or a domain name.");
+                $"L2TP '{name}' verification.publicAddress is required.");
         }
 
         if (IPAddress.TryParse(verification.PublicAddress, out var publicIp))
@@ -199,40 +304,35 @@ internal sealed class AppOptions
             if (publicIp.AddressFamily != AddressFamily.InterNetwork)
             {
                 throw new InvalidOperationException(
-                    "l2tp.verification.publicAddress supports IPv4 or a domain name; IPv6 is not supported yet.");
+                    $"L2TP '{name}' verification.publicAddress supports IPv4 or a domain name only.");
             }
         }
         else if (Uri.CheckHostName(verification.PublicAddress) != UriHostNameType.Dns)
         {
             throw new InvalidOperationException(
-                "l2tp.verification.publicAddress must be an IPv4 address or a valid DNS host name.");
+                $"L2TP '{name}' verification.publicAddress must be an IPv4 address or DNS host name.");
         }
 
         if (string.IsNullOrWhiteSpace(verification.ProbeHost) ||
             Uri.CheckHostName(verification.ProbeHost) != UriHostNameType.Dns)
         {
-            throw new InvalidOperationException("l2tp.verification.probeHost must be a DNS host name.");
+            throw new InvalidOperationException($"L2TP '{name}' verification.probeHost must be a DNS host name.");
         }
 
         if (verification.ProbePort is < 1 or > 65535)
         {
-            throw new InvalidOperationException("l2tp.verification.probePort must be between 1 and 65535.");
+            throw new InvalidOperationException($"L2TP '{name}' verification.probePort must be between 1 and 65535.");
         }
 
         if (string.IsNullOrWhiteSpace(verification.ProbePath) ||
             !verification.ProbePath.StartsWith("/", StringComparison.Ordinal))
         {
-            throw new InvalidOperationException("l2tp.verification.probePath must start with '/'.");
+            throw new InvalidOperationException($"L2TP '{name}' verification.probePath must start with '/'.");
         }
 
         if (verification.TimeoutSeconds is < 1 or > 60)
         {
-            throw new InvalidOperationException("l2tp.verification.timeoutSeconds must be between 1 and 60.");
-        }
-
-        if (verification.MaxResponseBytes is < 1024 or > 1024 * 1024)
-        {
-            throw new InvalidOperationException("l2tp.verification.maxResponseBytes is outside the allowed range.");
+            throw new InvalidOperationException($"L2TP '{name}' verification.timeoutSeconds must be between 1 and 60.");
         }
     }
 
@@ -252,11 +352,23 @@ internal sealed class AppOptions
 
 internal sealed class ProxyOptions
 {
+    [JsonPropertyName("id")]
+    public string Id { get; init; } = Guid.NewGuid().ToString("N");
+
+    [JsonPropertyName("name")]
+    public string Name { get; init; } = "Proxy";
+
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; init; } = true;
+
     [JsonPropertyName("listenAddress")]
     public string ListenAddress { get; init; } = "127.0.0.1";
 
     [JsonPropertyName("listenPort")]
     public int ListenPort { get; init; } = 18080;
+
+    [JsonPropertyName("vpnConnectionId")]
+    public string VpnConnectionId { get; init; } = string.Empty;
 
     [JsonPropertyName("maxHeaderBytes")]
     public int MaxHeaderBytes { get; init; } = 65536;
@@ -280,6 +392,15 @@ internal enum L2tpConnectionMode
 
 internal sealed class L2tpOptions
 {
+    [JsonPropertyName("id")]
+    public string Id { get; init; } = Guid.NewGuid().ToString("N");
+
+    [JsonPropertyName("name")]
+    public string Name { get; init; } = "L2TP";
+
+    [JsonPropertyName("shared")]
+    public bool Shared { get; init; }
+
     [JsonPropertyName("mode")]
     public L2tpConnectionMode Mode { get; init; } = L2tpConnectionMode.ExistingWindowsProfile;
 
