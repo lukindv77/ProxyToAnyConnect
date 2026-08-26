@@ -10,6 +10,7 @@ internal sealed class DailyJsonlLogStore : IDisposable
     private readonly int _retentionDays;
 
     private string? _currentFilePath;
+    private DailyFilePathCache _dailyPathCache;
     private DateOnly? _lastRetentionCleanupDate;
     private int _disposed;
 
@@ -51,9 +52,14 @@ internal sealed class DailyJsonlLogStore : IDisposable
 
         lock (_gate)
         {
-            var relativePath = BuildRelativeDailyPath(localDate);
-            var fullPath = Path.Combine(_rootDirectory, relativePath);
-            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            var fullPath = _dailyPathCache.Resolve(
+                _rootDirectory,
+                localDate,
+                out var pathChanged);
+            if (pathChanged)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            }
 
             // Append exactly one JSONL record. The existing file is never read or
             // rewritten as part of logging. Closing the handle after the append keeps
@@ -196,5 +202,29 @@ internal sealed class DailyJsonlLogStore : IDisposable
     public void Dispose()
     {
         Interlocked.Exchange(ref _disposed, 1);
+    }
+}
+
+internal struct DailyFilePathCache
+{
+    private DateOnly? _date;
+    private string? _fullPath;
+
+    public string Resolve(string rootDirectory, DateOnly date, out bool changed)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(rootDirectory);
+
+        if (_date == date && _fullPath is not null)
+        {
+            changed = false;
+            return _fullPath;
+        }
+
+        _fullPath = Path.Combine(
+            rootDirectory,
+            DailyJsonlLogStore.BuildRelativeDailyPath(date));
+        _date = date;
+        changed = true;
+        return _fullPath;
     }
 }
