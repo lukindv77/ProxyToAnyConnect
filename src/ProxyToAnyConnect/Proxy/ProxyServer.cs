@@ -503,6 +503,8 @@ internal sealed class ProxyServer
 
     internal sealed class ParsedProxyRequest
     {
+        internal const int StackConnectionTokenCapacity = 8;
+
         private static readonly HashSet<string> FixedHopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
         {
             "Proxy-Authorization",
@@ -644,7 +646,13 @@ internal sealed class ProxyServer
 
         public byte[] BuildOriginHeader(string pathAndQuery)
         {
-            var connectionTokens = CollectConnectionTokens();
+            Span<ConnectionTokenRef> stackConnectionTokens =
+                stackalloc ConnectionTokenRef[StackConnectionTokenCapacity];
+            var stackConnectionTokenCount = CollectConnectionTokens(
+                stackConnectionTokens,
+                out var overflowConnectionTokens);
+            var connectionTokens = stackConnectionTokens[..stackConnectionTokenCount];
+
             var byteCount = checked(
                 Encoding.Latin1.GetByteCount(Method) + 1 +
                 Encoding.Latin1.GetByteCount(pathAndQuery) + 1 +
@@ -652,7 +660,7 @@ internal sealed class ProxyServer
 
             foreach (var header in Headers)
             {
-                if (ShouldSkipOriginHeader(header, connectionTokens))
+                if (ShouldSkipOriginHeader(header, connectionTokens, overflowConnectionTokens))
                 {
                     continue;
                 }
@@ -678,7 +686,7 @@ internal sealed class ProxyServer
 
             foreach (var header in Headers)
             {
-                if (ShouldSkipOriginHeader(header, connectionTokens))
+                if (ShouldSkipOriginHeader(header, connectionTokens, overflowConnectionTokens))
                 {
                     continue;
                 }
@@ -695,32 +703,94 @@ internal sealed class ProxyServer
             return result;
         }
 
-        private static bool ShouldSkipOriginHeader(
+        private bool ShouldSkipOriginHeader(
             HeaderLine header,
-            HashSet<string>? connectionTokens) =>
-            header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
-            FixedHopByHopHeaders.Contains(header.Name) ||
-            connectionTokens?.Contains(header.Name) == true;
-
-        private HashSet<string>? CollectConnectionTokens()
+            ReadOnlySpan<ConnectionTokenRef> stackConnectionTokens,
+            HashSet<string>? overflowConnectionTokens)
         {
-            HashSet<string>? tokens = null;
-            foreach (var header in Headers)
+            if (header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+                FixedHopByHopHeaders.Contains(header.Name))
             {
+                return true;
+            }
+
+            if (overflowConnectionTokens is not null)
+            {
+                return overflowConnectionTokens.Contains(header.Name);
+            }
+
+            var headerName = header.Name.AsSpan();
+            foreach (var tokenRef in stackConnectionTokens)
+            {
+                var token = GetConnectionTokenSpan(tokenRef);
+                if (token.Equals(headerName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private int CollectConnectionTokens(
+            Span<ConnectionTokenRef> stackTokens,
+            out HashSet<string>? overflowTokens)
+        {
+            overflowTokens = null;
+            var stackTokenCount = 0;
+
+            for (var headerIndex = 0; headerIndex < Headers.Count; headerIndex++)
+            {
+                var header = Headers[headerIndex];
                 if (!header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
 
-                var remaining = header.Value.AsSpan();
-                while (!remaining.IsEmpty)
+                var value = header.Value.AsSpan();
+                var segmentStart = 0;
+                while (segmentStart <= value.Length)
                 {
+                    var remaining = value[segmentStart..];
                     var comma = remaining.IndexOf(',');
-                    var token = (comma < 0 ? remaining : remaining[..comma]).Trim();
-                    if (!token.IsEmpty)
+                    var segmentLength = comma < 0 ? remaining.Length : comma;
+                    var segment = remaining[..segmentLength];
+                    var trimStart = 0;
+                    while (trimStart < segment.Length && char.IsWhiteSpace(segment[trimStart]))
                     {
-                        (tokens ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase))
-                            .Add(token.ToString());
+                        trimStart++;
+                    }
+
+                    var trimEnd = segment.Length;
+                    while (trimEnd > trimStart && char.IsWhiteSpace(segment[trimEnd - 1]))
+                    {
+                        trimEnd--;
+                    }
+
+                    if (trimEnd > trimStart)
+                    {
+                        var tokenRef = new ConnectionTokenRef(
+                            headerIndex,
+                            segmentStart + trimStart,
+                            trimEnd - trimStart);
+
+                        if (overflowTokens is null && stackTokenCount < stackTokens.Length)
+                        {
+                            stackTokens[stackTokenCount++] = tokenRef;
+                        }
+                        else
+                        {
+                            if (overflowTokens is null)
+                            {
+                                overflowTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                for (var i = 0; i < stackTokenCount; i++)
+                                {
+                                    overflowTokens.Add(GetConnectionTokenSpan(stackTokens[i]).ToString());
+                                }
+                            }
+
+                            overflowTokens.Add(GetConnectionTokenSpan(tokenRef).ToString());
+                        }
                     }
 
                     if (comma < 0)
@@ -728,12 +798,17 @@ internal sealed class ProxyServer
                         break;
                     }
 
-                    remaining = remaining[(comma + 1)..];
+                    segmentStart += comma + 1;
                 }
             }
 
-            return tokens;
+            return stackTokenCount;
         }
+
+        private ReadOnlySpan<char> GetConnectionTokenSpan(ConnectionTokenRef tokenRef) =>
+            Headers[tokenRef.HeaderIndex].Value.AsSpan(tokenRef.Start, tokenRef.Length);
+
+        private readonly record struct ConnectionTokenRef(int HeaderIndex, int Start, int Length);
 
         private readonly record struct HeaderLine(string Name, string Value);
     }
