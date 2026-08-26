@@ -81,6 +81,11 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        if (await SelectiveReconfigureStressSelfTests.RunAsync() != 0)
+        {
+            return 1;
+        }
+
         if (await ProxyLifecycleStressSelfTests.RunAsync() != 0)
         {
             return 1;
