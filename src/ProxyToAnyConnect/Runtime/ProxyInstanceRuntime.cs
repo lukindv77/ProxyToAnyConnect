@@ -61,7 +61,9 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
                 lease = await _vpn.AcquireAsync(_options.Id, cancellationToken);
                 runCancellation = new CancellationTokenSource();
 
-                var dnsResolver = new L2tpDnsResolver(_options.DnsTimeoutMilliseconds);
+                var dnsResolver = new L2tpDnsResolver(
+                    _options.DnsTimeoutMilliseconds,
+                    lease.DnsCache);
                 var socketFactory = new L2tpSocketFactory(lease.ConnectionManager, dnsResolver);
                 var proxyServer = new ProxyServer(_options, socketFactory, Metrics, _vpn.Metrics);
 
@@ -253,7 +255,6 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
             return;
         }
 
-        // Inline pause semantics because public PauseAsync rejects disposed objects.
         await _gate.WaitAsync();
         try
         {
