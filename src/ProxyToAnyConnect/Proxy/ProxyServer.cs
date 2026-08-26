@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -9,6 +10,9 @@ namespace ProxyToAnyConnect.Proxy;
 
 internal sealed class ProxyServer
 {
+    private const int TransferBufferSize = 32 * 1024;
+    private const int InitialHeaderBufferSize = 4 * 1024;
+
     private static readonly byte[] ConnectionEstablished =
         Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n");
 
@@ -107,8 +111,8 @@ internal sealed class ProxyServer
 
         using var headerTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         headerTimeout.CancelAfter(TimeSpan.FromSeconds(_options.ClientHeaderTimeoutSeconds));
-        var readResult = await ReadHeaderAsync(clientStream, _options.MaxHeaderBytes, headerTimeout.Token);
-        var request = ParsedProxyRequest.Parse(readResult.Header);
+        var readResult = await ReadRequestAsync(clientStream, _options.MaxHeaderBytes, headerTimeout.Token);
+        var request = readResult.Request;
 
         if (request.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
         {
@@ -225,17 +229,24 @@ internal sealed class ProxyServer
         Action<int> onTransferred,
         CancellationToken cancellationToken)
     {
-        var buffer = new byte[32 * 1024];
-        while (true)
+        var buffer = ArrayPool<byte>.Shared.Rent(TransferBufferSize);
+        try
         {
-            var read = await source.ReadAsync(buffer, cancellationToken);
-            if (read == 0)
+            while (true)
             {
-                return;
-            }
+                var read = await source.ReadAsync(buffer.AsMemory(0, TransferBufferSize), cancellationToken);
+                if (read == 0)
+                {
+                    return;
+                }
 
-            await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-            onTransferred(read);
+                await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                onTransferred(read);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer, clearArray: false);
         }
     }
 
@@ -268,35 +279,74 @@ internal sealed class ProxyServer
         }
     }
 
-    private static async Task<HeaderReadResult> ReadHeaderAsync(
+    private static async Task<RequestReadResult> ReadRequestAsync(
         Stream stream,
         int maxHeaderBytes,
         CancellationToken cancellationToken)
     {
-        var buffer = new byte[Math.Min(4096, maxHeaderBytes)];
-        using var received = new MemoryStream();
+        var pool = ArrayPool<byte>.Shared;
+        var capacity = Math.Min(InitialHeaderBufferSize, maxHeaderBytes);
+        var buffer = pool.Rent(capacity);
+        var length = 0;
 
-        while (received.Length < maxHeaderBytes)
+        try
         {
-            var read = await stream.ReadAsync(buffer, cancellationToken);
-            if (read == 0)
+            while (length < maxHeaderBytes)
             {
-                throw new InvalidDataException("Connection closed before the HTTP proxy request header was complete.");
-            }
+                if (length == capacity)
+                {
+                    var nextCapacity = Math.Min(maxHeaderBytes, checked(capacity * 2));
+                    if (nextCapacity <= capacity)
+                    {
+                        break;
+                    }
 
-            received.Write(buffer, 0, read);
-            var data = received.GetBuffer().AsSpan(0, checked((int)received.Length));
-            var headerEnd = FindHeaderEnd(data);
-            if (headerEnd >= 0)
-            {
+                    var replacement = pool.Rent(nextCapacity);
+                    buffer.AsSpan(0, length).CopyTo(replacement);
+                    pool.Return(buffer, clearArray: false);
+                    buffer = replacement;
+                    capacity = nextCapacity;
+                }
+
+                var read = await stream.ReadAsync(
+                    buffer.AsMemory(length, Math.Min(capacity - length, maxHeaderBytes - length)),
+                    cancellationToken);
+                if (read == 0)
+                {
+                    throw new InvalidDataException("Connection closed before the HTTP proxy request header was complete.");
+                }
+
+                length += read;
+                var data = buffer.AsSpan(0, length);
+                var headerEnd = FindHeaderEnd(data);
+                if (headerEnd < 0)
+                {
+                    continue;
+                }
+
                 var headerLength = headerEnd + 4;
-                return new HeaderReadResult(
-                    data[..headerLength].ToArray(),
-                    data[headerLength..].ToArray());
-            }
-        }
+                var request = ParsedProxyRequest.Parse(data[..headerLength]);
+                var remainderLength = length - headerLength;
+                byte[] remainder;
+                if (remainderLength == 0)
+                {
+                    remainder = [];
+                }
+                else
+                {
+                    remainder = GC.AllocateUninitializedArray<byte>(remainderLength);
+                    data[headerLength..length].CopyTo(remainder);
+                }
 
-        throw new InvalidDataException("HTTP proxy request header exceeded the configured size limit.");
+                return new RequestReadResult(request, remainder);
+            }
+
+            throw new InvalidDataException("HTTP proxy request header exceeded the configured size limit.");
+        }
+        finally
+        {
+            pool.Return(buffer, clearArray: false);
+        }
     }
 
     private static int FindHeaderEnd(ReadOnlySpan<byte> data)
@@ -387,7 +437,7 @@ internal sealed class ProxyServer
         }
     }
 
-    private readonly record struct HeaderReadResult(byte[] Header, byte[] Remainder);
+    private readonly record struct RequestReadResult(ParsedProxyRequest Request, byte[] Remainder);
 
     internal sealed class ParsedProxyRequest
     {
