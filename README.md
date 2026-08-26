@@ -1,129 +1,144 @@
 # ProxyToAnyConnect
 
-Local HTTP/HTTPS proxy for Windows 11 x64 that establishes and monitors a configured L2TP connection and routes proxy traffic only through that verified connection.
+Windows 11 x64 GUI application that exposes one or more local HTTP/HTTPS proxy listeners and routes each proxy exclusively through its selected verified L2TP connection.
 
-## Core invariants
+> **Current development contract:** [`docs/requirements.md`](docs/requirements.md) is the source of truth for product behavior and acceptance criteria.
 
-1. The application establishes the configured L2TP connection itself.
-2. The application discovers the IPv4 address assigned to that L2TP connection at runtime.
-3. Proxy outbound connections have no DIRECT fallback path.
-4. Establishing L2TP must not replace the normal Windows default route used by other applications.
-5. Other applications continue to use their ordinary network path unless they explicitly use this proxy.
-6. HTTPS is supported with the standard HTTP `CONNECT` tunnel. TLS is not intercepted or decrypted.
-7. A newly established L2TP connection is not exposed to proxy traffic until active path verification succeeds.
-8. While `Ready`, the application continuously checks the RAS IPv4 and the host IPv4 default-route baseline; a violation cancels active proxy tunnels and disconnects the RAS session.
-
-## Platform
+## Target platform
 
 - Windows 11 x64
 - C# / .NET 10 (`net10.0-windows`)
-- HTTP proxy listener: loopback only
-- HTTP and HTTPS `CONNECT`
+- WinForms GUI + system tray
 - IPv4 first
-- Windows RAS API for L2TP lifecycle and state
+- Windows RAS / Winsock / IP Helper APIs
 
-## Connection state
+## Core invariants
+
+1. Proxy traffic has no DIRECT fallback path.
+2. Every outbound proxy socket is bound to the IPv4/interface of its selected verified L2TP session.
+3. Establishing L2TP must not replace or modify the normal default Internet route used by unrelated applications.
+4. DNS for proxied traffic is resolved through the selected L2TP context.
+5. HTTPS uses normal HTTP `CONNECT`; ProxyToAnyConnect does not intercept or decrypt TLS.
+6. L2TP is not usable by proxy traffic until active verification reaches `Ready`.
+7. Loss of a verified L2TP context cancels dependent active proxy tunnels fail-closed.
+
+## GUI lifecycle
+
+`ProxyToAnyConnect.exe` always runs as a GUI application.
+
+- The main window may be hidden/minimized to the Windows notification area.
+- Clicking the window close button (`X`) hides it to tray; it does **not** terminate the process.
+- The process exits only through an explicit **Exit** command in the application menu or tray context menu.
+
+## Multi-proxy model
+
+The target runtime supports multiple independent proxy instances.
+
+Each proxy has its own:
+
+- name and stable ID;
+- bind IPv4;
+- bind TCP port;
+- header/read timeout;
+- outbound connect timeout;
+- DNS timeout;
+- selected L2TP connection;
+- runtime state and last error.
+
+Each proxy can be independently **Running** or **Paused**.
+
+Pausing a proxy stops only its listener and active sessions. Resuming starts it again.
+
+## Shared and dedicated L2TP
+
+L2TP connections are independent catalog entities referenced by proxy instances.
+
+- **Shared L2TP** may be used by multiple Running proxies through one verified RAS session.
+- **Dedicated L2TP** is assigned to one proxy.
+
+A Running proxy holds a runtime lease on its selected L2TP connection:
+
+```text
+first active lease
+        -> Dialing -> Verifying -> Ready
+
+additional shared proxy
+        -> reuse same Ready L2TP
+
+last active lease released
+        -> RasHangUp
+```
+
+Therefore, if a proxy is paused and no other active proxy uses its L2TP connection, that L2TP session is disconnected automatically.
+
+## L2TP connection modes
+
+### Existing Windows profile
+
+The GUI provides interactive selection of existing Windows L2TP profiles. Existing profiles are validated for split-tunnel/fail-closed compatibility before dialing.
+
+### Custom ephemeral L2TP
+
+A connection may instead be configured directly in ProxyToAnyConnect with server/authentication/IPsec/PPP settings.
+
+The custom connection must not become a persistent Windows VPN profile. The implementation may create a temporary private RAS phonebook entry only for the active runtime/session and removes it after disconnect/exit.
+
+Passwords and PSKs must never be stored as plaintext; Windows user-bound DPAPI is the intended storage mechanism.
+
+## Verification and monitoring
+
+A usable L2TP connection follows:
 
 ```text
 Disconnected -> Dialing -> Verifying -> Ready
 ```
 
-Only `Ready` is usable by proxy traffic.
+Verification includes assigned RAS IPv4/interface discovery, preservation of the host default-route set, an L2TP-bound HTTPS probe, and public IPv4 equality when a fixed expected public IPv4 is configured.
 
-Verification currently checks:
+If the configured public address is a DNS name instead of an IPv4 literal, checks that inherently require a fixed expected IPv4 are skipped; the remaining L2TP-bound verification is still mandatory.
 
-- Windows VPN profile is L2TP with split tunneling enabled;
-- the active IPv4 default-route set is unchanged by `RasDial`;
-- an HTTPS probe can be completed using a socket bound to the L2TP source IPv4 and `IP_UNICAST_IF`;
-- when a fixed public IPv4 is configured, the externally observed public IPv4 matches it.
+## Keepalive
 
-If the configured public address is a DNS name instead of an IPv4 address, checks that depend on a fixed expected IPv4 are skipped. The remaining L2TP-bound route and active probe checks are still required.
+Each L2TP connection has its own keepalive policy:
 
-`l2tp.verification.publicAddress` means the public identity seen by Internet services for traffic exiting through L2TP. It is **not** the public address of the L2TP server endpoint.
+- `Off`
+- `VpnServerInternalIPv4` — probe the internal PPP server IPv4 returned by RAS
+- `CustomIPv4` — probe an explicitly configured IPv4
 
-## Traffic flow
+Settings include probe interval, probe timeout and consecutive failure threshold.
 
-```text
-Chrome / other client
-        |
-        | HTTP proxy 127.0.0.1:18080
-        v
-ProxyToAnyConnect
-        |
-        | verified L2TP-bound socket only
-        v
-Windows L2TP
-        |
-        v
-Internet
-```
-
-If L2TP is unavailable, cannot be verified, changes the Windows default route, or fails the public-IP check, proxy requests fail. The application never retries proxy traffic through the normal Wi-Fi/Ethernet route.
-
-DNS for proxied destinations is also sent only through L2TP-bound sockets. The resolver supports IPv4 A records, follows CNAME chains, and falls back from UDP to DNS-over-TCP when a DNS response is truncated.
-
-## Windows VPN profile scope
-
-Both Windows VPN profile scopes are supported:
-
-- normal per-user profile: RAS uses the current user's default phonebook;
-- `AllUserConnection=True`: ProxyToAnyConnect explicitly uses the global Windows `rasphone.pbk` under the common application-data directory.
-
-The profile scope is detected by `Get-VpnConnection` before dialing.
-
-## Required configuration before first run
-
-Edit `src/ProxyToAnyConnect/appsettings.json` (or the deployed copy) and set:
-
-```json
-{
-  "l2tp": {
-    "entryName": "ProxyToAnyConnect-L2TP",
-    "monitorIntervalMilliseconds": 1000,
-    "routeMonitorIntervalMilliseconds": 5000,
-    "verification": {
-      "publicAddress": "YOUR_L2TP_PUBLIC_IPV4_OR_DNS_NAME",
-      "probeHost": "api.ipify.org",
-      "probePort": 443,
-      "probePath": "/"
-    }
-  },
-  "logging": {
-    "filePath": "logs/ProxyToAnyConnect.jsonl",
-    "consoleJson": false
-  }
-}
-```
-
-The Windows VPN entry must already exist and have its credentials stored by Windows. Credentials are not stored in this repository.
-
-## Structured diagnostics
-
-The default configuration writes JSON Lines diagnostics to:
+After the failure threshold is reached:
 
 ```text
-logs/ProxyToAnyConnect.jsonl
+invalidate context
+   -> cancel dependent proxy tunnels
+   -> RasHangUp
+   -> reconnect cooldown
+   -> if active proxy leases exist:
+         Dialing -> Verifying -> Ready
+      else:
+         remain Disconnected
 ```
 
-relative to the deployed `appsettings.json` directory. Log entries include VPN state transitions, profile/route verification, assigned RAS IPv4/interface information and fail-closed reasons. Password values, HTTP request bodies and HTTPS tunnel contents are not logged.
+The keepalive probe itself must be forced through the selected L2TP context and has no DIRECT fallback.
 
-Logging failures do not alter proxy routing or fail-closed behavior; if the log file cannot be written, file logging disables itself.
+## Current implementation status
 
-## Verification-only diagnostic run
+The repository is currently being refactored from the initial single-proxy console-oriented prototype to the GUI multi-proxy architecture above. Existing low-level pieces already include HTTP/HTTPS CONNECT proxying, RAS dialing/PPP IPv4 discovery, L2TP-bound DNS, `IP_UNICAST_IF`, active verification, route guards, structured diagnostics and Windows CI self-tests.
 
-Before enabling the browser proxy, test the complete VPN path without starting a listener:
+During this refactor, `main` may temporarily contain incomplete integration commits; GitHub issues track the remaining milestones.
 
-```powershell
-.\ProxyToAnyConnect.exe .\appsettings.json --verify-only
-```
+## Roadmap issues
 
-Exit code `0` means the connection reached `Ready` and all fail-closed guards passed. The process then exits and disconnects the RAS session.
+- #2 — Windows 11 integration test with real L2TP endpoint
+- #3 — GUI lifecycle / tray / explicit Exit
+- #4 — multi-proxy runtime, shared/dedicated L2TP leases, Pause/Resume
+- #5 — settings UI, bind IP/port, timeouts, interactive Windows profile selection
+- #6 — custom ephemeral L2TP and protected credentials
+- #7 — L2TP keepalive and automatic reconnect
 
-## Build and publish
+## Documentation
 
-GitHub Actions builds with .NET 10 on Windows, runs parser and live loopback proxy tests, verifies active CONNECT cancellation when the outbound/VPN lifetime ends, and publishes a self-contained `win-x64` artifact named `ProxyToAnyConnect-win-x64`.
-
-See:
-
-- [`docs/architecture.md`](docs/architecture.md) — current architecture and invariants;
-- [`docs/windows-integration-test.md`](docs/windows-integration-test.md) — reproducible Windows 11 + real L2TP test procedure.
+- [`docs/requirements.md`](docs/requirements.md) — current product requirements and runtime semantics
+- [`docs/architecture.md`](docs/architecture.md) — implementation architecture (being updated during the refactor)
+- [`docs/windows-integration-test.md`](docs/windows-integration-test.md) — Windows integration test procedure (will be expanded for multi-proxy scenarios)
