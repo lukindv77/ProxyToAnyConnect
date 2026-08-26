@@ -7,12 +7,21 @@ namespace ProxyToAnyConnect;
 
 internal static class Program
 {
+    private const string VerifyOnlyArgument = "--verify-only";
+    private const string HelpArgument = "--help";
+
     public static async Task<int> Main(string[] args)
     {
         if (!OperatingSystem.IsWindows())
         {
             Console.Error.WriteLine("ProxyToAnyConnect supports Windows only.");
             return 2;
+        }
+
+        if (args.Any(argument => argument.Equals(HelpArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            PrintUsage();
+            return 0;
         }
 
         using var shutdown = new CancellationTokenSource();
@@ -24,9 +33,24 @@ internal static class Program
 
         try
         {
-            var configPath = args.Length > 0
-                ? Path.GetFullPath(args[0])
+            var verifyOnly = args.Any(argument =>
+                argument.Equals(VerifyOnlyArgument, StringComparison.OrdinalIgnoreCase));
+
+            var configArgument = args.FirstOrDefault(argument => !argument.StartsWith("--", StringComparison.Ordinal));
+            var configPath = configArgument is not null
+                ? Path.GetFullPath(configArgument)
                 : Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+
+            var unknownArguments = args.Where(argument =>
+                    argument.StartsWith("--", StringComparison.Ordinal) &&
+                    !argument.Equals(VerifyOnlyArgument, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (unknownArguments.Length > 0)
+            {
+                Console.Error.WriteLine($"Unknown argument(s): {string.Join(", ", unknownArguments)}");
+                PrintUsage();
+                return 2;
+            }
 
             var options = await AppOptions.LoadAsync(configPath, shutdown.Token);
             await using var rasConnectionManager = new RasConnectionManager(options.L2tp);
@@ -35,10 +59,23 @@ internal static class Program
             {
                 var vpn = await rasConnectionManager.ConnectAsync(shutdown.Token);
                 PrintVpnContext(vpn, rasConnectionManager.LastVerification);
+
+                if (verifyOnly)
+                {
+                    Console.WriteLine("Verification-only mode completed successfully. Proxy listener was not started.");
+                    return 0;
+                }
             }
             catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException)
             {
                 Console.Error.WriteLine($"Initial L2TP connection/verification failed: {ex.Message}");
+
+                if (verifyOnly)
+                {
+                    Console.Error.WriteLine("Verification-only mode failed. Proxy listener was not started.");
+                    return 3;
+                }
+
                 Console.Error.WriteLine("Proxy remains fail-closed and will retry L2TP verification on demand.");
             }
 
@@ -58,6 +95,16 @@ internal static class Program
             Console.Error.WriteLine(ex);
             return 1;
         }
+    }
+
+    private static void PrintUsage()
+    {
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  ProxyToAnyConnect.exe [appsettings.json]");
+        Console.WriteLine("  ProxyToAnyConnect.exe [appsettings.json] --verify-only");
+        Console.WriteLine();
+        Console.WriteLine("--verify-only establishes L2TP, runs all fail-closed verification guards,");
+        Console.WriteLine("prints the verified VPN context, and exits without starting the proxy listener.");
     }
 
     private static void PrintVpnContext(VpnContext vpn, VpnVerificationResult? verification)
