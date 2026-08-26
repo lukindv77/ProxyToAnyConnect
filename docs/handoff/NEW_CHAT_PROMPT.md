@@ -12,16 +12,19 @@ Copy the text below as the first message in a new ChatGPT conversation.
 
 1. Прочитай на актуальном `main`:
    - `docs/handoff/CURRENT_STATE.md`
+   - `docs/handoff/AUDIT_SNAPSHOT.md`
+   - `docs/handoff/ISSUES_SNAPSHOT.md`
+   - `docs/handoff/MANIFEST.md`
    - `docs/requirements.md` — основной source of truth требований
    - `docs/architecture.md`
    - `docs/memory-stability.md`
    - `docs/windows-integration-test.md`
    - `README.md`
    - `.github/workflows/build.yml`
-   - `.github/workflows/handoff.yml` (если уже присутствует)
+   - `.github/workflows/handoff.yml`
 2. Получи latest commit `main` и не предполагай, что SHA из handoff всё ещё последний.
-3. Получи актуальные GitHub Issues, особенно #2, #4–#7, #9–#13, и их комментарии/acceptance criteria.
-4. Проверь GitHub Actions для **текущего head**, а не старого commit. Не утверждай, что CI зелёный, пока это не подтверждено для актуального head.
+3. Получи актуальные GitHub Issues и их новые комментарии/acceptance criteria. На момент handoff открыты были `#2, #4, #5, #6, #7, #10, #11, #12, #13`; закрыты `#1, #3, #8, #9`, но перепроверь это в GitHub.
+4. Проверь GitHub Actions для **текущего head**, а не старого commit. Проверь оба workflow: `build` и `handoff`. Не утверждай, что CI зелёный, пока это не подтверждено для актуального head.
 5. Просмотри текущую структуру `src/ProxyToAnyConnect` и `tests/ProxyToAnyConnect.SelfTests`, прежде чем писать код.
 6. Если GitHub расходится с этим prompt/handoff, **актуальный GitHub имеет приоритет**, кроме случаев, когда это очевидная незавершённая/сломанная промежуточная правка — тогда сначала разберись по commit history/issues/CI.
 
@@ -121,12 +124,12 @@ Windows 11 x64 GUI-приложение на **C# / .NET 10 (`net10.0-windows`)*
 - Per-session RAS monitor CTS/task, join при disconnect/reconnect; stale old monitor не может hangup новый RAS handle.
 - Windows self-tests и self-contained win-x64 publish artifact.
 
-## Последний известный проверенный baseline до handoff-doc commits
+## Последний известный проверенный code baseline до handoff-doc commits
 
 Commit `5c3955fce4896c0a02b78c021eaccd8078ada8f4` — `fix: own RAS monitor lifetime per VPN session`.
 GitHub Actions run #181 был полностью успешен: Build, Self-tests, Publish, ZIP, Upload artifact.
 
-После него добавлялись docs/handoff/workflow commits. Поэтому **обязательно проверь CI текущего head** и используй текущий head как baseline.
+После него добавлялись docs/handoff/workflow commits. Поэтому **обязательно проверь CI текущего head** и используй текущий head как baseline. Handoff workflow создаёт `ProxyToAnyConnect-handoff-<sha>` source ZIP с `HANDOFF_BUILD_INFO.txt`; обычный build workflow отдельно публикует self-contained win-x64 ZIP.
 
 ## Известные audit gaps / следующий приоритет
 
@@ -136,10 +139,10 @@ GitHub Actions run #181 был полностью успешен: Build, Self-te
 
 1. #2 — реальный Windows 11 E2E с существующим и custom ephemeral L2TP.
 2. #6/#7 — реальный custom L2TP + keepalive/reconnect validation.
-3. #12 — убедиться, что bounded latest L2TP status уже выведен в GUI; backend registry реализован, GUI может быть ещё не доведён.
+3. #10/#12 — bounded latest L2TP status backend есть; завершить/проверить GUI `Status / reason` с verification/keepalive/cooldown/fail-closed detail.
 4. #13 — продолжать long-run memory/resource audit: repeated Pause/Resume/reconnect/selective reconfigure, без monotonic retained graph/handles.
-5. Проверять selective reload: изменение proxy перезапускает только его; изменение shared L2TP — только зависимую группу; остальные продолжают работать.
-6. Performance/memory changes должны иметь repeatable regression coverage и не ухудшать data path.
+5. #4/#5 — проверить все acceptance criteria multi-proxy/settings, особенно unique bind endpoint validation, bind IPv4 selector и selective reload isolation.
+6. #11 — performance/memory changes должны иметь repeatable regression coverage и не ухудшать data path.
 7. Обновлять `docs/windows-integration-test.md` результатами реального теста.
 
 ## Правила работы в новом чате
@@ -158,7 +161,7 @@ GitHub Actions run #181 был полностью успешен: Build, Self-te
 Синхронизируйся с GitHub по шагам выше, кратко сообщи:
 
 1. актуальный head SHA;
-2. статус последнего CI для него;
+2. статус последних `build` и `handoff` workflow для него;
 3. какие roadmap issues сейчас open/closed;
 4. есть ли расхождения между handoff и текущим кодом;
 5. какой следующий конкретный кодовый шаг ты выбираешь.
