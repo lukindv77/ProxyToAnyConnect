@@ -74,7 +74,7 @@ internal sealed class AppOptions
                          FileMode.Create,
                          FileAccess.Write,
                          FileShare.None,
-                         bufferSize: 16 * 1024,
+                         16 * 1024,
                          useAsync: true))
         {
             await JsonSerializer.SerializeAsync(stream, this, JsonOptions, cancellationToken);
@@ -131,39 +131,25 @@ internal sealed class AppOptions
             }
         }
 
-        var endpointDuplicates = Proxies
+        var duplicateEndpoint = Proxies
             .Where(proxy => proxy.Enabled)
-            .GroupBy(
-                proxy => $"{proxy.ListenAddress}:{proxy.ListenPort}",
-                StringComparer.OrdinalIgnoreCase)
+            .GroupBy(proxy => $"{proxy.ListenAddress}:{proxy.ListenPort}", StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault(group => group.Count() > 1);
-        if (endpointDuplicates is not null)
+        if (duplicateEndpoint is not null)
         {
             throw new InvalidOperationException(
-                $"Multiple enabled proxies use the same listener endpoint {endpointDuplicates.Key}.");
+                $"Multiple enabled proxies use the same listener endpoint {duplicateEndpoint.Key}.");
         }
 
-        if (!string.IsNullOrWhiteSpace(Logging.FilePath) &&
-            Logging.FilePath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+        if (!string.IsNullOrWhiteSpace(Logging.Directory) &&
+            Logging.Directory.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
         {
-            throw new InvalidOperationException("logging.filePath contains invalid path characters.");
-        }
-    }
-
-    private static void EnsureUniqueIds(IEnumerable<string> ids, string kind)
-    {
-        var duplicate = ids
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .GroupBy(id => id, StringComparer.OrdinalIgnoreCase)
-            .FirstOrDefault(group => group.Count() > 1);
-        if (duplicate is not null)
-        {
-            throw new InvalidOperationException($"Duplicate {kind} id '{duplicate.Key}'.");
+            throw new InvalidOperationException("logging.directory contains invalid path characters.");
         }
 
-        if (ids.Any(string.IsNullOrWhiteSpace))
+        if (Logging.RetentionDays is < 1 or > 3650)
         {
-            throw new InvalidOperationException($"Every {kind} must have a non-empty id.");
+            throw new InvalidOperationException("logging.retentionDays must be between 1 and 3650.");
         }
     }
 
@@ -247,16 +233,15 @@ internal sealed class AppOptions
                     throw new InvalidOperationException($"L2TP '{l2tp.Name}' entryName is required.");
                 }
                 break;
-
             case L2tpConnectionMode.CustomEphemeral:
                 ValidateCustomL2tp(l2tp.Name, l2tp.Custom);
                 break;
-
             default:
                 throw new InvalidOperationException($"Unsupported l2tp.mode '{l2tp.Mode}'.");
         }
 
         ValidateVerification(l2tp.Name, l2tp.Verification);
+        ValidateKeepalive(l2tp.Name, l2tp.Keepalive);
     }
 
     private static void ValidateCustomL2tp(string name, CustomL2tpOptions custom)
@@ -286,8 +271,7 @@ internal sealed class AppOptions
 
         if (!custom.AllowPap && !custom.AllowChap && !custom.AllowMsChapV2)
         {
-            throw new InvalidOperationException(
-                $"L2TP '{name}' must enable at least one PPP authentication protocol.");
+            throw new InvalidOperationException($"L2TP '{name}' must enable at least one PPP authentication protocol.");
         }
     }
 
@@ -295,8 +279,7 @@ internal sealed class AppOptions
     {
         if (string.IsNullOrWhiteSpace(verification.PublicAddress))
         {
-            throw new InvalidOperationException(
-                $"L2TP '{name}' verification.publicAddress is required.");
+            throw new InvalidOperationException($"L2TP '{name}' verification.publicAddress is required.");
         }
 
         if (IPAddress.TryParse(verification.PublicAddress, out var publicIp))
@@ -333,6 +316,48 @@ internal sealed class AppOptions
         if (verification.TimeoutSeconds is < 1 or > 60)
         {
             throw new InvalidOperationException($"L2TP '{name}' verification.timeoutSeconds must be between 1 and 60.");
+        }
+    }
+
+    private static void ValidateKeepalive(string name, KeepaliveOptions keepalive)
+    {
+        if (keepalive.IntervalSeconds is < 1 or > 3600)
+        {
+            throw new InvalidOperationException($"L2TP '{name}' keepalive.intervalSeconds must be between 1 and 3600.");
+        }
+
+        if (keepalive.TimeoutMilliseconds is < 100 or > 60000)
+        {
+            throw new InvalidOperationException($"L2TP '{name}' keepalive.timeoutMilliseconds must be between 100 and 60000.");
+        }
+
+        if (keepalive.FailureThreshold is < 1 or > 100)
+        {
+            throw new InvalidOperationException($"L2TP '{name}' keepalive.failureThreshold must be between 1 and 100.");
+        }
+
+        if (keepalive.Mode == L2tpKeepaliveMode.CustomIPv4 &&
+            (!IPAddress.TryParse(keepalive.CustomIPv4, out var address) ||
+             address.AddressFamily != AddressFamily.InterNetwork))
+        {
+            throw new InvalidOperationException($"L2TP '{name}' keepalive.customIPv4 must be an IPv4 address.");
+        }
+    }
+
+    private static void EnsureUniqueIds(IEnumerable<string> ids, string kind)
+    {
+        var values = ids.ToArray();
+        if (values.Any(string.IsNullOrWhiteSpace))
+        {
+            throw new InvalidOperationException($"Every {kind} must have a non-empty id.");
+        }
+
+        var duplicate = values
+            .GroupBy(value => value, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicate is not null)
+        {
+            throw new InvalidOperationException($"Duplicate {kind} id '{duplicate.Key}'.");
         }
     }
 
@@ -419,6 +444,9 @@ internal sealed class L2tpOptions
     [JsonPropertyName("verification")]
     public VerificationOptions Verification { get; init; } = new();
 
+    [JsonPropertyName("keepalive")]
+    public KeepaliveOptions Keepalive { get; init; } = new();
+
     [JsonPropertyName("custom")]
     public CustomL2tpOptions Custom { get; init; } = new();
 }
@@ -437,6 +465,32 @@ internal enum L2tpEncryptionMode
     Optional,
     Required,
     Maximum
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter<L2tpKeepaliveMode>))]
+internal enum L2tpKeepaliveMode
+{
+    Off,
+    VpnServerInternalIPv4,
+    CustomIPv4
+}
+
+internal sealed class KeepaliveOptions
+{
+    [JsonPropertyName("mode")]
+    public L2tpKeepaliveMode Mode { get; init; } = L2tpKeepaliveMode.Off;
+
+    [JsonPropertyName("customIPv4")]
+    public string CustomIPv4 { get; init; } = string.Empty;
+
+    [JsonPropertyName("intervalSeconds")]
+    public int IntervalSeconds { get; init; } = 10;
+
+    [JsonPropertyName("timeoutMilliseconds")]
+    public int TimeoutMilliseconds { get; init; } = 2000;
+
+    [JsonPropertyName("failureThreshold")]
+    public int FailureThreshold { get; init; } = 3;
 }
 
 internal sealed class CustomL2tpOptions
@@ -498,8 +552,12 @@ internal sealed class VerificationOptions
 
 internal sealed class LoggingOptions
 {
-    [JsonPropertyName("filePath")]
-    public string? FilePath { get; init; } = "logs/ProxyToAnyConnect.jsonl";
+    // Empty means AppContext.BaseDirectory (the directory containing/running the utility).
+    [JsonPropertyName("directory")]
+    public string Directory { get; init; } = string.Empty;
+
+    [JsonPropertyName("retentionDays")]
+    public int RetentionDays { get; init; } = 30;
 
     [JsonPropertyName("consoleJson")]
     public bool ConsoleJson { get; init; }
