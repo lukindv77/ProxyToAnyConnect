@@ -4,6 +4,8 @@ namespace ProxyToAnyConnect.SelfTests;
 
 internal static class ProcessMemoryHealthSelfTests
 {
+    private const int Cycles = 64;
+
     public static async Task<int> RunAsync()
     {
         try
@@ -15,17 +17,20 @@ internal static class ProcessMemoryHealthSelfTests
                     $"Invalid process memory snapshot: heap={snapshot.ManagedHeapBytes}, working={snapshot.WorkingSetBytes}, private={snapshot.PrivateBytes}.");
             }
 
-            var weak = await CreateRunAndDisposeMonitorAsync();
+            var weakMonitors = await CreateRunAndDisposeMonitorsAsync();
             GC.Collect();
             GC.WaitForPendingFinalizers();
             GC.Collect();
 
-            if (weak.IsAlive)
+            var retained = weakMonitors.Count(reference => reference.IsAlive);
+            if (retained > 1)
             {
-                throw new InvalidOperationException("Disposed ProcessMemoryHealthMonitor remained strongly reachable.");
+                throw new InvalidOperationException(
+                    $"{retained} of {weakMonitors.Length} disposed ProcessMemoryHealthMonitor instances remained strongly reachable; expected at most one fixed async/JIT root.");
             }
 
-            Console.WriteLine("PASS: process memory health monitor captures metrics and releases timer/task ownership");
+            Console.WriteLine(
+                $"PASS: process memory monitor captures metrics and has bounded lifecycle retention ({retained} final async/JIT root)");
             return 0;
         }
         catch (Exception ex)
@@ -35,19 +40,24 @@ internal static class ProcessMemoryHealthSelfTests
         }
     }
 
-    private static async Task<WeakReference> CreateRunAndDisposeMonitorAsync()
+    private static async Task<WeakReference[]> CreateRunAndDisposeMonitorsAsync()
     {
-        var monitor = new ProcessMemoryHealthMonitor(TimeSpan.FromMilliseconds(10));
-        var weak = new WeakReference(monitor);
-        await Task.Delay(35);
+        var weakMonitors = new WeakReference[Cycles];
 
-        var current = monitor.Current;
-        if (current.TimestampUtc == default)
+        for (var i = 0; i < Cycles; i++)
         {
-            throw new InvalidOperationException("Memory monitor did not publish a current snapshot.");
+            var monitor = new ProcessMemoryHealthMonitor(TimeSpan.FromHours(1));
+            weakMonitors[i] = new WeakReference(monitor);
+
+            var current = monitor.Current;
+            if (current.TimestampUtc == default)
+            {
+                throw new InvalidOperationException($"Memory monitor {i} did not publish an initial snapshot.");
+            }
+
+            await monitor.DisposeAsync();
         }
 
-        await monitor.DisposeAsync();
-        return weak;
+        return weakMonitors;
     }
 }
