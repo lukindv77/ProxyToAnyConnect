@@ -14,8 +14,9 @@ internal sealed class L2tpDnsResolver
     private const int MaxCnameDepth = 8;
     private const int UdpReceiveBufferBytes = 4 * 1024;
     private readonly int _timeoutMilliseconds;
+    private readonly L2tpDnsCache? _cache;
 
-    public L2tpDnsResolver(int timeoutMilliseconds = 6000)
+    public L2tpDnsResolver(int timeoutMilliseconds = 6000, L2tpDnsCache? cache = null)
     {
         if (timeoutMilliseconds is < 250 or > 60000)
         {
@@ -23,6 +24,7 @@ internal sealed class L2tpDnsResolver
         }
 
         _timeoutMilliseconds = timeoutMilliseconds;
+        _cache = cache;
     }
 
     public async Task<IReadOnlyList<IPAddress>> ResolveIPv4Async(
@@ -46,7 +48,12 @@ internal sealed class L2tpDnsResolver
                 $"L2TP interface '{context.InterfaceName}' did not provide an IPv4 DNS server.");
         }
 
-        var asciiHost = IdnMapping.GetAscii(host.TrimEnd('.'));
+        var asciiHost = NormalizeDnsName(host);
+        if (_cache is not null && _cache.TryGet(asciiHost, context, out var cached))
+        {
+            return cached;
+        }
+
         Exception? lastError = null;
 
         foreach (var dnsServer in context.DnsServers)
@@ -54,9 +61,18 @@ internal sealed class L2tpDnsResolver
             try
             {
                 var result = await QueryAsync(asciiHost, dnsServer, context, cancellationToken);
-                if (result.Count > 0)
+                if (result.Addresses.Count > 0)
                 {
-                    return result;
+                    if (_cache is not null && result.MinimumTtlSeconds > 0)
+                    {
+                        _cache.Set(
+                            asciiHost,
+                            context,
+                            result.Addresses,
+                            TimeSpan.FromSeconds(result.MinimumTtlSeconds));
+                    }
+
+                    return result.Addresses;
                 }
             }
             catch (Exception ex) when (ex is SocketException or IOException or TimeoutException)
@@ -69,7 +85,7 @@ internal sealed class L2tpDnsResolver
             $"Unable to resolve '{host}' through the L2TP DNS servers.", lastError);
     }
 
-    private async Task<IReadOnlyList<IPAddress>> QueryAsync(
+    private async Task<DnsResolutionResult> QueryAsync(
         string host,
         IPAddress dnsServer,
         VpnContext context,
@@ -83,7 +99,7 @@ internal sealed class L2tpDnsResolver
         try
         {
             return await ResolveCoreAsync(
-                NormalizeDnsName(host),
+                host,
                 dnsServer,
                 context,
                 new HashSet<string>(StringComparer.OrdinalIgnoreCase),
@@ -99,7 +115,7 @@ internal sealed class L2tpDnsResolver
         }
     }
 
-    private static async Task<IReadOnlyList<IPAddress>> ResolveCoreAsync(
+    private static async Task<DnsResolutionResult> ResolveCoreAsync(
         string host,
         IPAddress dnsServer,
         VpnContext context,
@@ -130,21 +146,29 @@ internal sealed class L2tpDnsResolver
 
         if (parsed.Addresses.Count > 0)
         {
-            return parsed.Addresses;
+            return new DnsResolutionResult(
+                parsed.Addresses,
+                parsed.MinimumTtlSeconds ?? 0);
         }
 
         if (parsed.CanonicalName is not null)
         {
-            return await ResolveCoreAsync(
+            var recursive = await ResolveCoreAsync(
                 NormalizeDnsName(parsed.CanonicalName),
                 dnsServer,
                 context,
                 visitedNames,
                 depth + 1,
                 cancellationToken);
+
+            var cnameTtl = parsed.MinimumTtlSeconds ?? 0;
+            var effectiveTtl = cnameTtl == 0 || recursive.MinimumTtlSeconds == 0
+                ? 0
+                : Math.Min(cnameTtl, recursive.MinimumTtlSeconds);
+            return new DnsResolutionResult(recursive.Addresses, effectiveTtl);
         }
 
-        return [];
+        return new DnsResolutionResult([], 0);
     }
 
     private static async Task<ParsedDnsResponse> QueryUdpAsync(
@@ -169,12 +193,9 @@ internal sealed class L2tpDnsResolver
                 SocketFlags.None,
                 cancellationToken);
 
-            // Our A query does not advertise EDNS, so a normal DNS server should use TC
-            // rather than return a huge UDP answer. If the entire conservative 4 KiB buffer
-            // is filled, treat it as transport truncation and retry over TCP fail-closed.
             if (received >= UdpReceiveBufferBytes)
             {
-                return new ParsedDnsResponse([], null, Truncated: true);
+                return new ParsedDnsResponse([], null, Truncated: true, MinimumTtlSeconds: null);
             }
 
             return ParseResponse(buffer.AsSpan(0, received), transactionId);
@@ -289,7 +310,7 @@ internal sealed class L2tpDnsResolver
 
         if (truncated)
         {
-            return new ParsedDnsResponse([], null, Truncated: true);
+            return new ParsedDnsResponse([], null, Truncated: true, MinimumTtlSeconds: null);
         }
 
         var questionCount = BinaryPrimitives.ReadUInt16BigEndian(response[4..]);
@@ -305,12 +326,14 @@ internal sealed class L2tpDnsResolver
 
         var addresses = new List<IPAddress>();
         string? canonicalName = null;
+        uint? minimumTtlSeconds = null;
 
         for (var i = 0; i < answerCount; i++)
         {
             _ = ReadName(response, ref offset);
             EnsureRemaining(response, offset, 10);
             var type = BinaryPrimitives.ReadUInt16BigEndian(response[offset..]);
+            var ttlSeconds = BinaryPrimitives.ReadUInt32BigEndian(response[(offset + 4)..]);
             var dataLength = BinaryPrimitives.ReadUInt16BigEndian(response[(offset + 8)..]);
             offset += 10;
             EnsureRemaining(response, offset, dataLength);
@@ -318,18 +341,27 @@ internal sealed class L2tpDnsResolver
             if (type == 1 && dataLength == 4)
             {
                 addresses.Add(new IPAddress(response.Slice(offset, 4)));
+                minimumTtlSeconds = MinTtl(minimumTtlSeconds, ttlSeconds);
             }
             else if (type == 5)
             {
                 var cnameOffset = offset;
                 canonicalName = ReadName(response, ref cnameOffset);
+                minimumTtlSeconds = MinTtl(minimumTtlSeconds, ttlSeconds);
             }
 
             offset += dataLength;
         }
 
-        return new ParsedDnsResponse(addresses, canonicalName, Truncated: false);
+        return new ParsedDnsResponse(
+            addresses,
+            canonicalName,
+            Truncated: false,
+            MinimumTtlSeconds: minimumTtlSeconds);
     }
+
+    private static uint MinTtl(uint? current, uint candidate) =>
+        current is null ? candidate : Math.Min(current.Value, candidate);
 
     private static string ReadName(ReadOnlySpan<byte> packet, ref int offset)
     {
@@ -396,9 +428,14 @@ internal sealed class L2tpDnsResolver
 
     private static string NormalizeDnsName(string host) =>
         IdnMapping.GetAscii(host.Trim().TrimEnd('.')).ToLowerInvariant();
+
+    private readonly record struct DnsResolutionResult(
+        IReadOnlyList<IPAddress> Addresses,
+        uint MinimumTtlSeconds);
 }
 
 internal sealed record ParsedDnsResponse(
     IReadOnlyList<IPAddress> Addresses,
     string? CanonicalName,
-    bool Truncated);
+    bool Truncated,
+    uint? MinimumTtlSeconds);
