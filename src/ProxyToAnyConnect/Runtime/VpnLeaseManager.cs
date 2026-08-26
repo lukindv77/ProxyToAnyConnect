@@ -1,5 +1,6 @@
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
+using ProxyToAnyConnect.Network;
 using ProxyToAnyConnect.Vpn;
 
 namespace ProxyToAnyConnect.Runtime;
@@ -23,6 +24,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     {
         _options = options;
         Metrics = new L2tpRuntimeMetrics();
+        DnsCache = new L2tpDnsCache();
         _connectionManager = new RasConnectionManager(options, Metrics);
     }
 
@@ -32,6 +34,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     public L2tpOptions Options => _options;
     public RasConnectionManager ConnectionManager => _connectionManager;
     public L2tpRuntimeMetrics Metrics { get; }
+    public L2tpDnsCache DnsCache { get; }
     public int ActiveProxyCount => Volatile.Read(ref _activeProxyCount);
 
     public async Task<VpnLease> AcquireAsync(string proxyId, CancellationToken cancellationToken)
@@ -127,6 +130,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
 
                 await StopMaintenanceLockedAsync();
                 await _connectionManager.DisconnectAsync();
+                DnsCache.Clear();
             }
         }
         finally
@@ -213,6 +217,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
                     if (ActiveProxyCount == 0)
                     {
                         await _connectionManager.DisconnectAsync();
+                        DnsCache.Clear();
                         AppLog.Info(
                             "vpn.maintenance.reconnect_discarded",
                             "Reconnect completed after the last proxy lease was released; L2TP was disconnected again.",
@@ -265,6 +270,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             Volatile.Write(ref _activeProxyCount, 0);
             await StopMaintenanceLockedAsync();
             await _connectionManager.DisposeAsync();
+            DnsCache.Clear();
         }
         finally
         {
@@ -288,6 +294,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         }
 
         public RasConnectionManager ConnectionManager => _owner._connectionManager;
+        public L2tpDnsCache DnsCache => _owner.DnsCache;
 
         public async ValueTask DisposeAsync()
         {
