@@ -182,6 +182,12 @@ internal sealed class AppOptions
             throw new InvalidOperationException($"Proxy '{proxy.Name}' listenPort must be between 1 and 65535.");
         }
 
+        if (proxy.MaxConcurrentConnections is < 1 or > 100000)
+        {
+            throw new InvalidOperationException(
+                $"Proxy '{proxy.Name}' maxConcurrentConnections must be between 1 and 100000.");
+        }
+
         if (proxy.MaxHeaderBytes is < 4096 or > 1024 * 1024)
         {
             throw new InvalidOperationException($"Proxy '{proxy.Name}' maxHeaderBytes is outside the allowed range.");
@@ -391,6 +397,9 @@ internal sealed class ProxyOptions
 
     [JsonPropertyName("listenPort")]
     public int ListenPort { get; init; } = 18080;
+
+    [JsonPropertyName("maxConcurrentConnections")]
+    public int MaxConcurrentConnections { get; init; } = 512;
 
     [JsonPropertyName("vpnConnectionId")]
     public string VpnConnectionId { get; init; } = string.Empty;
