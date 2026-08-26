@@ -5,9 +5,12 @@ namespace ProxyToAnyConnect.Diagnostics;
 
 internal sealed class DailyJsonlLogStore : IDisposable
 {
+    private static readonly Encoding Utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
     private readonly object _gate = new();
     private readonly string _rootDirectory;
     private readonly int _retentionDays;
+    private readonly RetentionCleanupScheduler _retentionCleanupScheduler;
 
     private string? _currentFilePath;
     private DailyFilePathCache _dailyPathCache;
@@ -25,10 +28,13 @@ internal sealed class DailyJsonlLogStore : IDisposable
         _rootDirectory = Path.GetFullPath(rootDirectory);
         _retentionDays = retentionDays;
         Directory.CreateDirectory(_rootDirectory);
+        _retentionCleanupScheduler = new RetentionCleanupScheduler(
+            (today, cancellationToken) => CleanupRetention(cancellationToken, today));
     }
 
     public string RootDirectory => _rootDirectory;
     public int RetentionDays => _retentionDays;
+    internal static Encoding JsonlEncoding => Utf8NoBom;
 
     public string? CurrentFilePath
     {
@@ -73,7 +79,7 @@ internal sealed class DailyJsonlLogStore : IDisposable
                 FileOptions.SequentialScan);
             using var writer = new StreamWriter(
                 stream,
-                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                Utf8NoBom,
                 bufferSize: 4 * 1024,
                 leaveOpen: false);
             writer.WriteLine(line);
@@ -89,12 +95,19 @@ internal sealed class DailyJsonlLogStore : IDisposable
 
         if (scheduleRetentionCleanup)
         {
-            _ = CleanupRetentionBestEffortAsync(localDate);
+            _ = _retentionCleanupScheduler.Schedule(localDate);
         }
     }
 
-    public Task CleanupRetentionAsync(CancellationToken cancellationToken = default) =>
-        Task.Run(() => CleanupRetention(cancellationToken), cancellationToken);
+    public Task CleanupRetentionAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var localToday = DateOnly.FromDateTime(DateTime.Now);
+        var cleanupTask = _retentionCleanupScheduler.Schedule(localToday);
+        return cancellationToken.CanBeCanceled
+            ? cleanupTask.WaitAsync(cancellationToken)
+            : cleanupTask;
+    }
 
     internal void CleanupRetention(CancellationToken cancellationToken = default, DateOnly? today = null)
     {
@@ -154,18 +167,6 @@ internal sealed class DailyJsonlLogStore : IDisposable
             out date);
     }
 
-    private async Task CleanupRetentionBestEffortAsync(DateOnly localToday)
-    {
-        try
-        {
-            await Task.Run(() => CleanupRetention(today: localToday));
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            System.Diagnostics.Debug.WriteLine($"Log retention cleanup failed: {ex.Message}");
-        }
-    }
-
     private static bool IsMonthDirectoryName(string name) =>
         DateTime.TryParseExact(
             name,
@@ -201,7 +202,12 @@ internal sealed class DailyJsonlLogStore : IDisposable
 
     public void Dispose()
     {
-        Interlocked.Exchange(ref _disposed, 1);
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _retentionCleanupScheduler.Dispose();
     }
 }
 

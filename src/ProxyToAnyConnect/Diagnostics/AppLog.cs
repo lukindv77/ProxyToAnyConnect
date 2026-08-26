@@ -115,10 +115,22 @@ internal static class AppLog
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException)
         {
-            Interlocked.Exchange(ref _fileDisabled, 1);
+            // A writer may have captured the previous store immediately before a
+            // concurrent Configure() swaps and disposes it. That stale failure must
+            // not disable the newly configured store globally.
+            if (ShouldDisableFileLoggingAfterFailure(store, Volatile.Read(ref _store)))
+            {
+                Interlocked.Exchange(ref _fileDisabled, 1);
+            }
+
             System.Diagnostics.Debug.WriteLine($"Structured file logging disabled: {ex.Message}");
         }
     }
+
+    internal static bool ShouldDisableFileLoggingAfterFailure(
+        DailyJsonlLogStore attemptedStore,
+        DailyJsonlLogStore? currentStore) =>
+        ReferenceEquals(attemptedStore, currentStore);
 
     private static async Task CleanupRetentionSafelyAsync(DailyJsonlLogStore store)
     {
