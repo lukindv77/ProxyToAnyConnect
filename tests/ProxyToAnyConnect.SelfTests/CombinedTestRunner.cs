@@ -191,6 +191,11 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        if (await ProxyHttpFramingSelfTests.RunAsync() != 0)
+        {
+            return 1;
+        }
+
         if (await ProxyLifecycleStressSelfTests.RunAsync() != 0)
         {
             return 1;
@@ -201,7 +206,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, bounded-status, memory-health, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, bounded-status, memory-health, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
