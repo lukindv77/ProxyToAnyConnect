@@ -75,7 +75,7 @@ internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
                 WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, context.InterfaceIndex);
                 await socket.ConnectAsync(new IPEndPoint(address, port), linkedCancellation.Token);
 
-                if (!context.IsAlive)
+                if (!context.IsAlive || !context.TryAcquireConnectionReference())
                 {
                     socket.Dispose();
                     throw new VpnUnavailableException("L2TP connection disappeared while connecting.");
@@ -101,6 +101,8 @@ internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
 
 internal sealed class L2tpConnection : IProxyOutboundConnection
 {
+    private int _disposed;
+
     public L2tpConnection(Socket socket, VpnContext context)
     {
         Socket = socket;
@@ -113,7 +115,20 @@ internal sealed class L2tpConnection : IProxyOutboundConnection
 
     public ValueTask DisposeAsync()
     {
-        Socket.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        try
+        {
+            Socket.Dispose();
+        }
+        finally
+        {
+            Context.ReleaseConnectionReference();
+        }
+
         return ValueTask.CompletedTask;
     }
 }
