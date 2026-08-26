@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Text;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Network;
@@ -72,8 +73,6 @@ internal sealed class VpnConnectivityVerifier
             NoDelay = true
         };
 
-        // Verification uses the exact same routing constraints as proxy traffic:
-        // explicit L2TP interface plus explicit L2TP source address.
         WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, context.InterfaceIndex);
         socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
         await socket.ConnectAsync(
@@ -181,7 +180,7 @@ internal sealed class VpnConnectivityVerifier
         return response.ToArray();
     }
 
-    private static byte[] ParseHttpSuccessBody(ReadOnlySpan<byte> response)
+    internal static byte[] ParseHttpSuccessBody(ReadOnlySpan<byte> response)
     {
         var headerEnd = FindHeaderEnd(response);
         if (headerEnd < 0)
