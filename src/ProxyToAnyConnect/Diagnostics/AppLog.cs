@@ -13,36 +13,17 @@ internal static class AppLog
     public static string? CurrentLogFile => Volatile.Read(ref _store)?.CurrentFilePath;
     public static string? LogRootDirectory => Volatile.Read(ref _store)?.RootDirectory;
 
-    // Compatibility bridge while the GUI/settings refactor is in progress.
-    // A legacy filePath is interpreted as its parent directory; a directory path
-    // is used directly. New GUI configuration will call the explicit overload.
-    public static void Configure(LoggingOptions options, string configDirectory)
+    public static void Configure(LoggingOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        ArgumentException.ThrowIfNullOrWhiteSpace(configDirectory);
-
-        var configuredPath = options.FilePath;
-        string rootDirectory;
-        if (string.IsNullOrWhiteSpace(configuredPath))
-        {
-            rootDirectory = AppContext.BaseDirectory;
-        }
-        else
-        {
-            var fullPath = Path.GetFullPath(configuredPath, configDirectory);
-            rootDirectory = Path.HasExtension(fullPath)
-                ? Path.GetDirectoryName(fullPath) ?? AppContext.BaseDirectory
-                : fullPath;
-        }
-
-        Configure(rootDirectory, retentionDays: 30, options.ConsoleJson);
+        Configure(options.Directory, options.RetentionDays, options.ConsoleJson);
     }
 
     public static void Configure(string? rootDirectory, int retentionDays, bool consoleJson)
     {
         var resolvedRoot = string.IsNullOrWhiteSpace(rootDirectory)
             ? AppContext.BaseDirectory
-            : Path.GetFullPath(rootDirectory);
+            : Path.GetFullPath(rootDirectory, AppContext.BaseDirectory);
 
         DailyJsonlLogStore? newStore = null;
         try
@@ -103,7 +84,7 @@ internal static class AppLog
         }
         catch
         {
-            // Diagnostics must never break the proxy or alter fail-closed networking behavior.
+            // Diagnostics must never break proxy routing or VPN fail-closed behavior.
             return;
         }
 
