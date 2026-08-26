@@ -6,10 +6,13 @@ namespace ProxyToAnyConnect.SelfTests;
 
 internal static class VerificationParserSetupSelfTests
 {
-    private const int WarmupIterations = 256;
+    private const int WarmupIterations = 4096;
     private const int AllocationIterations = 1000;
     private const int TimingRounds = 9;
-    private const int IterationsPerRound = 4096;
+    // This parser is sub-microsecond to low-microsecond on hosted runners. Long
+    // warmup/rounds keep tiered JIT and scheduler noise from dominating the
+    // unchanged 1.25x relative policy.
+    private const int IterationsPerRound = 65536;
     private const double MaxMedianSlowdownRatio = 1.25;
 
     public static int Run()
