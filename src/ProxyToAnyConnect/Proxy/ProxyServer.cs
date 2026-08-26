@@ -537,14 +537,20 @@ internal sealed class ProxyServer
                 throw new InvalidDataException("Invalid HTTP proxy request.");
             }
 
-            // Keep the existing request-line split semantics. Only the header-line
-            // traversal is changed here so this remains an allocation-only refactor.
-            var requestLine = text[..requestLineEnd]
-                .Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
-            if (requestLine.Length != 3)
+            var requestLine = text.AsSpan(0, requestLineEnd);
+            Span<Range> requestParts = stackalloc Range[3];
+            var requestPartCount = requestLine.Split(
+                requestParts,
+                ' ',
+                StringSplitOptions.RemoveEmptyEntries);
+            if (requestPartCount != 3)
             {
                 throw new InvalidDataException("Invalid HTTP proxy request line.");
             }
+
+            var method = requestLine[requestParts[0]].ToString();
+            var target = requestLine[requestParts[1]].ToString();
+            var version = requestLine[requestParts[2]].ToString();
 
             var headers = new List<HeaderLine>();
             var offset = requestLineEnd + 2;
@@ -575,7 +581,7 @@ internal sealed class ProxyServer
                 offset += lineEnd + 2;
             }
 
-            return new ParsedProxyRequest(requestLine[0], requestLine[1], requestLine[2], headers);
+            return new ParsedProxyRequest(method, target, version, headers);
         }
 
         public byte[] BuildOriginHeader(string pathAndQuery)
