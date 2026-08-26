@@ -9,9 +9,6 @@ internal sealed class DailyJsonlLogStore : IDisposable
     private readonly string _rootDirectory;
     private readonly int _retentionDays;
 
-    private FileStream? _stream;
-    private StreamWriter? _writer;
-    private DateOnly _openDate;
     private string? _currentFilePath;
     private int _disposed;
 
@@ -52,9 +49,29 @@ internal sealed class DailyJsonlLogStore : IDisposable
 
         lock (_gate)
         {
-            EnsureWriterLocked(localDate);
-            _writer!.WriteLine(line);
-            _writer.Flush();
+            var relativePath = BuildRelativeDailyPath(localDate);
+            var fullPath = Path.Combine(_rootDirectory, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+
+            // Intentionally append one record without reading or rewriting the existing file.
+            // The handle is closed after each record so the current log can be viewed/copied
+            // by normal Windows tools while ProxyToAnyConnect continues running.
+            using var stream = new FileStream(
+                fullPath,
+                FileMode.Append,
+                FileAccess.Write,
+                FileShare.ReadWrite | FileShare.Delete,
+                bufferSize: 4 * 1024,
+                FileOptions.SequentialScan);
+            using var writer = new StreamWriter(
+                stream,
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                bufferSize: 4 * 1024,
+                leaveOpen: false);
+            writer.WriteLine(line);
+            writer.Flush();
+
+            _currentFilePath = fullPath;
         }
     }
 
@@ -119,51 +136,6 @@ internal sealed class DailyJsonlLogStore : IDisposable
             out date);
     }
 
-    private void EnsureWriterLocked(DateOnly date)
-    {
-        if (_writer is not null && _openDate == date)
-        {
-            return;
-        }
-
-        CloseWriterLocked();
-
-        var relativePath = BuildRelativeDailyPath(date);
-        var fullPath = Path.Combine(_rootDirectory, relativePath);
-        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-
-        _stream = new FileStream(
-            fullPath,
-            FileMode.Append,
-            FileAccess.Write,
-            FileShare.ReadWrite,
-            bufferSize: 16 * 1024,
-            FileOptions.SequentialScan);
-        _writer = new StreamWriter(_stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), 16 * 1024)
-        {
-            AutoFlush = false
-        };
-        _openDate = date;
-        _currentFilePath = fullPath;
-    }
-
-    private void CloseWriterLocked()
-    {
-        try
-        {
-            _writer?.Flush();
-        }
-        catch (IOException)
-        {
-        }
-
-        _writer?.Dispose();
-        _stream?.Dispose();
-        _writer = null;
-        _stream = null;
-        _currentFilePath = null;
-    }
-
     private static bool IsMonthDirectoryName(string name) =>
         DateTime.TryParseExact(
             name,
@@ -199,14 +171,6 @@ internal sealed class DailyJsonlLogStore : IDisposable
 
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
-        {
-            return;
-        }
-
-        lock (_gate)
-        {
-            CloseWriterLocked();
-        }
+        Interlocked.Exchange(ref _disposed, 1);
     }
 }
