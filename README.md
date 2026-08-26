@@ -33,7 +33,7 @@ Windows 11 x64 GUI application that exposes one or more local HTTP/HTTPS proxy l
 
 ## Multi-proxy model
 
-The target runtime supports multiple independent proxy instances.
+The runtime supports multiple independent proxy instances.
 
 Each proxy has its own:
 
@@ -43,8 +43,9 @@ Each proxy has its own:
 - header/read timeout;
 - outbound connect timeout;
 - DNS timeout;
+- `maxConcurrentConnections`;
 - selected L2TP connection;
-- runtime state and last error.
+- runtime state, RX/TX and last error.
 
 Each proxy can be independently **Running** or **Paused**.
 
@@ -76,15 +77,15 @@ Therefore, if a proxy is paused and no other active proxy uses its L2TP connecti
 
 ### Existing Windows profile
 
-The GUI provides interactive selection of existing Windows L2TP profiles. Existing profiles are validated for split-tunnel/fail-closed compatibility before dialing.
+The GUI provides interactive selection of existing Windows L2TP profiles. Existing profiles are validated for L2TP + split-tunnel/fail-closed compatibility before dialing.
 
 ### Custom ephemeral L2TP
 
 A connection may instead be configured directly in ProxyToAnyConnect with server/authentication/IPsec/PPP settings.
 
-The custom connection must not become a persistent Windows VPN profile. The implementation may create a temporary private RAS phonebook entry only for the active runtime/session and removes it after disconnect/exit.
+The custom connection does not become a persistent Windows VPN profile. The implementation creates a temporary private RAS phonebook entry only for the concrete runtime/session and removes it after disconnect/failure/exit.
 
-Passwords and PSKs must never be stored as plaintext; Windows user-bound DPAPI is the intended storage mechanism.
+Passwords and PSKs are not stored as plaintext; Windows user-bound DPAPI protects persisted secrets.
 
 ## Verification and monitoring
 
@@ -97,6 +98,8 @@ Disconnected -> Dialing -> Verifying -> Ready
 Verification includes assigned RAS IPv4/interface discovery, preservation of the host default-route set, an L2TP-bound HTTPS probe, and public IPv4 equality when a fixed expected public IPv4 is configured.
 
 If the configured public address is a DNS name instead of an IPv4 literal, checks that inherently require a fixed expected IPv4 are skipped; the remaining L2TP-bound verification is still mandatory.
+
+The GUI L2TP table exposes lifecycle state, assigned IPv4/interface index, active proxy leases, aggregate RX/TX, rolling keepalive ping and bounded latest status/reason detail including verification, keepalive failures, reconnect cooldown and the last fail-closed reason.
 
 ## Keepalive
 
@@ -121,22 +124,28 @@ invalidate context
          remain Disconnected
 ```
 
-The keepalive probe itself must be forced through the selected L2TP context and has no DIRECT fallback.
+The keepalive probe itself uses the selected L2TP source IPv4 and has no DIRECT fallback.
 
 ## Current implementation status
 
-The repository is currently being refactored from the initial single-proxy console-oriented prototype to the GUI multi-proxy architecture above. Existing low-level pieces already include HTTP/HTTPS CONNECT proxying, RAS dialing/PPP IPv4 discovery, L2TP-bound DNS, `IP_UNICAST_IF`, active verification, route guards, structured diagnostics and Windows CI self-tests.
+The current `main` is the WinForms multi-proxy architecture described above. Implemented pieces include shared/dedicated L2TP lease management, independent Pause/Resume, existing-profile and custom-ephemeral RAS lifecycles, L2TP-bound DNS, source IPv4 + `IP_UNICAST_IF` socket routing, active verification, default-route guards, keepalive/reconnect, bounded runtime diagnostics, deterministic proxy shutdown drain, append-only logging and process memory/resource health diagnostics.
 
-During this refactor, `main` may temporarily contain incomplete integration commits; GitHub issues track the remaining milestones.
+The largest remaining validation boundary is real Windows 11 testing against external L2TP endpoint(s). GitHub Issues are the live roadmap and acceptance tracker.
 
 ## Roadmap issues
 
+Open roadmap work currently includes:
+
 - #2 — Windows 11 integration test with real L2TP endpoint
-- #3 — GUI lifecycle / tray / explicit Exit
-- #4 — multi-proxy runtime, shared/dedicated L2TP leases, Pause/Resume
-- #5 — settings UI, bind IP/port, timeouts, interactive Windows profile selection
-- #6 — custom ephemeral L2TP and protected credentials
-- #7 — L2TP keepalive and automatic reconnect
+- #4 — multi-proxy/shared-dedicated acceptance and real isolation validation
+- #5 — settings UI/validation and real Windows interaction validation
+- #6 — real custom ephemeral L2TP endpoint validation
+- #7 — real keepalive/reconnect validation
+- #10 — runtime metrics/status acceptance against real L2TP traffic
+- #11 — ongoing process-wide performance/memory optimization
+- #13 — ongoing long-run memory/resource stability audit
+
+Completed roadmap milestones include #1, #3, #8, #9 and #12. Always query GitHub for the current issue state rather than relying on this README snapshot.
 
 ## New-chat handoff
 
@@ -145,13 +154,14 @@ The repository contains a reproducible handoff for continuing development in a n
 - [`docs/handoff/NEW_CHAT_PROMPT.md`](docs/handoff/NEW_CHAT_PROMPT.md) — copy/paste startup prompt for the new chat;
 - [`docs/handoff/CURRENT_STATE.md`](docs/handoff/CURRENT_STATE.md) — implementation/progress snapshot;
 - [`docs/handoff/AUDIT_SNAPSHOT.md`](docs/handoff/AUDIT_SNAPSHOT.md) — preserved technical audit findings and reasons behind important architecture decisions;
+- [`docs/handoff/ISSUES_SNAPSHOT.md`](docs/handoff/ISSUES_SNAPSHOT.md) — issue-state snapshot at handoff time;
 - [`docs/handoff/MANIFEST.md`](docs/handoff/MANIFEST.md) — files/state that must be checked at handoff.
 
-The `handoff` GitHub Actions workflow packages the exact checked-out commit into a `ProxyToAnyConnect-handoff-<sha>` ZIP artifact. The new chat must still query the current `main`, open issues and latest CI because GitHub remains authoritative over a snapshot.
+The `handoff` GitHub Actions workflow packages the exact checked-out commit into a `ProxyToAnyConnect-handoff-<sha>` ZIP artifact. A new chat must still query current `main`, open issues and latest CI because GitHub remains authoritative over a snapshot.
 
 ## Documentation
 
 - [`docs/requirements.md`](docs/requirements.md) — current product requirements and runtime semantics
-- [`docs/architecture.md`](docs/architecture.md) — implementation architecture (being updated during the refactor)
+- [`docs/architecture.md`](docs/architecture.md) — current implementation architecture
 - [`docs/memory-stability.md`](docs/memory-stability.md) — long-run memory/resource stability and latency-preserving optimization rules
-- [`docs/windows-integration-test.md`](docs/windows-integration-test.md) — Windows integration test procedure (will be expanded for multi-proxy scenarios)
+- [`docs/windows-integration-test.md`](docs/windows-integration-test.md) — current real Windows 11 / L2TP integration procedure
