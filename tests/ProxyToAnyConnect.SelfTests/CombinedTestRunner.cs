@@ -31,6 +31,11 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        if (ReconnectCooldownSelfTests.Run() != 0)
+        {
+            return 1;
+        }
+
         Console.WriteLine("All extended fail-closed self-tests passed.");
         return 0;
     }
