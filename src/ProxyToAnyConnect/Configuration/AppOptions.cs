@@ -58,6 +58,11 @@ internal sealed class AppOptions
             throw new InvalidOperationException("l2tp.routeMonitorIntervalMilliseconds is outside the allowed range.");
         }
 
+        if (L2tp.ReconnectCooldownMilliseconds is < 0 or > 300000)
+        {
+            throw new InvalidOperationException("l2tp.reconnectCooldownMilliseconds is outside the allowed range.");
+        }
+
         if (!string.IsNullOrWhiteSpace(Logging.FilePath) && Logging.FilePath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
         {
             throw new InvalidOperationException("logging.filePath contains invalid path characters.");
@@ -142,6 +147,11 @@ internal sealed class L2tpOptions
     // A mismatch fails closed and tears down the L2TP connection.
     [JsonPropertyName("routeMonitorIntervalMilliseconds")]
     public int RouteMonitorIntervalMilliseconds { get; init; } = 5000;
+
+    // After a failed Dialing/Verifying cycle, queued/new proxy requests fail quickly
+    // during this interval instead of sequentially hammering RasDial.
+    [JsonPropertyName("reconnectCooldownMilliseconds")]
+    public int ReconnectCooldownMilliseconds { get; init; } = 5000;
 
     [JsonPropertyName("verification")]
     public VerificationOptions Verification { get; init; } = new();
