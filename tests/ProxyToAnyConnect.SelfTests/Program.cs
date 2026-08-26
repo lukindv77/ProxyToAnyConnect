@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Network;
 using ProxyToAnyConnect.Proxy;
 using ProxyToAnyConnect.Vpn;
@@ -10,26 +11,29 @@ namespace ProxyToAnyConnect.SelfTests;
 internal static class Program
 {
     private const ushort DnsTransactionId = 0x1234;
+    private static readonly TimeSpan IntegrationTimeout = TimeSpan.FromSeconds(10);
 
-    public static int Main()
+    public static async Task<int> Main()
     {
-        var tests = new (string Name, Action Test)[]
+        var tests = new (string Name, Func<Task> Test)[]
         {
-            ("L2TP split-tunnel profile is accepted", AcceptsSplitTunnelL2tp),
-            ("Full-tunnel profile is rejected", RejectsFullTunnel),
-            ("Non-L2TP profile is rejected", RejectsNonL2tp),
-            ("Unchanged default routes are accepted", AcceptsUnchangedDefaultRoutes),
-            ("Changed default routes are rejected", RejectsChangedDefaultRoutes),
-            ("Zero interface index is rejected", RejectsZeroInterfaceIndex),
-            ("IPv4 public address enables IP comparison", PublicIpv4EnablesComparison),
-            ("DNS public address skips IP comparison", PublicDnsSkipsComparison),
-            ("DNS A response returns IPv4", DnsAResponseReturnsIpv4),
-            ("DNS CNAME response returns canonical name", DnsCnameResponseReturnsCanonicalName),
-            ("Truncated DNS response requests TCP fallback", DnsTruncatedResponseIsDetected),
-            ("CONNECT authority uses default HTTPS port", ProxyAuthorityUsesDefaultPort),
-            ("CONNECT authority accepts explicit port", ProxyAuthorityAcceptsExplicitPort),
-            ("IPv6 proxy authority is rejected", ProxyAuthorityRejectsIpv6),
-            ("Origin request strips proxy-only headers", ProxyOriginHeaderStripsProxyHeaders)
+            ("L2TP split-tunnel profile is accepted", AsAsync(AcceptsSplitTunnelL2tp)),
+            ("Full-tunnel profile is rejected", AsAsync(RejectsFullTunnel)),
+            ("Non-L2TP profile is rejected", AsAsync(RejectsNonL2tp)),
+            ("Unchanged default routes are accepted", AsAsync(AcceptsUnchangedDefaultRoutes)),
+            ("Changed default routes are rejected", AsAsync(RejectsChangedDefaultRoutes)),
+            ("Zero interface index is rejected", AsAsync(RejectsZeroInterfaceIndex)),
+            ("IPv4 public address enables IP comparison", AsAsync(PublicIpv4EnablesComparison)),
+            ("DNS public address skips IP comparison", AsAsync(PublicDnsSkipsComparison)),
+            ("DNS A response returns IPv4", AsAsync(DnsAResponseReturnsIpv4)),
+            ("DNS CNAME response returns canonical name", AsAsync(DnsCnameResponseReturnsCanonicalName)),
+            ("Truncated DNS response requests TCP fallback", AsAsync(DnsTruncatedResponseIsDetected)),
+            ("CONNECT authority uses default HTTPS port", AsAsync(ProxyAuthorityUsesDefaultPort)),
+            ("CONNECT authority accepts explicit port", AsAsync(ProxyAuthorityAcceptsExplicitPort)),
+            ("IPv6 proxy authority is rejected", AsAsync(ProxyAuthorityRejectsIpv6)),
+            ("Origin request strips proxy-only headers", AsAsync(ProxyOriginHeaderStripsProxyHeaders)),
+            ("Plain HTTP is forwarded end-to-end through proxy", PlainHttpIsForwardedEndToEndAsync),
+            ("CONNECT creates a bidirectional TCP tunnel", ConnectCreatesBidirectionalTunnelAsync)
         };
 
         var failed = 0;
@@ -37,7 +41,7 @@ internal static class Program
         {
             try
             {
-                test();
+                await test();
                 Console.WriteLine($"PASS: {name}");
             }
             catch (Exception ex)
@@ -50,6 +54,12 @@ internal static class Program
         Console.WriteLine($"Self-tests complete. Passed: {tests.Length - failed}; Failed: {failed}.");
         return failed == 0 ? 0 : 1;
     }
+
+    private static Func<Task> AsAsync(Action action) => () =>
+    {
+        action();
+        return Task.CompletedTask;
+    };
 
     private static void AcceptsSplitTunnelL2tp()
     {
@@ -211,6 +221,224 @@ internal static class Program
         }
     }
 
+    private static async Task PlainHttpIsForwardedEndToEndAsync()
+    {
+        using var timeout = new CancellationTokenSource(IntegrationTimeout);
+        using var originListener = new TcpListener(IPAddress.Loopback, 0);
+        originListener.Start();
+        var originPort = ((IPEndPoint)originListener.LocalEndpoint).Port;
+
+        var factory = new LoopbackOutboundFactory(originPort);
+        var proxyPort = ReserveLoopbackPort();
+        using var proxyCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        var proxy = CreateTestProxy(proxyPort, factory);
+        var proxyTask = proxy.RunAsync(proxyCancellation.Token);
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, proxyPort, timeout.Token);
+            await using var clientStream = client.GetStream();
+
+            var request = Encoding.ASCII.GetBytes(
+                "GET http://example.com/path?q=1 HTTP/1.1\r\n" +
+                "Host: example.com\r\n" +
+                "Proxy-Authorization: Basic secret\r\n" +
+                "Connection: X-Remove\r\n" +
+                "X-Remove: no\r\n" +
+                "X-Keep: yes\r\n\r\n");
+            await clientStream.WriteAsync(request, timeout.Token);
+
+            using var originClient = await originListener.AcceptTcpClientAsync(timeout.Token);
+            await using var originStream = originClient.GetStream();
+            var originHeader = Encoding.Latin1.GetString(
+                await ReadHeaderAsync(originStream, timeout.Token));
+
+            if (!originHeader.StartsWith("GET /path?q=1 HTTP/1.1\r\n", StringComparison.Ordinal) ||
+                originHeader.Contains("Proxy-Authorization", StringComparison.OrdinalIgnoreCase) ||
+                originHeader.Contains("X-Remove:", StringComparison.OrdinalIgnoreCase) ||
+                !originHeader.Contains("X-Keep: yes", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException($"Unexpected forwarded HTTP header:\n{originHeader}");
+            }
+
+            var response = Encoding.ASCII.GetBytes(
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+            await originStream.WriteAsync(response, timeout.Token);
+            originClient.Client.Shutdown(SocketShutdown.Send);
+
+            var clientResponse = Encoding.Latin1.GetString(
+                await ReadToEndAsync(clientStream, timeout.Token));
+            if (!clientResponse.Contains("200 OK", StringComparison.Ordinal) ||
+                !clientResponse.EndsWith("OK", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException($"Unexpected proxy response:\n{clientResponse}");
+            }
+
+            factory.AssertLastTarget("example.com", 80);
+        }
+        finally
+        {
+            proxyCancellation.Cancel();
+            await proxyTask;
+        }
+    }
+
+    private static async Task ConnectCreatesBidirectionalTunnelAsync()
+    {
+        using var timeout = new CancellationTokenSource(IntegrationTimeout);
+        using var originListener = new TcpListener(IPAddress.Loopback, 0);
+        originListener.Start();
+        var originPort = ((IPEndPoint)originListener.LocalEndpoint).Port;
+
+        var factory = new LoopbackOutboundFactory(originPort);
+        var proxyPort = ReserveLoopbackPort();
+        using var proxyCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        var proxy = CreateTestProxy(proxyPort, factory);
+        var proxyTask = proxy.RunAsync(proxyCancellation.Token);
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, proxyPort, timeout.Token);
+            await using var clientStream = client.GetStream();
+
+            var connectRequest = Encoding.ASCII.GetBytes(
+                "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+            await clientStream.WriteAsync(connectRequest, timeout.Token);
+
+            using var originClient = await originListener.AcceptTcpClientAsync(timeout.Token);
+            await using var originStream = originClient.GetStream();
+
+            var connectResponse = Encoding.Latin1.GetString(
+                await ReadHeaderAsync(clientStream, timeout.Token));
+            if (!connectResponse.StartsWith("HTTP/1.1 200 Connection Established", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException($"Unexpected CONNECT response: {connectResponse}");
+            }
+
+            var clientPayload = Encoding.ASCII.GetBytes("client-through-tunnel");
+            await clientStream.WriteAsync(clientPayload, timeout.Token);
+            var receivedAtOrigin = new byte[clientPayload.Length];
+            await ReadExactlyAsync(originStream, receivedAtOrigin, timeout.Token);
+            if (!receivedAtOrigin.AsSpan().SequenceEqual(clientPayload))
+            {
+                throw new InvalidOperationException("CONNECT tunnel corrupted client-to-origin bytes.");
+            }
+
+            var originPayload = Encoding.ASCII.GetBytes("origin-through-tunnel");
+            await originStream.WriteAsync(originPayload, timeout.Token);
+            var receivedAtClient = new byte[originPayload.Length];
+            await ReadExactlyAsync(clientStream, receivedAtClient, timeout.Token);
+            if (!receivedAtClient.AsSpan().SequenceEqual(originPayload))
+            {
+                throw new InvalidOperationException("CONNECT tunnel corrupted origin-to-client bytes.");
+            }
+
+            factory.AssertLastTarget("example.com", 443);
+        }
+        finally
+        {
+            proxyCancellation.Cancel();
+            await proxyTask;
+        }
+    }
+
+    private static ProxyServer CreateTestProxy(
+        int proxyPort,
+        IProxyOutboundConnectionFactory factory) =>
+        new(
+            new ProxyOptions
+            {
+                ListenAddress = "127.0.0.1",
+                ListenPort = proxyPort,
+                MaxHeaderBytes = 65536
+            },
+            factory);
+
+    private static int ReserveLoopbackPort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        try
+        {
+            return ((IPEndPoint)listener.LocalEndpoint).Port;
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    private static async Task<byte[]> ReadHeaderAsync(
+        Stream stream,
+        CancellationToken cancellationToken)
+    {
+        using var buffer = new MemoryStream();
+        var oneByte = new byte[1];
+
+        while (buffer.Length < 65536)
+        {
+            var read = await stream.ReadAsync(oneByte, cancellationToken);
+            if (read == 0)
+            {
+                throw new IOException("Stream ended before HTTP header was complete.");
+            }
+
+            buffer.WriteByte(oneByte[0]);
+            if (buffer.Length >= 4)
+            {
+                var data = buffer.GetBuffer();
+                var length = checked((int)buffer.Length);
+                if (data[length - 4] == (byte)'\r' &&
+                    data[length - 3] == (byte)'\n' &&
+                    data[length - 2] == (byte)'\r' &&
+                    data[length - 1] == (byte)'\n')
+                {
+                    return buffer.ToArray();
+                }
+            }
+        }
+
+        throw new IOException("HTTP header exceeded test limit.");
+    }
+
+    private static async Task<byte[]> ReadToEndAsync(
+        Stream stream,
+        CancellationToken cancellationToken)
+    {
+        using var buffer = new MemoryStream();
+        var chunk = new byte[4096];
+        while (true)
+        {
+            var read = await stream.ReadAsync(chunk, cancellationToken);
+            if (read == 0)
+            {
+                return buffer.ToArray();
+            }
+
+            buffer.Write(chunk, 0, read);
+        }
+    }
+
+    private static async Task ReadExactlyAsync(
+        Stream stream,
+        Memory<byte> buffer,
+        CancellationToken cancellationToken)
+    {
+        var offset = 0;
+        while (offset < buffer.Length)
+        {
+            var read = await stream.ReadAsync(buffer[offset..], cancellationToken);
+            if (read == 0)
+            {
+                throw new IOException("Stream ended before expected payload was received.");
+            }
+
+            offset += read;
+        }
+    }
+
     private static byte[] BuildDnsResponse(ushort answerType, byte[] answerData)
     {
         var packet = new List<byte>();
@@ -278,5 +506,71 @@ internal static class Program
         }
 
         throw new InvalidOperationException($"Expected exception {typeof(TException).Name} was not thrown.");
+    }
+
+    private sealed class LoopbackOutboundFactory : IProxyOutboundConnectionFactory
+    {
+        private readonly int _originPort;
+        private string? _lastHost;
+        private int _lastPort;
+
+        public LoopbackOutboundFactory(int originPort)
+        {
+            _originPort = originPort;
+        }
+
+        public async Task<IProxyOutboundConnection> ConnectAsync(
+            string host,
+            int port,
+            CancellationToken cancellationToken)
+        {
+            _lastHost = host;
+            _lastPort = port;
+
+            var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+            {
+                NoDelay = true
+            };
+
+            try
+            {
+                await socket.ConnectAsync(
+                    new IPEndPoint(IPAddress.Loopback, _originPort),
+                    cancellationToken);
+                return new TestOutboundConnection(socket);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+        }
+
+        public void AssertLastTarget(string expectedHost, int expectedPort)
+        {
+            if (!string.Equals(_lastHost, expectedHost, StringComparison.OrdinalIgnoreCase) ||
+                _lastPort != expectedPort)
+            {
+                throw new InvalidOperationException(
+                    $"Unexpected outbound target. Expected {expectedHost}:{expectedPort}, got {_lastHost}:{_lastPort}.");
+            }
+        }
+    }
+
+    private sealed class TestOutboundConnection : IProxyOutboundConnection
+    {
+        public TestOutboundConnection(Socket socket)
+        {
+            Socket = socket;
+        }
+
+        public Socket Socket { get; }
+        public CancellationToken LifetimeToken => CancellationToken.None;
+
+        public ValueTask DisposeAsync()
+        {
+            Socket.Dispose();
+            return ValueTask.CompletedTask;
+        }
     }
 }
