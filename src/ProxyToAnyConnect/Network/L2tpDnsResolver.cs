@@ -452,57 +452,98 @@ internal sealed class L2tpDnsResolver
         }
     }
 
-    private static string ReadName(ReadOnlySpan<byte> packet, ref int offset)
+    internal static string ReadName(ReadOnlySpan<byte> packet, ref int offset)
     {
-        var labels = new List<string>();
+        Span<char> initial = stackalloc char[256];
+        Span<char> destination = initial;
+        char[]? rented = null;
+        var written = 0;
+        var hasLabel = false;
         var current = offset;
         var jumped = false;
         var jumps = 0;
 
-        while (true)
+        try
         {
-            EnsureRemaining(packet, current, 1);
-            var length = packet[current++];
-            if (length == 0)
-            {
-                if (!jumped)
-                {
-                    offset = current;
-                }
-
-                return string.Join('.', labels);
-            }
-
-            if ((length & 0xC0) == 0xC0)
+            while (true)
             {
                 EnsureRemaining(packet, current, 1);
-                var pointer = ((length & 0x3F) << 8) | packet[current++];
-                if (pointer >= packet.Length || ++jumps > 32)
+                var length = packet[current++];
+                if (length == 0)
                 {
-                    throw new IOException("Invalid DNS name compression pointer.");
+                    if (!jumped)
+                    {
+                        offset = current;
+                    }
+
+                    return written == 0
+                        ? string.Empty
+                        : new string(destination[..written]);
                 }
 
+                if ((length & 0xC0) == 0xC0)
+                {
+                    EnsureRemaining(packet, current, 1);
+                    var pointer = ((length & 0x3F) << 8) | packet[current++];
+                    if (pointer >= packet.Length || ++jumps > 32)
+                    {
+                        throw new IOException("Invalid DNS name compression pointer.");
+                    }
+
+                    if (!jumped)
+                    {
+                        offset = current;
+                        jumped = true;
+                    }
+
+                    current = pointer;
+                    continue;
+                }
+
+                if ((length & 0xC0) != 0 || length > 63)
+                {
+                    throw new IOException("Invalid DNS label length.");
+                }
+
+                EnsureRemaining(packet, current, length);
+                var required = checked(written + (hasLabel ? 1 : 0) + length);
+                if (required > destination.Length)
+                {
+                    var doubled = destination.Length <= int.MaxValue / 2
+                        ? destination.Length * 2
+                        : int.MaxValue;
+                    var replacement = ArrayPool<char>.Shared.Rent(Math.Max(required, doubled));
+                    destination[..written].CopyTo(replacement);
+                    if (rented is not null)
+                    {
+                        ArrayPool<char>.Shared.Return(rented, clearArray: false);
+                    }
+
+                    rented = replacement;
+                    destination = rented;
+                }
+
+                if (hasLabel)
+                {
+                    destination[written++] = '.';
+                }
+
+                written += Encoding.ASCII.GetChars(
+                    packet.Slice(current, length),
+                    destination[written..]);
+                hasLabel = true;
+                current += length;
                 if (!jumped)
                 {
                     offset = current;
-                    jumped = true;
                 }
-
-                current = pointer;
-                continue;
             }
-
-            if ((length & 0xC0) != 0 || length > 63)
+        }
+        finally
+        {
+            if (rented is not null)
             {
-                throw new IOException("Invalid DNS label length.");
-            }
-
-            EnsureRemaining(packet, current, length);
-            labels.Add(Encoding.ASCII.GetString(packet.Slice(current, length)));
-            current += length;
-            if (!jumped)
-            {
-                offset = current;
+                ArrayPool<char>.Shared.Return(rented, clearArray: false);
             }
         }
     }
