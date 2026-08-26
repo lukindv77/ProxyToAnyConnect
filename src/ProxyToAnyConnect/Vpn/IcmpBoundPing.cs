@@ -7,7 +7,14 @@ namespace ProxyToAnyConnect.Vpn;
 internal static class IcmpBoundPing
 {
     private const uint IpSuccess = 0;
-    private static readonly byte[] Payload = "ProxyToAnyConnect"u8.ToArray();
+    private const int ErrorIoPending = 997;
+    private const int ErrorTimeout = 1460;
+    private const uint ReplyBufferSize = 512;
+    private static readonly TimeSpan CompletionGrace = TimeSpan.FromSeconds(2);
+    private static readonly byte[] Payload = CreatePinnedPayload();
+    private static int _activeNativeOperations;
+
+    internal static int ActiveNativeOperations => Volatile.Read(ref _activeNativeOperations);
 
     public static async Task<IcmpProbeResult> SendAsync(
         IPAddress source,
@@ -28,59 +35,152 @@ internal static class IcmpBoundPing
             throw new ArgumentOutOfRangeException(nameof(timeout));
         }
 
-        var task = Task.Run(() => SendCore(source, destination, timeout), CancellationToken.None);
-        return await task.WaitAsync(cancellationToken);
-    }
+        cancellationToken.ThrowIfCancellationRequested();
 
-    private static IcmpProbeResult SendCore(
-        IPAddress source,
-        IPAddress destination,
-        TimeSpan timeout)
-    {
         var handle = IcmpCreateFile();
         if (handle == new nint(-1))
         {
             return new IcmpProbeResult(false, null, Marshal.GetLastWin32Error());
         }
 
-        const int replyBufferSize = 512;
-        var replyBuffer = Marshal.AllocHGlobal(replyBufferSize);
+        nint replyBuffer = 0;
+        Interlocked.Increment(ref _activeNativeOperations);
         try
         {
-            var replies = IcmpSendEcho2Ex(
+            replyBuffer = Marshal.AllocHGlobal(checked((int)ReplyBufferSize));
+            using var completionEvent = new EventWaitHandle(
+                initialState: false,
+                mode: EventResetMode.AutoReset);
+
+            var sendResult = IcmpSendEcho2Ex(
                 handle,
-                0,
+                completionEvent.SafeWaitHandle.DangerousGetHandle(),
                 0,
                 0,
                 ToIpAddr(source),
                 ToIpAddr(destination),
-                Payload,
+                Marshal.UnsafeAddrOfPinnedArrayElement(Payload, 0),
                 checked((ushort)Payload.Length),
                 0,
                 replyBuffer,
-                replyBufferSize,
+                ReplyBufferSize,
                 checked((uint)Math.Ceiling(timeout.TotalMilliseconds)));
 
-            if (replies == 0)
+            var pending = false;
+            if (sendResult == 0)
             {
-                return new IcmpProbeResult(false, null, Marshal.GetLastWin32Error());
+                var error = Marshal.GetLastWin32Error();
+                if (error != ErrorIoPending)
+                {
+                    return new IcmpProbeResult(false, null, error);
+                }
+
+                pending = true;
+            }
+            else if (sendResult == ErrorIoPending)
+            {
+                // The IcmpSendEcho2Ex documentation describes ERROR_IO_PENDING as
+                // the asynchronous return value. Some Windows examples observe the
+                // conventional zero + GetLastError(ERROR_IO_PENDING) form instead;
+                // accept both representations of the same pending operation.
+                pending = true;
             }
 
-            // ICMP_ECHO_REPLY starts with:
-            // IPAddr Address (DWORD), ULONG Status, ULONG RoundTripTime.
-            // These first 12 bytes have identical offsets on x86/x64, so we do not
-            // need to marshal the pointer-containing remainder of the native struct.
-            var status = unchecked((uint)Marshal.ReadInt32(replyBuffer, 4));
-            var roundTripMilliseconds = unchecked((uint)Marshal.ReadInt32(replyBuffer, 8));
-            return status == IpSuccess
-                ? new IcmpProbeResult(true, TimeSpan.FromMilliseconds(roundTripMilliseconds), 0)
-                : new IcmpProbeResult(false, null, unchecked((int)status));
+            IcmpProbeResult result;
+            if (pending)
+            {
+                // Do not let caller cancellation release native buffers while Windows
+                // may still write the asynchronous reply. Cancellation is surfaced only
+                // after this exact native operation has signaled completion (or passed a
+                // conservative guard beyond its own native timeout), so no probe worker,
+                // ICMP handle or reply buffer survives SendAsync completion.
+                var signaled = await WaitForSignalAsync(
+                    completionEvent,
+                    timeout + CompletionGrace).ConfigureAwait(false);
+                result = signaled
+                    ? ParseReply(replyBuffer)
+                    : new IcmpProbeResult(false, null, ErrorTimeout);
+            }
+            else
+            {
+                // A completion can race the asynchronous API setup and be returned
+                // synchronously. Parse the same native reply buffer in either case.
+                result = ParseReply(replyBuffer);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            return result;
         }
         finally
         {
-            Marshal.FreeHGlobal(replyBuffer);
+            if (replyBuffer != 0)
+            {
+                Marshal.FreeHGlobal(replyBuffer);
+            }
+
+            // Windows owns the asynchronous request through this ICMP handle. Closing
+            // it only after completion/guarded timeout keeps the reply buffer lifetime
+            // valid and provides a final bounded join before ownership is released.
             _ = IcmpCloseHandle(handle);
+            Interlocked.Decrement(ref _activeNativeOperations);
         }
+    }
+
+    private static IcmpProbeResult ParseReply(nint replyBuffer)
+    {
+        var replies = IcmpParseReplies(replyBuffer, ReplyBufferSize);
+        if (replies == 0)
+        {
+            var error = Marshal.GetLastWin32Error();
+            return new IcmpProbeResult(false, null, error);
+        }
+
+        // IcmpParseReplies leaves ICMP_ECHO_REPLY at the start of the buffer:
+        // IPAddr Address (DWORD), ULONG Status, ULONG RoundTripTime. These first
+        // 12 bytes have identical offsets on x86/x64, so the pointer-containing
+        // remainder of the native structure does not need to be marshalled.
+        var status = unchecked((uint)Marshal.ReadInt32(replyBuffer, 4));
+        var roundTripMilliseconds = unchecked((uint)Marshal.ReadInt32(replyBuffer, 8));
+        return status == IpSuccess
+            ? new IcmpProbeResult(true, TimeSpan.FromMilliseconds(roundTripMilliseconds), 0)
+            : new IcmpProbeResult(false, null, unchecked((int)status));
+    }
+
+    private static Task<bool> WaitForSignalAsync(WaitHandle waitHandle, TimeSpan timeout)
+    {
+        var completion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var registration = ThreadPool.RegisterWaitForSingleObject(
+            waitHandle,
+            static (state, timedOut) =>
+                ((TaskCompletionSource<bool>)state!).TrySetResult(!timedOut),
+            completion,
+            timeout,
+            executeOnlyOnce: true);
+
+        return AwaitAndUnregisterAsync(completion.Task, registration);
+    }
+
+    private static async Task<bool> AwaitAndUnregisterAsync(
+        Task<bool> completion,
+        RegisteredWaitHandle registration)
+    {
+        try
+        {
+            return await completion.ConfigureAwait(false);
+        }
+        finally
+        {
+            registration.Unregister(null);
+        }
+    }
+
+    private static byte[] CreatePinnedPayload()
+    {
+        ReadOnlySpan<byte> payloadBytes = "ProxyToAnyConnect"u8;
+        var payload = GC.AllocateUninitializedArray<byte>(payloadBytes.Length, pinned: true);
+        payloadBytes.CopyTo(payload);
+        return payload;
     }
 
     private static uint ToIpAddr(IPAddress address)
@@ -104,12 +204,15 @@ internal static class IcmpBoundPing
         nint apcContext,
         uint sourceAddress,
         uint destinationAddress,
-        [In] byte[] requestData,
+        nint requestData,
         ushort requestSize,
         nint requestOptions,
         nint replyBuffer,
-        int replySize,
+        uint replySize,
         uint timeout);
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint IcmpParseReplies(nint replyBuffer, uint replySize);
 }
 
 internal readonly record struct IcmpProbeResult(
