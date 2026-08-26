@@ -1,46 +1,122 @@
-using System.Diagnostics;
-using System.Text;
-using System.Text.Json;
+using System.ComponentModel;
+using System.Net;
+using System.Runtime.InteropServices;
 
 namespace ProxyToAnyConnect.Vpn;
 
 internal sealed class WindowsDefaultRouteInspector
 {
-    private static readonly TimeSpan InspectionTimeout = TimeSpan.FromSeconds(10);
+    private const int MaxCaptureAttempts = 3;
 
-    public async Task<DefaultRouteSnapshot> CaptureIPv4Async(CancellationToken cancellationToken)
+    public Task<DefaultRouteSnapshot> CaptureIPv4Async(CancellationToken cancellationToken)
     {
-        const string script = """
-            $ErrorActionPreference = 'Stop'
-            $routes = @(
-                Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
-                    ForEach-Object {
-                        [pscustomobject]@{
-                            InterfaceIndex = [uint32]$_.ifIndex
-                            NextHop = [string]$_.NextHop
-                            RouteMetric = [uint32]$_.RouteMetric
-                            PolicyStore = [string]$_.PolicyStore
-                        }
-                    } |
-                    Sort-Object InterfaceIndex, NextHop, RouteMetric, PolicyStore
-            )
-            ConvertTo-Json -InputObject $routes -Compress
-            """;
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(CaptureIPv4(cancellationToken));
+    }
 
-        var json = await RunPowerShellAsync(script, cancellationToken);
-
-        try
+    private static DefaultRouteSnapshot CaptureIPv4(CancellationToken cancellationToken)
+    {
+        uint size = 0;
+        var result = IpHelperNative.GetIpForwardTable(0, ref size, order: true);
+        if (result is not (IpHelperNative.ErrorSuccess or IpHelperNative.ErrorInsufficientBuffer))
         {
-            var routes = JsonSerializer.Deserialize<List<DefaultRouteEntry>>(json)
-                ?? [];
-            return new DefaultRouteSnapshot(routes);
+            throw CreateRouteTableException(result);
         }
-        catch (JsonException ex)
+
+        if (size < sizeof(uint))
         {
             throw new InvalidOperationException(
-                $"Unable to parse the Windows IPv4 default-route snapshot. Output: {json}",
-                ex);
+                $"Windows returned an invalid IPv4 route-table buffer size: {size} bytes.");
         }
+
+        for (var attempt = 1; attempt <= MaxCaptureAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var allocatedSize = size;
+            var buffer = Marshal.AllocHGlobal(checked((int)allocatedSize));
+            try
+            {
+                result = IpHelperNative.GetIpForwardTable(buffer, ref size, order: true);
+                if (result == IpHelperNative.ErrorInsufficientBuffer)
+                {
+                    continue;
+                }
+
+                if (result != IpHelperNative.ErrorSuccess)
+                {
+                    throw CreateRouteTableException(result);
+                }
+
+                return ParseDefaultRoutes(buffer, Math.Min(allocatedSize, size));
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        throw new InvalidOperationException(
+            "Windows IPv4 route table changed too quickly to capture a stable snapshot.");
+    }
+
+    internal static DefaultRouteSnapshot ParseDefaultRoutes(nint tableBuffer, uint bufferSize)
+    {
+        if (tableBuffer == 0)
+        {
+            throw new ArgumentNullException(nameof(tableBuffer));
+        }
+
+        if (bufferSize < sizeof(uint))
+        {
+            throw new InvalidOperationException("IPv4 route-table buffer is too small.");
+        }
+
+        var count = checked((uint)Marshal.ReadInt32(tableBuffer));
+        var rowSize = Marshal.SizeOf<IpHelperNative.MibIpForwardRow>();
+        var requiredSize = checked((ulong)sizeof(uint) + ((ulong)count * (uint)rowSize));
+        if (requiredSize > bufferSize)
+        {
+            throw new InvalidOperationException(
+                $"IPv4 route-table buffer is truncated. Entries={count}, required={requiredSize}, available={bufferSize}.");
+        }
+
+        var routes = new List<DefaultRouteEntry>();
+        for (uint index = 0; index < count; index++)
+        {
+            var offset = checked(sizeof(uint) + ((int)index * rowSize));
+            var rowPointer = IntPtr.Add(tableBuffer, offset);
+            var row = Marshal.PtrToStructure<IpHelperNative.MibIpForwardRow>(rowPointer);
+
+            // Microsoft documents a destination of 0.0.0.0 as the IPv4 default route.
+            // Require the /0 mask too so malformed or policy-specific entries do not
+            // accidentally become part of the invariant snapshot.
+            if (row.DwForwardDest != 0 || row.DwForwardMask != 0)
+            {
+                continue;
+            }
+
+            routes.Add(new DefaultRouteEntry(
+                row.DwForwardIfIndex,
+                NetworkUInt32ToIPv4(row.DwForwardNextHop).ToString(),
+                row.DwForwardMetric1,
+                "GetIpForwardTable"));
+        }
+
+        return new DefaultRouteSnapshot(
+            routes
+                .OrderBy(route => route.InterfaceIndex)
+                .ThenBy(route => route.NextHop, StringComparer.Ordinal)
+                .ThenBy(route => route.RouteMetric)
+                .ToArray());
+    }
+
+    internal static IPAddress NetworkUInt32ToIPv4(uint value)
+    {
+        // GetIpForwardTable exposes IPv4 address fields in network byte order.
+        // Marshaling them into a UInt32 preserves their four memory bytes; using
+        // BitConverter here reconstructs those bytes without an extra host/network swap.
+        return new IPAddress(BitConverter.GetBytes(value));
     }
 
     public static void EnsureUnchanged(DefaultRouteSnapshot before, DefaultRouteSnapshot after)
@@ -51,95 +127,21 @@ internal sealed class WindowsDefaultRouteInspector
         }
 
         throw new InvalidOperationException(
-            "Windows IPv4 default routes changed while establishing L2TP. " +
-            $"Before: {before}; After: {after}. The new VPN connection will be rejected.");
+            "Windows IPv4 default routes changed while L2TP was active. " +
+            $"Before: {before}; After: {after}. The VPN connection will be rejected fail-closed.");
     }
 
-    private static async Task<string> RunPowerShellAsync(
-        string script,
-        CancellationToken cancellationToken)
-    {
-        var encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-        var powershellPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.System),
-            "WindowsPowerShell",
-            "v1.0",
-            "powershell.exe");
-
-        if (!File.Exists(powershellPath))
-        {
-            throw new InvalidOperationException($"Windows PowerShell was not found at '{powershellPath}'.");
-        }
-
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = powershellPath,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-        startInfo.ArgumentList.Add("-NoLogo");
-        startInfo.ArgumentList.Add("-NoProfile");
-        startInfo.ArgumentList.Add("-NonInteractive");
-        startInfo.ArgumentList.Add("-EncodedCommand");
-        startInfo.ArgumentList.Add(encodedCommand);
-
-        using var process = new Process { StartInfo = startInfo };
-        if (!process.Start())
-        {
-            throw new InvalidOperationException("Unable to start Windows PowerShell to inspect default routes.");
-        }
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(InspectionTimeout);
-
-        try
-        {
-            await process.WaitForExitAsync(timeout.Token);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            TryKill(process);
-            throw new TimeoutException("Timed out while reading Windows IPv4 default routes.");
-        }
-
-        var stdout = (await stdoutTask).Trim();
-        var stderr = (await stderrTask).Trim();
-
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException(
-                $"Unable to inspect Windows IPv4 default routes. PowerShell exit code {process.ExitCode}: {stderr}");
-        }
-
-        return stdout;
-    }
-
-    private static void TryKill(Process process)
-    {
-        try
-        {
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-            }
-        }
-        catch (InvalidOperationException)
-        {
-            // Process exited between HasExited and Kill.
-        }
-    }
+    private static InvalidOperationException CreateRouteTableException(uint errorCode) =>
+        new(
+            $"Unable to inspect the Windows IPv4 route table through GetIpForwardTable: " +
+            $"{errorCode}: {new Win32Exception(checked((int)errorCode)).Message}");
 }
 
 internal sealed record DefaultRouteEntry(
     uint InterfaceIndex,
     string NextHop,
     uint RouteMetric,
-    string PolicyStore);
+    string Source);
 
 internal sealed record DefaultRouteSnapshot(IReadOnlyList<DefaultRouteEntry> Routes)
 {
@@ -149,5 +151,5 @@ internal sealed record DefaultRouteSnapshot(IReadOnlyList<DefaultRouteEntry> Rou
             : string.Join(
                 "; ",
                 Routes.Select(route =>
-                    $"if={route.InterfaceIndex},next={route.NextHop},metric={route.RouteMetric},store={route.PolicyStore}"));
+                    $"if={route.InterfaceIndex},next={route.NextHop},metric={route.RouteMetric},source={route.Source}"));
 }
