@@ -14,6 +14,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     private readonly HashSet<string> _consumers = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _lifetime = new();
 
+    private CancellationTokenSource? _maintenanceCancellation;
     private Task? _maintenanceTask;
     private int _activeProxyCount;
     private int _disposed;
@@ -121,8 +122,10 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             {
                 AppLog.Info(
                     "vpn.lease.last_released",
-                    "Last active proxy released the L2TP connection; disconnecting RAS.",
+                    "Last active proxy released the L2TP connection; stopping maintenance and disconnecting RAS.",
                     new { VpnId = _options.Id, VpnName = _options.Name });
+
+                await StopMaintenanceLockedAsync();
                 await _connectionManager.DisconnectAsync();
             }
         }
@@ -134,9 +137,42 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
 
     private void EnsureMaintenanceStartedLocked()
     {
-        if (_maintenanceTask is null)
+        if (_maintenanceTask is { IsCompleted: false })
         {
-            _maintenanceTask = MaintainConnectionAsync(_lifetime.Token);
+            return;
+        }
+
+        _maintenanceCancellation?.Dispose();
+        _maintenanceCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _maintenanceTask = MaintainConnectionAsync(_maintenanceCancellation.Token);
+    }
+
+    private async Task StopMaintenanceLockedAsync()
+    {
+        var cancellation = _maintenanceCancellation;
+        var task = _maintenanceTask;
+        _maintenanceCancellation = null;
+        _maintenanceTask = null;
+
+        if (cancellation is null)
+        {
+            return;
+        }
+
+        cancellation.Cancel();
+        try
+        {
+            if (task is not null)
+            {
+                await task;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            cancellation.Dispose();
         }
     }
 
@@ -150,7 +186,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             {
                 if (ActiveProxyCount == 0)
                 {
-                    continue;
+                    return;
                 }
 
                 if (_connectionManager.Current is { IsAlive: true } &&
@@ -172,9 +208,8 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
                         });
 
                     await _connectionManager.ConnectAsync(cancellationToken);
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                    // A proxy may have been paused while RasDial/verification was running.
-                    // Never leave a freshly reconnected L2TP alive with zero consumers.
                     if (ActiveProxyCount == 0)
                     {
                         await _connectionManager.DisconnectAsync();
@@ -182,7 +217,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
                             "vpn.maintenance.reconnect_discarded",
                             "Reconnect completed after the last proxy lease was released; L2TP was disconnected again.",
                             new { VpnId = _options.Id, VpnName = _options.Name });
-                        continue;
+                        return;
                     }
 
                     AppLog.Info(
@@ -228,22 +263,12 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         {
             _consumers.Clear();
             Volatile.Write(ref _activeProxyCount, 0);
+            await StopMaintenanceLockedAsync();
             await _connectionManager.DisposeAsync();
         }
         finally
         {
             _gate.Release();
-        }
-
-        if (_maintenanceTask is not null)
-        {
-            try
-            {
-                await _maintenanceTask;
-            }
-            catch (OperationCanceledException)
-            {
-            }
         }
 
         _lifetime.Dispose();
