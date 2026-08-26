@@ -5,6 +5,14 @@ namespace ProxyToAnyConnect.Vpn;
 internal sealed class VpnContext : IDisposable
 {
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly CancellationToken _lifetimeToken;
+
+    // One reference belongs to RasConnectionManager while this context is the
+    // current RAS session. Every live outbound proxy connection adds one more.
+    // The CTS is disposed only after the manager owner and every connection
+    // have released their references.
+    private int _references = 1;
+    private int _ownerReleased;
     private int _disposed;
 
     internal VpnContext(
@@ -20,6 +28,7 @@ internal sealed class VpnContext : IDisposable
         InterfaceDescription = interfaceInfo.Description;
         InterfaceIndex = interfaceInfo.InterfaceIndex;
         DnsServers = interfaceInfo.DnsServers;
+        _lifetimeToken = _lifetime.Token;
     }
 
     public string EntryName { get; }
@@ -29,25 +38,80 @@ internal sealed class VpnContext : IDisposable
     public string InterfaceDescription { get; }
     public int InterfaceIndex { get; }
     public IReadOnlyList<IPAddress> DnsServers { get; }
-    public CancellationToken LifetimeToken => _lifetime.Token;
-    public bool IsAlive => !_lifetime.IsCancellationRequested;
+    public CancellationToken LifetimeToken => _lifetimeToken;
+    public bool IsAlive => !_lifetimeToken.IsCancellationRequested;
 
     internal void MarkDisconnected()
     {
-        if (!_lifetime.IsCancellationRequested)
+        if (!_lifetimeToken.IsCancellationRequested)
         {
-            _lifetime.Cancel();
+            try
+            {
+                _lifetime.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // A racing final reference release already disposed the CTS.
+            }
         }
     }
 
+    internal bool TryAcquireConnectionReference()
+    {
+        while (true)
+        {
+            if (!IsAlive || Volatile.Read(ref _disposed) != 0)
+            {
+                return false;
+            }
+
+            var current = Volatile.Read(ref _references);
+            if (current <= 0)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _references, current + 1, current) != current)
+            {
+                continue;
+            }
+
+            // Disconnect may race the increment. Do not let a newly-created
+            // connection keep a dead context alive unnecessarily.
+            if (IsAlive && Volatile.Read(ref _disposed) == 0)
+            {
+                return true;
+            }
+
+            ReleaseConnectionReference();
+            return false;
+        }
+    }
+
+    internal void ReleaseConnectionReference() => ReleaseReference();
+
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        MarkDisconnected();
+        if (Interlocked.Exchange(ref _ownerReleased, 1) == 0)
+        {
+            ReleaseReference();
+        }
+    }
+
+    private void ReleaseReference()
+    {
+        var remaining = Interlocked.Decrement(ref _references);
+        if (remaining < 0)
+        {
+            throw new InvalidOperationException("VpnContext reference count became negative.");
+        }
+
+        if (remaining != 0 || Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
         }
 
-        _lifetime.Cancel();
         _lifetime.Dispose();
     }
 }
