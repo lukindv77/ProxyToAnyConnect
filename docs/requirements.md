@@ -28,10 +28,7 @@ Each proxy instance has at least:
 - HTTP header/read timeout;
 - outbound connect timeout;
 - DNS timeout;
-- reference to one configured L2TP connection;
-- lifetime traffic counters:
-  - RX bytes: bytes received from target/origin servers and delivered to the proxy client;
-  - TX bytes: bytes received from the proxy client and sent to target/origin servers.
+- reference to one configured L2TP connection.
 
 Every enabled proxy must have a unique inbound `IPv4:port` endpoint.
 
@@ -51,15 +48,6 @@ An L2TP connection can be:
 
 - **shared** — multiple proxy instances may use the same runtime L2TP session;
 - **dedicated** — at most one proxy may reference/use that L2TP connection.
-
-Each L2TP runtime exposes at least:
-
-- connection state and last error;
-- assigned client IPv4 and interface information when connected;
-- aggregate RX/TX proxy traffic counters for all proxy instances currently/previously routed through this L2TP runtime;
-- rolling average successful keepalive RTT for the last 5 minutes.
-
-L2TP RX/TX counters represent application proxy payload traffic assigned to that L2TP connection. Verification probes, keepalive packets and RAS/IPsec protocol overhead are not included.
 
 ### Runtime lease semantics
 
@@ -223,7 +211,8 @@ where `MM` always has a leading zero.
 Logging requirements:
 
 - the current day's log file is append-only;
-- adding a log line must append to the open/current file or append stream; the existing file must never be loaded completely into memory to add a line;
+- adding a log line performs only an append write to the current daily file; the existing file must never be loaded or rewritten in order to add a record;
+- the implementation may open/append/close for each record so the active file remains readable/copyable by normal Windows tools while the application runs;
 - rotation to a new daily file occurs automatically when the local calendar day changes;
 - parent `YYYY-MM` directory is created on demand;
 - retention cleanup removes daily log files older than the configured number of days and removes empty month directories afterward;
