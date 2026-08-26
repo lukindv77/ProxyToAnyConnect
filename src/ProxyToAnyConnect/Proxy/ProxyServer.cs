@@ -530,34 +530,30 @@ internal sealed class ProxyServer
 
         public static ParsedProxyRequest Parse(ReadOnlySpan<byte> headerBytes)
         {
-            var text = Encoding.Latin1.GetString(headerBytes);
-            var requestLineEnd = text.IndexOf("\r\n", StringComparison.Ordinal);
+            var requestLineEnd = headerBytes.IndexOf("\r\n"u8);
             if (requestLineEnd < 0)
             {
                 throw new InvalidDataException("Invalid HTTP proxy request.");
             }
 
-            var requestLine = text.AsSpan(0, requestLineEnd);
+            var requestLine = headerBytes[..requestLineEnd];
             Span<Range> requestParts = stackalloc Range[3];
-            var requestPartCount = requestLine.Split(
-                requestParts,
-                ' ',
-                StringSplitOptions.RemoveEmptyEntries);
+            var requestPartCount = SplitRequestLine(requestLine, requestParts);
             if (requestPartCount != 3)
             {
                 throw new InvalidDataException("Invalid HTTP proxy request line.");
             }
 
-            var method = requestLine[requestParts[0]].ToString();
-            var target = requestLine[requestParts[1]].ToString();
-            var version = requestLine[requestParts[2]].ToString();
+            var method = Encoding.Latin1.GetString(requestLine[requestParts[0]]);
+            var target = Encoding.Latin1.GetString(requestLine[requestParts[1]]);
+            var version = Encoding.Latin1.GetString(requestLine[requestParts[2]]);
 
             var headers = new List<HeaderLine>();
             var offset = requestLineEnd + 2;
-            while (offset < text.Length)
+            while (offset < headerBytes.Length)
             {
-                var remaining = text.AsSpan(offset);
-                var lineEnd = remaining.IndexOf("\r\n".AsSpan());
+                var remaining = headerBytes[offset..];
+                var lineEnd = remaining.IndexOf("\r\n"u8);
                 if (lineEnd < 0)
                 {
                     throw new InvalidDataException("Invalid HTTP proxy request.");
@@ -569,19 +565,81 @@ internal sealed class ProxyServer
                 }
 
                 var line = remaining[..lineEnd];
-                var separator = line.IndexOf(':');
+                var separator = line.IndexOf((byte)':');
                 if (separator <= 0)
                 {
                     throw new InvalidDataException("Invalid HTTP header line.");
                 }
 
+                var name = TrimLatin1Whitespace(line[..separator]);
+                var value = TrimLatin1Whitespace(line[(separator + 1)..]);
                 headers.Add(new HeaderLine(
-                    line[..separator].Trim().ToString(),
-                    line[(separator + 1)..].Trim().ToString()));
+                    Encoding.Latin1.GetString(name),
+                    Encoding.Latin1.GetString(value)));
                 offset += lineEnd + 2;
             }
 
             return new ParsedProxyRequest(method, target, version, headers);
+        }
+
+        private static int SplitRequestLine(ReadOnlySpan<byte> requestLine, Span<Range> parts)
+        {
+            if (parts.Length < 3)
+            {
+                throw new ArgumentException("At least three request-line ranges are required.", nameof(parts));
+            }
+
+            var offset = 0;
+            var count = 0;
+            while (count < 2)
+            {
+                while (offset < requestLine.Length && requestLine[offset] == (byte)' ')
+                {
+                    offset++;
+                }
+
+                if (offset >= requestLine.Length)
+                {
+                    return count;
+                }
+
+                var start = offset;
+                while (offset < requestLine.Length && requestLine[offset] != (byte)' ')
+                {
+                    offset++;
+                }
+
+                parts[count++] = start..offset;
+            }
+
+            while (offset < requestLine.Length && requestLine[offset] == (byte)' ')
+            {
+                offset++;
+            }
+
+            if (offset < requestLine.Length)
+            {
+                parts[count++] = offset..requestLine.Length;
+            }
+
+            return count;
+        }
+
+        private static ReadOnlySpan<byte> TrimLatin1Whitespace(ReadOnlySpan<byte> value)
+        {
+            var start = 0;
+            while (start < value.Length && char.IsWhiteSpace((char)value[start]))
+            {
+                start++;
+            }
+
+            var end = value.Length;
+            while (end > start && char.IsWhiteSpace((char)value[end - 1]))
+            {
+                end--;
+            }
+
+            return value[start..end];
         }
 
         public byte[] BuildOriginHeader(string pathAndQuery)
