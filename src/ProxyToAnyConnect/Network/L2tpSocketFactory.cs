@@ -6,10 +6,10 @@ namespace ProxyToAnyConnect.Network;
 
 internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
 {
-    private readonly RasConnectionManager _connectionManager;
+    private readonly IVpnConnectionController _connectionManager;
     private readonly L2tpDnsResolver _dnsResolver;
 
-    public L2tpSocketFactory(RasConnectionManager connectionManager, L2tpDnsResolver dnsResolver)
+    public L2tpSocketFactory(IVpnConnectionController connectionManager, L2tpDnsResolver dnsResolver)
     {
         _connectionManager = connectionManager;
         _dnsResolver = dnsResolver;
