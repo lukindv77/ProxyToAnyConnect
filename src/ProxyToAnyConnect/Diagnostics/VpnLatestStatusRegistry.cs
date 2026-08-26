@@ -3,7 +3,14 @@ using System.Reflection;
 
 namespace ProxyToAnyConnect.Diagnostics;
 
-internal sealed record VpnLatestStatus(string Text, DateTimeOffset UpdatedUtc);
+internal sealed record VpnLatestStatus(
+    string? Activity,
+    string? VerificationSummary,
+    string? KeepaliveSummary,
+    string? ReconnectSummary,
+    string? LastFailureReason,
+    string Text,
+    DateTimeOffset UpdatedUtc);
 
 internal static class VpnLatestStatusRegistry
 {
@@ -49,6 +56,22 @@ internal static class VpnLatestStatusRegistry
         }
     }
 
+    internal static void UpdateKeepaliveSuccess(string vpnId, string target, TimeSpan roundTripTime)
+    {
+        if (string.IsNullOrWhiteSpace(vpnId) || roundTripTime < TimeSpan.Zero)
+        {
+            return;
+        }
+
+        Update(
+            vpnId,
+            status => status with
+            {
+                KeepaliveSummary = BuildKeepaliveSuccessText(target, roundTripTime.TotalMilliseconds),
+                UpdatedUtc = DateTimeOffset.UtcNow
+            });
+    }
+
     internal static void UpdateFromLog(
         string eventName,
         string message,
@@ -66,43 +89,150 @@ internal static class VpnLatestStatusRegistry
             return;
         }
 
-        var text = eventName switch
-        {
-            "vpn.state" => GetString(data, "Current") is { Length: > 0 } state
-                ? $"State: {state}"
-                : message,
+        var now = DateTimeOffset.UtcNow;
+        Update(
+            vpnId,
+            status => eventName switch
+            {
+                "vpn.state" => status with
+                {
+                    Activity = BuildStateActivity(data, status.Activity),
+                    UpdatedUtc = now
+                },
 
-            "vpn.profile.validated" => "Windows L2TP profile validated",
-            "vpn.ephemeral.prepared" => "Custom ephemeral L2TP prepared",
-            "vpn.routes.validated" => "Default-route guard OK",
+                "vpn.profile.validated" => status with
+                {
+                    Activity = "Windows L2TP profile validated",
+                    UpdatedUtc = now
+                },
 
-            "vpn.ras.connected" => BuildConnectedText(data),
+                "vpn.ephemeral.prepared" => status with
+                {
+                    Activity = "Custom ephemeral L2TP prepared",
+                    UpdatedUtc = now
+                },
 
-            "vpn.keepalive.failed" => BuildKeepaliveFailureText(data),
-            "vpn.keepalive.recovered" => BuildKeepaliveRecoveredText(data),
+                "vpn.routes.validated" => status with
+                {
+                    Activity = "Default-route guard OK",
+                    UpdatedUtc = now
+                },
 
-            "vpn.reconnect.cooldown_active" => GetLong(data, "RetryAfterMilliseconds") is { } remaining
-                ? $"Reconnect cooldown: {remaining} ms"
-                : "Reconnect cooldown active",
+                "vpn.ras.connected" => status with
+                {
+                    Activity = BuildConnectedText(data),
+                    UpdatedUtc = now
+                },
 
-            "vpn.reconnect.cooldown_armed" => GetString(data, "Reason") is { Length: > 0 } reason
-                ? $"Reconnect cooldown: {reason}"
-                : "Reconnect cooldown armed",
+                "vpn.verification.succeeded" => status with
+                {
+                    Activity = null,
+                    VerificationSummary = BuildVerificationText(data),
+                    ReconnectSummary = null,
+                    UpdatedUtc = now
+                },
 
-            "vpn.connection.rejected" => $"Rejected: {exception?.Message ?? message}",
-            "vpn.monitor.fail_closed" => $"Fail-closed: {exception?.Message ?? message}",
-            "vpn.ras.hangup" => "Disconnected",
-            _ => null
-        };
+                "vpn.keepalive.failed" => status with
+                {
+                    KeepaliveSummary = BuildKeepaliveFailureText(data),
+                    UpdatedUtc = now
+                },
 
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return;
-        }
+                "vpn.keepalive.recovered" => status with
+                {
+                    KeepaliveSummary = BuildKeepaliveRecoveredText(data),
+                    UpdatedUtc = now
+                },
 
+                "vpn.reconnect.cooldown_active" => status with
+                {
+                    ReconnectSummary = GetLong(data, "RetryAfterMilliseconds") is { } remaining
+                        ? $"Reconnect cooldown: {remaining} ms"
+                        : "Reconnect cooldown active",
+                    UpdatedUtc = now
+                },
+
+                "vpn.reconnect.cooldown_armed" => status with
+                {
+                    ReconnectSummary = GetString(data, "Reason") is { Length: > 0 } reason
+                        ? $"Reconnect cooldown: {reason}"
+                        : "Reconnect cooldown armed",
+                    UpdatedUtc = now
+                },
+
+                "vpn.maintenance.reconnect_attempt" => status with
+                {
+                    ReconnectSummary = "Reconnect: dialing and verifying",
+                    UpdatedUtc = now
+                },
+
+                "vpn.maintenance.reconnect_pending" => status with
+                {
+                    ReconnectSummary = GetString(data, "Error") is { Length: > 0 } error
+                        ? $"Reconnect pending: {error}"
+                        : "Reconnect pending",
+                    UpdatedUtc = now
+                },
+
+                "vpn.maintenance.reconnected" => status with
+                {
+                    ReconnectSummary = "Reconnect completed",
+                    UpdatedUtc = now
+                },
+
+                "vpn.maintenance.reconnect_discarded" => status with
+                {
+                    ReconnectSummary = "Reconnect discarded: no active proxy leases",
+                    UpdatedUtc = now
+                },
+
+                "vpn.connection.rejected" => status with
+                {
+                    Activity = "Disconnected",
+                    LastFailureReason = $"Rejected: {exception?.Message ?? message}",
+                    UpdatedUtc = now
+                },
+
+                "vpn.monitor.fail_closed" => status with
+                {
+                    Activity = "Disconnected",
+                    LastFailureReason = $"Fail-closed: {exception?.Message ?? message}",
+                    UpdatedUtc = now
+                },
+
+                "vpn.ras.hangup" => status with
+                {
+                    Activity = "Disconnected",
+                    UpdatedUtc = now
+                },
+
+                _ => status
+            });
+    }
+
+    private static void Update(string vpnId, Func<VpnLatestStatus, VpnLatestStatus> update)
+    {
         lock (Gate)
         {
-            if (!Entries.ContainsKey(vpnId) && Entries.Count >= MaxEntries)
+            var exists = Entries.TryGetValue(vpnId, out var current);
+            current ??= new VpnLatestStatus(
+                Activity: null,
+                VerificationSummary: null,
+                KeepaliveSummary: null,
+                ReconnectSummary: null,
+                LastFailureReason: null,
+                Text: string.Empty,
+                UpdatedUtc: DateTimeOffset.UtcNow);
+
+            var updated = update(current);
+            if (ReferenceEquals(updated, current))
+            {
+                return;
+            }
+
+            updated = updated with { Text = BuildText(updated) };
+
+            if (!exists && Entries.Count >= MaxEntries)
             {
                 var oldest = Entries.MinBy(pair => pair.Value.UpdatedUtc);
                 if (!string.IsNullOrEmpty(oldest.Key))
@@ -111,8 +241,40 @@ internal static class VpnLatestStatusRegistry
                 }
             }
 
-            Entries[vpnId] = new VpnLatestStatus(text, DateTimeOffset.UtcNow);
+            Entries[vpnId] = updated;
         }
+    }
+
+    private static string BuildText(VpnLatestStatus status)
+    {
+        var parts = new List<string>(5);
+        AddIfPresent(parts, status.Activity);
+        AddIfPresent(parts, status.VerificationSummary);
+        AddIfPresent(parts, status.KeepaliveSummary);
+        AddIfPresent(parts, status.ReconnectSummary);
+        AddIfPresent(parts, status.LastFailureReason);
+        return string.Join(" | ", parts);
+    }
+
+    private static void AddIfPresent(List<string> parts, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            parts.Add(value);
+        }
+    }
+
+    private static string? BuildStateActivity(object data, string? currentActivity)
+    {
+        return GetString(data, "Current") switch
+        {
+            "Dialing" => "Dialing",
+            "Verifying" => "Verifying",
+            "Ready" => null,
+            "Disconnected" => "Disconnected",
+            { Length: > 0 } state => $"State: {state}",
+            _ => currentActivity
+        };
     }
 
     private static string BuildConnectedText(object data)
@@ -122,12 +284,34 @@ internal static class VpnLatestStatusRegistry
 
         if (!string.IsNullOrWhiteSpace(localIp) && interfaceIndex is not null)
         {
-            return $"Connected: {localIp}, ifIndex {interfaceIndex.Value}";
+            return $"RAS connected: {localIp}, ifIndex {interfaceIndex.Value}";
         }
 
         return !string.IsNullOrWhiteSpace(localIp)
-            ? $"Connected: {localIp}"
+            ? $"RAS connected: {localIp}"
             : "RAS connected";
+    }
+
+    private static string BuildVerificationText(object data)
+    {
+        var probeTarget = GetString(data, "ProbeTargetIPv4");
+        var observedPublicIp = GetString(data, "ObservedPublicIPv4");
+        var expectedPublicIp = GetString(data, "ExpectedPublicIPv4");
+        var comparisonPerformed = GetBool(data, "PublicIPv4ComparisonPerformed");
+        var localIp = GetString(data, "LocalIPv4");
+        var interfaceIndex = GetLong(data, "InterfaceIndex");
+
+        var route = !string.IsNullOrWhiteSpace(localIp) && interfaceIndex is not null
+            ? $"{localIp}/if{interfaceIndex.Value}"
+            : localIp;
+        var publicIdentity = comparisonPerformed == true && !string.IsNullOrWhiteSpace(expectedPublicIp)
+            ? $"egress {observedPublicIp ?? "?"} = {expectedPublicIp}"
+            : !string.IsNullOrWhiteSpace(observedPublicIp)
+                ? $"egress {observedPublicIp}"
+                : "egress probe passed";
+        var probe = string.IsNullOrWhiteSpace(probeTarget) ? string.Empty : $", probe {probeTarget}";
+        var boundRoute = string.IsNullOrWhiteSpace(route) ? string.Empty : $", {route}";
+        return $"Verified: {publicIdentity}{probe}{boundRoute}";
     }
 
     private static string BuildKeepaliveFailureText(object data)
@@ -145,10 +329,20 @@ internal static class VpnLatestStatusRegistry
 
     private static string BuildKeepaliveRecoveredText(object data)
     {
+        var target = GetString(data, "Target") ?? string.Empty;
         var rtt = GetDouble(data, "RoundTripMilliseconds");
         return rtt is null
             ? "Keepalive recovered"
-            : $"Keepalive recovered: {rtt.Value:F0} ms";
+            : BuildKeepaliveSuccessText(target, rtt.Value, prefix: "Keepalive recovered");
+    }
+
+    private static string BuildKeepaliveSuccessText(
+        string target,
+        double roundTripMilliseconds,
+        string prefix = "Keepalive")
+    {
+        var destination = string.IsNullOrWhiteSpace(target) ? string.Empty : $" -> {target}";
+        return $"{prefix}: {roundTripMilliseconds:F0} ms{destination}";
     }
 
     private static string? GetString(object data, string propertyName)
@@ -196,6 +390,21 @@ internal static class VpnLatestStatusRegistry
         {
             return null;
         }
+    }
+
+    private static bool? GetBool(object data, string propertyName)
+    {
+        var value = GetPropertyValue(data, propertyName);
+        if (value is bool boolValue)
+        {
+            return boolValue;
+        }
+
+        return value is null
+            ? null
+            : bool.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), out var parsed)
+                ? parsed
+                : null;
     }
 
     private static object? GetPropertyValue(object data, string propertyName) =>
