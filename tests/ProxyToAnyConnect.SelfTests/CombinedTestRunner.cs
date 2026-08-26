@@ -25,6 +25,11 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        if (await ProxyShutdownDrainSelfTests.RunAsync() != 0)
+        {
+            return 1;
+        }
+
         var routeFailures = await NativeRouteSelfTests.RunAsync();
         if (routeFailures != 0)
         {
@@ -81,7 +86,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, bounded-status, memory-health, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, bounded-status, memory-health, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
