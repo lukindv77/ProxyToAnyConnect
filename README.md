@@ -62,6 +62,15 @@ If L2TP is unavailable, cannot be verified, changes the Windows default route, o
 
 DNS for proxied destinations is also sent only through L2TP-bound sockets. The resolver supports IPv4 A records, follows CNAME chains, and falls back from UDP to DNS-over-TCP when a DNS response is truncated.
 
+## Windows VPN profile scope
+
+Both Windows VPN profile scopes are supported:
+
+- normal per-user profile: RAS uses the current user's default phonebook;
+- `AllUserConnection=True`: ProxyToAnyConnect explicitly uses the global Windows `rasphone.pbk` under the common application-data directory.
+
+The profile scope is detected by `Get-VpnConnection` before dialing.
+
 ## Required configuration before first run
 
 Edit `src/ProxyToAnyConnect/appsettings.json` (or the deployed copy) and set:
@@ -78,11 +87,27 @@ Edit `src/ProxyToAnyConnect/appsettings.json` (or the deployed copy) and set:
       "probePort": 443,
       "probePath": "/"
     }
+  },
+  "logging": {
+    "filePath": "logs/ProxyToAnyConnect.jsonl",
+    "consoleJson": false
   }
 }
 ```
 
 The Windows VPN entry must already exist and have its credentials stored by Windows. Credentials are not stored in this repository.
+
+## Structured diagnostics
+
+The default configuration writes JSON Lines diagnostics to:
+
+```text
+logs/ProxyToAnyConnect.jsonl
+```
+
+relative to the deployed `appsettings.json` directory. Log entries include VPN state transitions, profile/route verification, assigned RAS IPv4/interface information and fail-closed reasons. Password values, HTTP request bodies and HTTPS tunnel contents are not logged.
+
+Logging failures do not alter proxy routing or fail-closed behavior; if the log file cannot be written, file logging disables itself.
 
 ## Verification-only diagnostic run
 
@@ -96,7 +121,7 @@ Exit code `0` means the connection reached `Ready` and all fail-closed guards pa
 
 ## Build and publish
 
-GitHub Actions builds with .NET 10 on Windows, runs the self-tests and publishes a self-contained `win-x64` artifact named `ProxyToAnyConnect-win-x64`.
+GitHub Actions builds with .NET 10 on Windows, runs parser and live loopback proxy tests, verifies active CONNECT cancellation when the outbound/VPN lifetime ends, and publishes a self-contained `win-x64` artifact named `ProxyToAnyConnect-win-x64`.
 
 See:
 
