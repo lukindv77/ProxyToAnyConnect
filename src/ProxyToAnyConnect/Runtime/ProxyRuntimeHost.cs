@@ -21,11 +21,19 @@ internal sealed class ProxyRuntimeHost : IAsyncDisposable
 
     public async Task StartEnabledAsync(CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        var runtime = Current;
-        if (runtime is not null)
+        await _gate.WaitAsync(cancellationToken);
+        try
         {
-            await runtime.StartEnabledAsync(cancellationToken);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            var runtime = Current;
+            if (runtime is not null)
+            {
+                await runtime.StartEnabledAsync(cancellationToken);
+            }
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 
@@ -70,16 +78,36 @@ internal sealed class ProxyRuntimeHost : IAsyncDisposable
     }
 
     public Task StartProxyAsync(string proxyId, CancellationToken cancellationToken = default) =>
-        GetRequiredRuntime().StartProxyAsync(proxyId, cancellationToken);
+        ExecuteRuntimeActionAsync(
+            runtime => runtime.StartProxyAsync(proxyId, cancellationToken),
+            cancellationToken);
 
     public Task PauseProxyAsync(string proxyId, CancellationToken cancellationToken = default) =>
-        GetRequiredRuntime().PauseProxyAsync(proxyId, cancellationToken);
+        ExecuteRuntimeActionAsync(
+            runtime => runtime.PauseProxyAsync(proxyId, cancellationToken),
+            cancellationToken);
 
     public IReadOnlyList<ProxyRuntimeSnapshot> GetProxySnapshots() =>
         Current?.GetProxySnapshots() ?? [];
 
     public IReadOnlyList<L2tpRuntimeSnapshot> GetL2tpSnapshots() =>
         Current?.GetL2tpSnapshots() ?? [];
+
+    private async Task ExecuteRuntimeActionAsync(
+        Func<ProxyRuntimeCoordinator, Task> action,
+        CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            var runtime = GetRequiredRuntime();
+            await action(runtime);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
 
     private ProxyRuntimeCoordinator GetRequiredRuntime()
     {
