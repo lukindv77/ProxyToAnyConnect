@@ -26,6 +26,7 @@ internal static class ProxyParserAllocationSelfTests
         try
         {
             RequestLineSpanSplitMatchesLegacySemantics();
+            ByteSpanParserMatchesCurrentTextParser();
             OriginHeaderDirectSerializationMatchesCurrentBuilder();
 
             var raw = BuildRepresentativeHeader();
@@ -33,22 +34,24 @@ internal static class ProxyParserAllocationSelfTests
             for (var i = 0; i < WarmupIterations; i++)
             {
                 GC.KeepAlive(ProxyServer.ParsedProxyRequest.Parse(raw));
+                GC.KeepAlive(CurrentTextSpanParse(raw));
                 GC.KeepAlive(LegacySplitParse(raw));
             }
 
             var optimizedParserBytes = MeasureOptimizedParser(raw);
+            var currentTextParserBytes = MeasureCurrentTextParser(raw);
             var legacyParserBytes = MeasureLegacyParser(raw);
-            if (optimizedParserBytes >= legacyParserBytes)
+            if (optimizedParserBytes >= currentTextParserBytes)
             {
                 throw new InvalidOperationException(
-                    $"Span header traversal allocated {optimizedParserBytes} bytes versus " +
-                    $"{legacyParserBytes} bytes for the legacy Split path.");
+                    $"Byte-span parser allocated {optimizedParserBytes} bytes versus " +
+                    $"{currentTextParserBytes} bytes for the immediate text-span predecessor.");
             }
 
             var optimizedRequest = ProxyServer.ParsedProxyRequest.Parse(raw);
-            var legacyRequest = LegacySplitParse(raw);
+            var currentTextRequest = CurrentTextSpanParse(raw);
             var optimizedOrigin = optimizedRequest.BuildOriginHeader(OriginPath);
-            var currentBuilderOrigin = CurrentBuilderBuildOriginHeader(legacyRequest, OriginPath);
+            var currentBuilderOrigin = CurrentBuilderBuildOriginHeader(currentTextRequest, OriginPath);
             if (!optimizedOrigin.AsSpan().SequenceEqual(currentBuilderOrigin))
             {
                 throw new InvalidOperationException(
@@ -58,11 +61,11 @@ internal static class ProxyParserAllocationSelfTests
             for (var i = 0; i < WarmupIterations; i++)
             {
                 GC.KeepAlive(optimizedRequest.BuildOriginHeader(OriginPath));
-                GC.KeepAlive(CurrentBuilderBuildOriginHeader(legacyRequest, OriginPath));
+                GC.KeepAlive(CurrentBuilderBuildOriginHeader(currentTextRequest, OriginPath));
             }
 
             var optimizedOriginBytes = MeasureOptimizedOrigin(optimizedRequest);
-            var currentBuilderOriginBytes = MeasureCurrentBuilderOrigin(legacyRequest);
+            var currentBuilderOriginBytes = MeasureCurrentBuilderOrigin(currentTextRequest);
             if (optimizedOriginBytes >= currentBuilderOriginBytes)
             {
                 throw new InvalidOperationException(
@@ -72,8 +75,9 @@ internal static class ProxyParserAllocationSelfTests
 
             Console.WriteLine(
                 $"PASS: proxy parser/origin paths reduce allocations " +
-                $"(parse {optimizedParserBytes / (double)MeasurementIterations:F0} vs " +
-                $"{legacyParserBytes / (double)MeasurementIterations:F0}; origin direct " +
+                $"(parse bytes {optimizedParserBytes / (double)MeasurementIterations:F0} vs text " +
+                $"{currentTextParserBytes / (double)MeasurementIterations:F0} " +
+                $"(legacy {legacyParserBytes / (double)MeasurementIterations:F0}); origin direct " +
                 $"{optimizedOriginBytes / (double)MeasurementIterations:F0} vs builder " +
                 $"{currentBuilderOriginBytes / (double)MeasurementIterations:F0} bytes/request)");
             return 0;
@@ -110,6 +114,60 @@ internal static class ProxyParserAllocationSelfTests
                     $"Request-line span split changed legacy semantics for '{requestLine}'. " +
                     $"optimized=({optimized.Method}|{optimized.Target}|{optimized.Version}), " +
                     $"legacy=({legacy.Method}|{legacy.Target}|{legacy.Version}).");
+            }
+        }
+    }
+
+    private static void ByteSpanParserMatchesCurrentTextParser()
+    {
+        (string Raw, string Path)[] cases =
+        [
+            (
+                "GET http://example.test/a HTTP/1.1\r\n" +
+                "Host: example.test\r\n" +
+                "X-Keep: yes\r\n\r\n",
+                "/a"
+            ),
+            (
+                "  GET   http://example.test/a   HTTP/1.1 extra-data\r\n" +
+                "Host: example.test\r\n\r\n",
+                "/request-line"
+            ),
+            (
+                "GET http://example.test/trim HTTP/1.1\r\n" +
+                "\u00a0X-Trim\u00a0:\u0085value\u00a0\r\n" +
+                "Empty: \t\r\n" +
+                "Connection: X-Hop\r\n" +
+                "X-Hop: remove-me\r\n\r\n",
+                "/trim"
+            ),
+            (
+                "CONNECT   example.test:443   HTTP/1.1   trailing\r\n" +
+                "Host: example.test\r\n\r\n",
+                "/unused"
+            )
+        ];
+
+        foreach (var testCase in cases)
+        {
+            var raw = Encoding.Latin1.GetBytes(testCase.Raw);
+            var optimized = ProxyServer.ParsedProxyRequest.Parse(raw);
+            var current = CurrentTextSpanParse(raw);
+
+            if (!string.Equals(optimized.Method, current.Method, StringComparison.Ordinal) ||
+                !string.Equals(optimized.Target, current.Target, StringComparison.Ordinal) ||
+                !string.Equals(optimized.Version, current.Version, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Byte-span parser changed current request-line semantics for '{testCase.Raw}'.");
+            }
+
+            var actualOrigin = optimized.BuildOriginHeader(testCase.Path);
+            var expectedOrigin = CurrentBuilderBuildOriginHeader(current, testCase.Path);
+            if (!actualOrigin.AsSpan().SequenceEqual(expectedOrigin))
+            {
+                throw new InvalidOperationException(
+                    $"Byte-span parser changed current header/trim semantics for '{testCase.Path}'.");
             }
         }
     }
@@ -151,7 +209,7 @@ internal static class ProxyParserAllocationSelfTests
         {
             var raw = Encoding.Latin1.GetBytes(testCase.Raw);
             var optimized = ProxyServer.ParsedProxyRequest.Parse(raw);
-            var current = LegacySplitParse(raw);
+            var current = CurrentTextSpanParse(raw);
             var actual = optimized.BuildOriginHeader(testCase.Path);
             var expected = CurrentBuilderBuildOriginHeader(current, testCase.Path);
 
@@ -169,6 +227,17 @@ internal static class ProxyParserAllocationSelfTests
         for (var i = 0; i < MeasurementIterations; i++)
         {
             GC.KeepAlive(ProxyServer.ParsedProxyRequest.Parse(raw));
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    private static long MeasureCurrentTextParser(byte[] raw)
+    {
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < MeasurementIterations; i++)
+        {
+            GC.KeepAlive(CurrentTextSpanParse(raw));
         }
 
         return GC.GetAllocatedBytesForCurrentThread() - before;
@@ -196,7 +265,7 @@ internal static class ProxyParserAllocationSelfTests
         return GC.GetAllocatedBytesForCurrentThread() - before;
     }
 
-    private static long MeasureCurrentBuilderOrigin(LegacyRequest request)
+    private static long MeasureCurrentBuilderOrigin(CurrentTextRequest request)
     {
         var before = GC.GetAllocatedBytesForCurrentThread();
         for (var i = 0; i < MeasurementIterations; i++)
@@ -222,6 +291,66 @@ internal static class ProxyParserAllocationSelfTests
             "X-Forward-Test: retained\r\n" +
             "Cookie: a=1; b=2; c=3\r\n" +
             "Proxy-Connection: keep-alive\r\n\r\n");
+
+    // Test-only copy of the production parser immediately before direct byte-span
+    // traversal. It retains the one full Latin-1 header string and then creates
+    // only the final request/header strings from spans. Header lines are value
+    // records to match the production representation at that point.
+    private static CurrentTextRequest CurrentTextSpanParse(ReadOnlySpan<byte> headerBytes)
+    {
+        var text = Encoding.Latin1.GetString(headerBytes);
+        var requestLineEnd = text.IndexOf("\r\n", StringComparison.Ordinal);
+        if (requestLineEnd < 0)
+        {
+            throw new InvalidDataException("Invalid HTTP proxy request.");
+        }
+
+        var requestLine = text.AsSpan(0, requestLineEnd);
+        Span<Range> requestParts = stackalloc Range[3];
+        var requestPartCount = requestLine.Split(
+            requestParts,
+            ' ',
+            StringSplitOptions.RemoveEmptyEntries);
+        if (requestPartCount != 3)
+        {
+            throw new InvalidDataException("Invalid HTTP proxy request line.");
+        }
+
+        var method = requestLine[requestParts[0]].ToString();
+        var target = requestLine[requestParts[1]].ToString();
+        var version = requestLine[requestParts[2]].ToString();
+
+        var headers = new List<CurrentTextHeaderLine>();
+        var offset = requestLineEnd + 2;
+        while (offset < text.Length)
+        {
+            var remaining = text.AsSpan(offset);
+            var lineEnd = remaining.IndexOf("\r\n".AsSpan());
+            if (lineEnd < 0)
+            {
+                throw new InvalidDataException("Invalid HTTP proxy request.");
+            }
+
+            if (lineEnd == 0)
+            {
+                break;
+            }
+
+            var line = remaining[..lineEnd];
+            var separator = line.IndexOf(':');
+            if (separator <= 0)
+            {
+                throw new InvalidDataException("Invalid HTTP header line.");
+            }
+
+            headers.Add(new CurrentTextHeaderLine(
+                line[..separator].Trim().ToString(),
+                line[(separator + 1)..].Trim().ToString()));
+            offset += lineEnd + 2;
+        }
+
+        return new CurrentTextRequest(method, target, version, headers);
+    }
 
     // Test-only copy of the pre-refactor parsing shape. This intentionally uses
     // string.Split for every CRLF line so the allocation comparison stays local
@@ -262,7 +391,7 @@ internal static class ProxyParserAllocationSelfTests
     // direct byte serialization. Connection tokenization is intentionally the
     // already-optimized span/lazy-set form so the allocation comparison isolates
     // StringBuilder + ToString() + Encoding.GetBytes(byte[]) materialization.
-    private static byte[] CurrentBuilderBuildOriginHeader(LegacyRequest request, string pathAndQuery)
+    private static byte[] CurrentBuilderBuildOriginHeader(CurrentTextRequest request, string pathAndQuery)
     {
         var connectionTokens = CollectCurrentConnectionTokens(request);
         var builder = new StringBuilder();
@@ -284,7 +413,7 @@ internal static class ProxyParserAllocationSelfTests
         return Encoding.Latin1.GetBytes(builder.ToString());
     }
 
-    private static HashSet<string>? CollectCurrentConnectionTokens(LegacyRequest request)
+    private static HashSet<string>? CollectCurrentConnectionTokens(CurrentTextRequest request)
     {
         HashSet<string>? tokens = null;
         foreach (var header in request.Headers)
@@ -316,6 +445,14 @@ internal static class ProxyParserAllocationSelfTests
 
         return tokens;
     }
+
+    private sealed record CurrentTextRequest(
+        string Method,
+        string Target,
+        string Version,
+        List<CurrentTextHeaderLine> Headers);
+
+    private readonly record struct CurrentTextHeaderLine(string Name, string Value);
 
     private sealed record LegacyRequest(
         string Method,
