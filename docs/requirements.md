@@ -28,7 +28,10 @@ Each proxy instance has at least:
 - HTTP header/read timeout;
 - outbound connect timeout;
 - DNS timeout;
-- reference to one configured L2TP connection.
+- reference to one configured L2TP connection;
+- lifetime traffic counters:
+  - RX bytes: bytes received from target/origin servers and delivered to the proxy client;
+  - TX bytes: bytes received from the proxy client and sent to target/origin servers.
 
 Every enabled proxy must have a unique inbound `IPv4:port` endpoint.
 
@@ -48,6 +51,15 @@ An L2TP connection can be:
 
 - **shared** — multiple proxy instances may use the same runtime L2TP session;
 - **dedicated** — at most one proxy may reference/use that L2TP connection.
+
+Each L2TP runtime exposes at least:
+
+- connection state and last error;
+- assigned client IPv4 and interface information when connected;
+- aggregate RX/TX proxy traffic counters for all proxy instances currently/previously routed through this L2TP runtime;
+- rolling average successful keepalive RTT for the last 5 minutes.
+
+L2TP RX/TX counters represent application proxy payload traffic assigned to that L2TP connection. Verification probes, keepalive packets and RAS/IPsec protocol overhead are not included.
 
 ### Runtime lease semantics
 
@@ -177,6 +189,49 @@ When the consecutive failure threshold is reached:
 4. apply reconnect cooldown;
 5. if one or more running proxies still hold leases, reconnect and perform full verification before traffic resumes.
 
+### Ping statistics
+
+- Each successful keepalive probe contributes one RTT sample to the corresponding L2TP runtime.
+- The GUI displays the arithmetic mean of successful RTT samples whose timestamps are within the last 5 minutes.
+- Failed keepalive attempts affect health/failure counters but are not included as synthetic RTT values.
+- When keepalive is `Off`, or when there are no successful samples in the 5-minute window, average ping is displayed as unavailable (`—`).
+
+## Logging and retention
+
+ProxyToAnyConnect keeps append-only structured operational logs with special emphasis on L2TP lifecycle, verification, keepalive and errors.
+
+Settings expose:
+
+- log root directory;
+- retention period in days.
+
+Defaults:
+
+- the log root defaults to the directory containing/running `ProxyToAnyConnect.exe`;
+- retention defaults to 30 days unless changed in the GUI.
+
+Directory/file layout:
+
+```text
+<log-root>/
+  YYYY-MM/
+    YYYY-MM-DD.jsonl
+```
+
+where `MM` always has a leading zero.
+
+Logging requirements:
+
+- the current day's log file is append-only;
+- adding a log line must append to the open/current file or append stream; the existing file must never be loaded completely into memory to add a line;
+- rotation to a new daily file occurs automatically when the local calendar day changes;
+- parent `YYYY-MM` directory is created on demand;
+- retention cleanup removes daily log files older than the configured number of days and removes empty month directories afterward;
+- retention cleanup must not block or break proxy/VPN fail-closed behavior;
+- logging errors are reported in GUI diagnostics when possible but must not make traffic fall back DIRECT;
+- log records include timestamp, severity, event name, relevant proxy/VPN IDs, state transitions, RAS errors, verification/keepalive outcomes and sanitized exception details;
+- passwords, PSKs, HTTP request/response bodies and HTTPS tunnel contents must never be written to logs.
+
 ## GUI settings
 
 The GUI must allow configuring and managing:
@@ -193,7 +248,8 @@ The GUI must allow configuring and managing:
 - DNS timeout;
 - start/resume;
 - pause;
-- current runtime state and last error.
+- current runtime state and last error;
+- RX bytes and TX bytes, updated while the proxy is running.
 
 ### L2TP connections
 
@@ -207,7 +263,45 @@ The GUI must allow configuring and managing:
 - monitor intervals;
 - reconnect cooldown;
 - keepalive mode and settings;
-- current connection state, assigned IPv4, interface index and verification result.
+- current connection state, assigned IPv4, interface index and verification result;
+- aggregate RX/TX bytes across associated proxy traffic;
+- rolling 5-minute average keepalive ping.
+
+### Logging
+
+- select/change log root directory;
+- configure retention days;
+- show the effective current log directory/path.
+
+## GUI runtime views
+
+The main GUI contains at least:
+
+1. **Proxies** tab/table
+   - one row per proxy;
+   - name;
+   - bind IPv4:port;
+   - selected L2TP;
+   - runtime state;
+   - last error/status;
+   - RX bytes;
+   - TX bytes;
+   - Pause/Resume action.
+2. **L2TP** tab/table
+   - one row per L2TP configuration/runtime;
+   - name;
+   - mode (existing/custom);
+   - shared/dedicated;
+   - runtime state;
+   - assigned client IPv4;
+   - active proxy lease count;
+   - aggregate RX bytes;
+   - aggregate TX bytes;
+   - 5-minute average ping;
+   - last keepalive/verification/error status.
+3. **Settings/Diagnostics** UI for configuration and log location/retention.
+
+Runtime byte counters must be updated from the live data pumps, not reconstructed by reading log files.
 
 ## Security and privacy
 
