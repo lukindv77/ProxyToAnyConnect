@@ -7,6 +7,19 @@ internal static class ProxyParserAllocationSelfTests
 {
     private const int WarmupIterations = 32;
     private const int MeasurementIterations = 1000;
+    private const string OriginPath = "/path?q=1";
+
+    private static readonly HashSet<string> LegacyFixedHopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Proxy-Authorization",
+        "Proxy-Authenticate",
+        "Proxy-Connection",
+        "Keep-Alive",
+        "TE",
+        "Trailer",
+        "Transfer-Encoding",
+        "Upgrade"
+    };
 
     public static int Run()
     {
@@ -20,19 +33,46 @@ internal static class ProxyParserAllocationSelfTests
                 GC.KeepAlive(LegacySplitParse(raw));
             }
 
-            var optimizedBytes = MeasureOptimized(raw);
-            var legacyBytes = MeasureLegacy(raw);
-            if (optimizedBytes >= legacyBytes)
+            var optimizedParserBytes = MeasureOptimizedParser(raw);
+            var legacyParserBytes = MeasureLegacyParser(raw);
+            if (optimizedParserBytes >= legacyParserBytes)
             {
                 throw new InvalidOperationException(
-                    $"Span header traversal allocated {optimizedBytes} bytes versus " +
-                    $"{legacyBytes} bytes for the legacy Split path.");
+                    $"Span header traversal allocated {optimizedParserBytes} bytes versus " +
+                    $"{legacyParserBytes} bytes for the legacy Split path.");
+            }
+
+            var optimizedRequest = ProxyServer.ParsedProxyRequest.Parse(raw);
+            var legacyRequest = LegacySplitParse(raw);
+            var optimizedOrigin = optimizedRequest.BuildOriginHeader(OriginPath);
+            var legacyOrigin = LegacyBuildOriginHeader(legacyRequest, OriginPath);
+            if (!optimizedOrigin.AsSpan().SequenceEqual(legacyOrigin))
+            {
+                throw new InvalidOperationException(
+                    "Optimized origin-header filtering changed the legacy output bytes.");
+            }
+
+            for (var i = 0; i < WarmupIterations; i++)
+            {
+                GC.KeepAlive(optimizedRequest.BuildOriginHeader(OriginPath));
+                GC.KeepAlive(LegacyBuildOriginHeader(legacyRequest, OriginPath));
+            }
+
+            var optimizedOriginBytes = MeasureOptimizedOrigin(optimizedRequest);
+            var legacyOriginBytes = MeasureLegacyOrigin(legacyRequest);
+            if (optimizedOriginBytes >= legacyOriginBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Span Connection tokenization allocated {optimizedOriginBytes} bytes versus " +
+                    $"{legacyOriginBytes} bytes for the legacy Split/LINQ origin-header path.");
             }
 
             Console.WriteLine(
-                $"PASS: proxy parser span traversal reduces allocations " +
-                $"({optimizedBytes / (double)MeasurementIterations:F0} vs " +
-                $"{legacyBytes / (double)MeasurementIterations:F0} bytes/request)");
+                $"PASS: proxy parser/origin span paths reduce allocations " +
+                $"(parse {optimizedParserBytes / (double)MeasurementIterations:F0} vs " +
+                $"{legacyParserBytes / (double)MeasurementIterations:F0}; origin " +
+                $"{optimizedOriginBytes / (double)MeasurementIterations:F0} vs " +
+                $"{legacyOriginBytes / (double)MeasurementIterations:F0} bytes/request)");
             return 0;
         }
         catch (Exception ex)
@@ -42,7 +82,7 @@ internal static class ProxyParserAllocationSelfTests
         }
     }
 
-    private static long MeasureOptimized(byte[] raw)
+    private static long MeasureOptimizedParser(byte[] raw)
     {
         var before = GC.GetAllocatedBytesForCurrentThread();
         for (var i = 0; i < MeasurementIterations; i++)
@@ -53,12 +93,34 @@ internal static class ProxyParserAllocationSelfTests
         return GC.GetAllocatedBytesForCurrentThread() - before;
     }
 
-    private static long MeasureLegacy(byte[] raw)
+    private static long MeasureLegacyParser(byte[] raw)
     {
         var before = GC.GetAllocatedBytesForCurrentThread();
         for (var i = 0; i < MeasurementIterations; i++)
         {
             GC.KeepAlive(LegacySplitParse(raw));
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    private static long MeasureOptimizedOrigin(ProxyServer.ParsedProxyRequest request)
+    {
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < MeasurementIterations; i++)
+        {
+            GC.KeepAlive(request.BuildOriginHeader(OriginPath));
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    private static long MeasureLegacyOrigin(LegacyRequest request)
+    {
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < MeasurementIterations; i++)
+        {
+            GC.KeepAlive(LegacyBuildOriginHeader(request, OriginPath));
         }
 
         return GC.GetAllocatedBytesForCurrentThread() - before;
@@ -113,6 +175,35 @@ internal static class ProxyParserAllocationSelfTests
         }
 
         return new LegacyRequest(requestLine[0], requestLine[1], requestLine[2], headers);
+    }
+
+    // Test-only copy of the old BuildOriginHeader allocation shape.
+    private static byte[] LegacyBuildOriginHeader(LegacyRequest request, string pathAndQuery)
+    {
+        var connectionTokens = request.Headers
+            .Where(header => header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+            .SelectMany(header => header.Value.Split(','))
+            .Select(token => token.Trim())
+            .Where(token => token.Length > 0)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var builder = new StringBuilder();
+        builder.Append(request.Method).Append(' ').Append(pathAndQuery).Append(' ').Append(request.Version).Append("\r\n");
+
+        foreach (var header in request.Headers)
+        {
+            if (header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+                LegacyFixedHopByHopHeaders.Contains(header.Name) ||
+                connectionTokens.Contains(header.Name))
+            {
+                continue;
+            }
+
+            builder.Append(header.Name).Append(": ").Append(header.Value).Append("\r\n");
+        }
+
+        builder.Append("Connection: close\r\n\r\n");
+        return Encoding.Latin1.GetBytes(builder.ToString());
     }
 
     private sealed record LegacyRequest(
