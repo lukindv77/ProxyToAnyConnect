@@ -12,9 +12,9 @@ internal sealed class ProxyServer
         Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n");
 
     private readonly ProxyOptions _options;
-    private readonly L2tpSocketFactory _socketFactory;
+    private readonly IProxyOutboundConnectionFactory _socketFactory;
 
-    public ProxyServer(ProxyOptions options, L2tpSocketFactory socketFactory)
+    public ProxyServer(ProxyOptions options, IProxyOutboundConnectionFactory socketFactory)
     {
         _options = options;
         _socketFactory = socketFactory;
@@ -123,7 +123,7 @@ internal sealed class ProxyServer
         await PumpBidirectionalAsync(
             clientStream,
             upstreamStream,
-            upstream.Context.LifetimeToken,
+            upstream.LifetimeToken,
             cancellationToken);
     }
 
@@ -150,7 +150,7 @@ internal sealed class ProxyServer
         await PumpBidirectionalAsync(
             clientStream,
             upstreamStream,
-            upstream.Context.LifetimeToken,
+            upstream.LifetimeToken,
             cancellationToken);
     }
 
