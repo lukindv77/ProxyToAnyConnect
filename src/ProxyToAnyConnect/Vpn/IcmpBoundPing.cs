@@ -44,11 +44,12 @@ internal static class IcmpBoundPing
         }
 
         nint replyBuffer = 0;
+        EventWaitHandle? completionEvent = null;
         Interlocked.Increment(ref _activeNativeOperations);
         try
         {
             replyBuffer = Marshal.AllocHGlobal(checked((int)ReplyBufferSize));
-            using var completionEvent = new EventWaitHandle(
+            completionEvent = new EventWaitHandle(
                 initialState: false,
                 mode: EventResetMode.AutoReset);
 
@@ -113,15 +114,18 @@ internal static class IcmpBoundPing
         }
         finally
         {
+            // Keep every object that Windows can still touch alive through the ICMP
+            // handle close. On current Windows IcmpCloseHandle joins outstanding async
+            // requests; ordering handle -> event -> buffer therefore also makes the
+            // defensive completion-guard path memory-safe if an event was not signaled.
+            _ = IcmpCloseHandle(handle);
+            completionEvent?.Dispose();
+
             if (replyBuffer != 0)
             {
                 Marshal.FreeHGlobal(replyBuffer);
             }
 
-            // Windows owns the asynchronous request through this ICMP handle. Closing
-            // it only after completion/guarded timeout keeps the reply buffer lifetime
-            // valid and provides a final bounded join before ownership is released.
-            _ = IcmpCloseHandle(handle);
             Interlocked.Decrement(ref _activeNativeOperations);
         }
     }
