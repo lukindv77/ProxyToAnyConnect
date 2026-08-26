@@ -10,6 +10,7 @@ internal sealed class DailyJsonlLogStore : IDisposable
     private readonly int _retentionDays;
 
     private string? _currentFilePath;
+    private DateOnly? _lastRetentionCleanupDate;
     private int _disposed;
 
     public DailyJsonlLogStore(string rootDirectory, int retentionDays)
@@ -46,6 +47,7 @@ internal sealed class DailyJsonlLogStore : IDisposable
 
         var localNow = (timestamp ?? DateTimeOffset.Now).ToLocalTime();
         var localDate = DateOnly.FromDateTime(localNow.DateTime);
+        var scheduleRetentionCleanup = false;
 
         lock (_gate)
         {
@@ -53,9 +55,9 @@ internal sealed class DailyJsonlLogStore : IDisposable
             var fullPath = Path.Combine(_rootDirectory, relativePath);
             Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
 
-            // Intentionally append one record without reading or rewriting the existing file.
-            // The handle is closed after each record so the current log can be viewed/copied
-            // by normal Windows tools while ProxyToAnyConnect continues running.
+            // Append exactly one JSONL record. The existing file is never read or
+            // rewritten as part of logging. Closing the handle after the append keeps
+            // the daily file freely viewable/copyable by ordinary Windows tools.
             using var stream = new FileStream(
                 fullPath,
                 FileMode.Append,
@@ -72,6 +74,16 @@ internal sealed class DailyJsonlLogStore : IDisposable
             writer.Flush();
 
             _currentFilePath = fullPath;
+            if (_lastRetentionCleanupDate != localDate)
+            {
+                _lastRetentionCleanupDate = localDate;
+                scheduleRetentionCleanup = true;
+            }
+        }
+
+        if (scheduleRetentionCleanup)
+        {
+            _ = CleanupRetentionBestEffortAsync(localDate);
         }
     }
 
@@ -134,6 +146,18 @@ internal sealed class DailyJsonlLogStore : IDisposable
             CultureInfo.InvariantCulture,
             DateTimeStyles.None,
             out date);
+    }
+
+    private async Task CleanupRetentionBestEffortAsync(DateOnly localToday)
+    {
+        try
+        {
+            await Task.Run(() => CleanupRetention(today: localToday));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            System.Diagnostics.Debug.WriteLine($"Log retention cleanup failed: {ex.Message}");
+        }
     }
 
     private static bool IsMonthDirectoryName(string name) =>
