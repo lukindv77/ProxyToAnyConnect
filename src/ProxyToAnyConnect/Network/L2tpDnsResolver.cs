@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Net;
@@ -11,7 +12,7 @@ internal sealed class L2tpDnsResolver
 {
     private static readonly IdnMapping IdnMapping = new();
     private const int MaxCnameDepth = 8;
-    private const int MaxDnsPacketBytes = ushort.MaxValue;
+    private const int UdpReceiveBufferBytes = 4 * 1024;
     private readonly int _timeoutMilliseconds;
 
     public L2tpDnsResolver(int timeoutMilliseconds = 6000)
@@ -119,8 +120,7 @@ internal sealed class L2tpDnsResolver
         var transactionId = (ushort)Random.Shared.Next(1, ushort.MaxValue + 1);
         var query = BuildQuery(host, transactionId);
 
-        var udpResponse = await QueryUdpAsync(query, dnsServer, context, cancellationToken);
-        var parsed = ParseResponse(udpResponse, transactionId);
+        var parsed = await QueryUdpAsync(query, transactionId, dnsServer, context, cancellationToken);
 
         if (parsed.Truncated)
         {
@@ -147,8 +147,9 @@ internal sealed class L2tpDnsResolver
         return [];
     }
 
-    private static async Task<byte[]> QueryUdpAsync(
+    private static async Task<ParsedDnsResponse> QueryUdpAsync(
         byte[] query,
+        ushort transactionId,
         IPAddress dnsServer,
         VpnContext context,
         CancellationToken cancellationToken)
@@ -156,16 +157,32 @@ internal sealed class L2tpDnsResolver
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, context.InterfaceIndex);
         socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
-        await socket.SendToAsync(query, SocketFlags.None, new IPEndPoint(dnsServer, 53), cancellationToken);
+        socket.Connect(new IPEndPoint(dnsServer, 53));
 
-        var buffer = new byte[MaxDnsPacketBytes];
-        var result = await socket.ReceiveFromAsync(
-            buffer,
-            SocketFlags.None,
-            new IPEndPoint(IPAddress.Any, 0),
-            cancellationToken);
+        await socket.SendAsync(query, SocketFlags.None, cancellationToken);
 
-        return buffer.AsSpan(0, result.ReceivedBytes).ToArray();
+        var buffer = ArrayPool<byte>.Shared.Rent(UdpReceiveBufferBytes);
+        try
+        {
+            var received = await socket.ReceiveAsync(
+                buffer.AsMemory(0, UdpReceiveBufferBytes),
+                SocketFlags.None,
+                cancellationToken);
+
+            // Our A query does not advertise EDNS, so a normal DNS server should use TC
+            // rather than return a huge UDP answer. If the entire conservative 4 KiB buffer
+            // is filled, treat it as transport truncation and retry over TCP fail-closed.
+            if (received >= UdpReceiveBufferBytes)
+            {
+                return new ParsedDnsResponse([], null, Truncated: true);
+            }
+
+            return ParseResponse(buffer.AsSpan(0, received), transactionId);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer, clearArray: false);
+        }
     }
 
     private static async Task<byte[]> QueryTcpAsync(
@@ -196,7 +213,7 @@ internal sealed class L2tpDnsResolver
             throw new IOException("DNS-over-TCP response is too short.");
         }
 
-        var response = new byte[responseLength];
+        var response = GC.AllocateUninitializedArray<byte>(responseLength);
         await ReadExactlyAsync(stream, response, cancellationToken);
         return response;
     }
