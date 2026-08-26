@@ -12,6 +12,17 @@ internal sealed class L2tpDnsResolver
     private static readonly IdnMapping IdnMapping = new();
     private const int MaxCnameDepth = 8;
     private const int MaxDnsPacketBytes = ushort.MaxValue;
+    private readonly int _timeoutMilliseconds;
+
+    public L2tpDnsResolver(int timeoutMilliseconds = 6000)
+    {
+        if (timeoutMilliseconds is < 250 or > 60000)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeoutMilliseconds));
+        }
+
+        _timeoutMilliseconds = timeoutMilliseconds;
+    }
 
     public async Task<IReadOnlyList<IPAddress>> ResolveIPv4Async(
         string host,
@@ -57,7 +68,7 @@ internal sealed class L2tpDnsResolver
             $"Unable to resolve '{host}' through the L2TP DNS servers.", lastError);
     }
 
-    private static async Task<IReadOnlyList<IPAddress>> QueryAsync(
+    private async Task<IReadOnlyList<IPAddress>> QueryAsync(
         string host,
         IPAddress dnsServer,
         VpnContext context,
@@ -66,7 +77,7 @@ internal sealed class L2tpDnsResolver
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             context.LifetimeToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(6));
+        timeout.CancelAfter(TimeSpan.FromMilliseconds(_timeoutMilliseconds));
 
         try
         {
@@ -79,10 +90,11 @@ internal sealed class L2tpDnsResolver
                 timeout.Token);
         }
         catch (OperationCanceledException ex)
-            when (!cancellationToken.IsCancellationRequested &&
-                  !context.LifetimeToken.IsCancellationRequested)
+            when (!cancellationToken.IsCancellationRequested && !context.LifetimeToken.IsCancellationRequested)
         {
-            throw new TimeoutException($"DNS query to {dnsServer} timed out.", ex);
+            throw new TimeoutException(
+                $"DNS resolution through L2TP timed out after {_timeoutMilliseconds} ms.",
+                ex);
         }
     }
 
@@ -96,7 +108,7 @@ internal sealed class L2tpDnsResolver
     {
         if (depth > MaxCnameDepth)
         {
-            throw new IOException($"DNS CNAME chain for '{host}' exceeded {MaxCnameDepth} hops.");
+            throw new IOException("DNS CNAME chain exceeded the maximum supported depth.");
         }
 
         if (!visitedNames.Add(host))
@@ -104,8 +116,9 @@ internal sealed class L2tpDnsResolver
             throw new IOException($"DNS CNAME loop detected at '{host}'.");
         }
 
-        var transactionId = (ushort)Random.Shared.Next(1, ushort.MaxValue);
+        var transactionId = (ushort)Random.Shared.Next(1, ushort.MaxValue + 1);
         var query = BuildQuery(host, transactionId);
+
         var udpResponse = await QueryUdpAsync(query, dnsServer, context, cancellationToken);
         var parsed = ParseResponse(udpResponse, transactionId);
 
@@ -113,21 +126,17 @@ internal sealed class L2tpDnsResolver
         {
             var tcpResponse = await QueryTcpAsync(query, dnsServer, context, cancellationToken);
             parsed = ParseResponse(tcpResponse, transactionId);
-            if (parsed.Truncated)
-            {
-                throw new IOException("DNS response remained truncated after TCP fallback.");
-            }
         }
 
         if (parsed.Addresses.Count > 0)
         {
-            return parsed.Addresses.Distinct().ToArray();
+            return parsed.Addresses;
         }
 
         if (parsed.CanonicalName is not null)
         {
             return await ResolveCoreAsync(
-                parsed.CanonicalName,
+                NormalizeDnsName(parsed.CanonicalName),
                 dnsServer,
                 context,
                 visitedNames,
@@ -144,17 +153,19 @@ internal sealed class L2tpDnsResolver
         VpnContext context,
         CancellationToken cancellationToken)
     {
-        using var socket = CreateBoundSocket(
-            SocketType.Dgram,
-            ProtocolType.Udp,
-            context);
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, context.InterfaceIndex);
+        socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
+        await socket.SendToAsync(query, SocketFlags.None, new IPEndPoint(dnsServer, 53), cancellationToken);
 
-        await socket.ConnectAsync(new IPEndPoint(dnsServer, 53), cancellationToken);
-        await socket.SendAsync(query, SocketFlags.None, cancellationToken);
+        var buffer = new byte[MaxDnsPacketBytes];
+        var result = await socket.ReceiveFromAsync(
+            buffer,
+            SocketFlags.None,
+            new IPEndPoint(IPAddress.Any, 0),
+            cancellationToken);
 
-        var response = new byte[4096];
-        var received = await socket.ReceiveAsync(response, SocketFlags.None, cancellationToken);
-        return response.AsSpan(0, received).ToArray();
+        return buffer.AsSpan(0, result.ReceivedBytes).ToArray();
     }
 
     private static async Task<byte[]> QueryTcpAsync(
@@ -163,27 +174,26 @@ internal sealed class L2tpDnsResolver
         VpnContext context,
         CancellationToken cancellationToken)
     {
-        using var socket = CreateBoundSocket(
-            SocketType.Stream,
-            ProtocolType.Tcp,
-            context);
-
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+        {
+            NoDelay = true
+        };
+        WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, context.InterfaceIndex);
+        socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
         await socket.ConnectAsync(new IPEndPoint(dnsServer, 53), cancellationToken);
+
         await using var stream = new NetworkStream(socket, ownsSocket: false);
-
-        var framedQuery = new byte[query.Length + 2];
-        BinaryPrimitives.WriteUInt16BigEndian(framedQuery.AsSpan(0, 2), checked((ushort)query.Length));
-        query.CopyTo(framedQuery.AsSpan(2));
-
-        await stream.WriteAsync(framedQuery, cancellationToken);
+        var prefix = new byte[2];
+        BinaryPrimitives.WriteUInt16BigEndian(prefix, checked((ushort)query.Length));
+        await stream.WriteAsync(prefix, cancellationToken);
+        await stream.WriteAsync(query, cancellationToken);
         await stream.FlushAsync(cancellationToken);
 
-        var lengthPrefix = new byte[2];
-        await ReadExactlyAsync(stream, lengthPrefix, cancellationToken);
-        var responseLength = BinaryPrimitives.ReadUInt16BigEndian(lengthPrefix);
-        if (responseLength < 12 || responseLength > MaxDnsPacketBytes)
+        await ReadExactlyAsync(stream, prefix, cancellationToken);
+        var responseLength = BinaryPrimitives.ReadUInt16BigEndian(prefix);
+        if (responseLength < 12)
         {
-            throw new IOException($"Invalid DNS-over-TCP response length {responseLength}.");
+            throw new IOException("DNS-over-TCP response is too short.");
         }
 
         var response = new byte[responseLength];
@@ -191,38 +201,15 @@ internal sealed class L2tpDnsResolver
         return response;
     }
 
-    private static Socket CreateBoundSocket(
-        SocketType socketType,
-        ProtocolType protocolType,
-        VpnContext context)
-    {
-        var socket = new Socket(AddressFamily.InterNetwork, socketType, protocolType);
-
-        try
-        {
-            socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
-            WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, context.InterfaceIndex);
-            return socket;
-        }
-        catch
-        {
-            socket.Dispose();
-            throw;
-        }
-    }
-
-    private static async Task ReadExactlyAsync(
-        Stream stream,
-        Memory<byte> buffer,
-        CancellationToken cancellationToken)
+    private static async Task ReadExactlyAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
     {
         var offset = 0;
         while (offset < buffer.Length)
         {
-            var read = await stream.ReadAsync(buffer[offset..], cancellationToken);
+            var read = await stream.ReadAsync(buffer.AsMemory(offset), cancellationToken);
             if (read == 0)
             {
-                throw new IOException("DNS-over-TCP connection closed before the complete response was received.");
+                throw new IOException("DNS-over-TCP stream ended before the complete response was received.");
             }
 
             offset += read;
@@ -233,70 +220,69 @@ internal sealed class L2tpDnsResolver
     {
         using var stream = new MemoryStream();
         Span<byte> header = stackalloc byte[12];
-        BinaryPrimitives.WriteUInt16BigEndian(header[0..2], transactionId);
-        BinaryPrimitives.WriteUInt16BigEndian(header[2..4], 0x0100); // Recursion desired.
-        BinaryPrimitives.WriteUInt16BigEndian(header[4..6], 1); // QDCOUNT.
+        BinaryPrimitives.WriteUInt16BigEndian(header, transactionId);
+        BinaryPrimitives.WriteUInt16BigEndian(header[2..], 0x0100);
+        BinaryPrimitives.WriteUInt16BigEndian(header[4..], 1);
         stream.Write(header);
 
         foreach (var label in host.Split('.'))
         {
-            var labelBytes = Encoding.ASCII.GetBytes(label);
-            if (labelBytes.Length is 0 or > 63)
+            var bytes = Encoding.ASCII.GetBytes(label);
+            if (bytes.Length is 0 or > 63)
             {
                 throw new InvalidOperationException($"Invalid DNS label in '{host}'.");
             }
 
-            stream.WriteByte((byte)labelBytes.Length);
-            stream.Write(labelBytes);
+            stream.WriteByte((byte)bytes.Length);
+            stream.Write(bytes);
         }
 
         stream.WriteByte(0);
-        Span<byte> question = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt16BigEndian(question[0..2], 1); // A.
-        BinaryPrimitives.WriteUInt16BigEndian(question[2..4], 1); // IN.
-        stream.Write(question);
+        Span<byte> questionTail = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt16BigEndian(questionTail, 1);
+        BinaryPrimitives.WriteUInt16BigEndian(questionTail[2..], 1);
+        stream.Write(questionTail);
         return stream.ToArray();
     }
 
-    internal static DnsResponseParseResult ParseResponse(
-        ReadOnlySpan<byte> response,
-        ushort transactionId)
+    internal static ParsedDnsResponse ParseResponse(ReadOnlySpan<byte> response, ushort transactionId)
     {
         if (response.Length < 12)
         {
             throw new IOException("DNS response is too short.");
         }
 
-        if (BinaryPrimitives.ReadUInt16BigEndian(response[0..2]) != transactionId)
+        if (BinaryPrimitives.ReadUInt16BigEndian(response) != transactionId)
         {
-            throw new IOException("DNS transaction ID mismatch.");
+            throw new IOException("DNS response transaction ID does not match the query.");
         }
 
-        var flags = BinaryPrimitives.ReadUInt16BigEndian(response[2..4]);
+        var flags = BinaryPrimitives.ReadUInt16BigEndian(response[2..]);
         if ((flags & 0x8000) == 0)
         {
             throw new IOException("DNS packet is not a response.");
         }
 
-        if ((flags & 0x0200) != 0)
-        {
-            return new DnsResponseParseResult([], null, Truncated: true);
-        }
-
+        var truncated = (flags & 0x0200) != 0;
         var responseCode = flags & 0x000F;
         if (responseCode != 0)
         {
             throw new IOException($"DNS server returned response code {responseCode}.");
         }
 
-        var questionCount = BinaryPrimitives.ReadUInt16BigEndian(response[4..6]);
-        var answerCount = BinaryPrimitives.ReadUInt16BigEndian(response[6..8]);
+        if (truncated)
+        {
+            return new ParsedDnsResponse([], null, Truncated: true);
+        }
+
+        var questionCount = BinaryPrimitives.ReadUInt16BigEndian(response[4..]);
+        var answerCount = BinaryPrimitives.ReadUInt16BigEndian(response[6..]);
         var offset = 12;
 
         for (var i = 0; i < questionCount; i++)
         {
-            _ = ReadName(response, offset, out offset);
-            EnsureAvailable(response, offset, 4);
+            _ = ReadName(response, ref offset);
+            EnsureRemaining(response, offset, 4);
             offset += 4;
         }
 
@@ -305,58 +291,45 @@ internal sealed class L2tpDnsResolver
 
         for (var i = 0; i < answerCount; i++)
         {
-            _ = ReadName(response, offset, out offset);
-            EnsureAvailable(response, offset, 10);
-
-            var type = BinaryPrimitives.ReadUInt16BigEndian(response.Slice(offset, 2));
-            var recordClass = BinaryPrimitives.ReadUInt16BigEndian(response.Slice(offset + 2, 2));
-            var dataLength = BinaryPrimitives.ReadUInt16BigEndian(response.Slice(offset + 8, 2));
+            _ = ReadName(response, ref offset);
+            EnsureRemaining(response, offset, 10);
+            var type = BinaryPrimitives.ReadUInt16BigEndian(response[offset..]);
+            var dataLength = BinaryPrimitives.ReadUInt16BigEndian(response[(offset + 8)..]);
             offset += 10;
+            EnsureRemaining(response, offset, dataLength);
 
-            EnsureAvailable(response, offset, dataLength);
-            if (recordClass == 1)
+            if (type == 1 && dataLength == 4)
             {
-                if (type == 1 && dataLength == 4)
-                {
-                    addresses.Add(new IPAddress(response.Slice(offset, 4).ToArray()));
-                }
-                else if (type == 5)
-                {
-                    var cname = ReadName(response, offset, out _);
-                    if (!string.IsNullOrWhiteSpace(cname))
-                    {
-                        canonicalName = NormalizeDnsName(cname);
-                    }
-                }
+                addresses.Add(new IPAddress(response.Slice(offset, 4)));
+            }
+            else if (type == 5)
+            {
+                var cnameOffset = offset;
+                canonicalName = ReadName(response, ref cnameOffset);
             }
 
             offset += dataLength;
         }
 
-        return new DnsResponseParseResult(addresses, canonicalName, Truncated: false);
+        return new ParsedDnsResponse(addresses, canonicalName, Truncated: false);
     }
 
-    private static string ReadName(
-        ReadOnlySpan<byte> packet,
-        int offset,
-        out int nextOffset)
+    private static string ReadName(ReadOnlySpan<byte> packet, ref int offset)
     {
         var labels = new List<string>();
-        var visitedPointers = new HashSet<int>();
         var current = offset;
         var jumped = false;
-        nextOffset = offset;
+        var jumps = 0;
 
         while (true)
         {
-            EnsureAvailable(packet, current, 1);
-            var length = packet[current];
-
+            EnsureRemaining(packet, current, 1);
+            var length = packet[current++];
             if (length == 0)
             {
                 if (!jumped)
                 {
-                    nextOffset = current + 1;
+                    offset = current;
                 }
 
                 return string.Join('.', labels);
@@ -364,21 +337,16 @@ internal sealed class L2tpDnsResolver
 
             if ((length & 0xC0) == 0xC0)
             {
-                EnsureAvailable(packet, current, 2);
-                var pointer = ((length & 0x3F) << 8) | packet[current + 1];
-                if (pointer >= packet.Length)
+                EnsureRemaining(packet, current, 1);
+                var pointer = ((length & 0x3F) << 8) | packet[current++];
+                if (pointer >= packet.Length || ++jumps > 32)
                 {
-                    throw new IOException("DNS compression pointer is outside the packet.");
-                }
-
-                if (!visitedPointers.Add(pointer))
-                {
-                    throw new IOException("DNS compression pointer loop detected.");
+                    throw new IOException("Invalid DNS name compression pointer.");
                 }
 
                 if (!jumped)
                 {
-                    nextOffset = current + 2;
+                    offset = current;
                     jumped = true;
                 }
 
@@ -386,36 +354,34 @@ internal sealed class L2tpDnsResolver
                 continue;
             }
 
-            if ((length & 0xC0) != 0)
+            if ((length & 0xC0) != 0 || length > 63)
             {
-                throw new IOException("Invalid DNS name encoding.");
+                throw new IOException("Invalid DNS label length.");
             }
 
-            current++;
-            EnsureAvailable(packet, current, length);
+            EnsureRemaining(packet, current, length);
             labels.Add(Encoding.ASCII.GetString(packet.Slice(current, length)));
             current += length;
-
             if (!jumped)
             {
-                nextOffset = current;
+                offset = current;
             }
         }
     }
 
-    private static string NormalizeDnsName(string name) =>
-        name.Trim().TrimEnd('.');
-
-    private static void EnsureAvailable(ReadOnlySpan<byte> packet, int offset, int length)
+    private static void EnsureRemaining(ReadOnlySpan<byte> packet, int offset, int required)
     {
-        if (offset < 0 || length < 0 || offset > packet.Length - length)
+        if (offset < 0 || required < 0 || offset > packet.Length - required)
         {
-            throw new IOException("Truncated DNS response.");
+            throw new IOException("DNS response is truncated or malformed.");
         }
     }
+
+    private static string NormalizeDnsName(string host) =>
+        IdnMapping.GetAscii(host.Trim().TrimEnd('.')).ToLowerInvariant();
 }
 
-internal sealed record DnsResponseParseResult(
+internal sealed record ParsedDnsResponse(
     IReadOnlyList<IPAddress> Addresses,
     string? CanonicalName,
     bool Truncated);
