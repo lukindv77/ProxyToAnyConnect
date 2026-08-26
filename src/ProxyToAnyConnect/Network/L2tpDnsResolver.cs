@@ -351,7 +351,7 @@ internal sealed class L2tpDnsResolver
 
         for (var i = 0; i < questionCount; i++)
         {
-            _ = ReadName(response, ref offset);
+            SkipName(response, ref offset);
             EnsureRemaining(response, offset, 4);
             offset += 4;
         }
@@ -362,7 +362,7 @@ internal sealed class L2tpDnsResolver
 
         for (var i = 0; i < answerCount; i++)
         {
-            _ = ReadName(response, ref offset);
+            SkipName(response, ref offset);
             EnsureRemaining(response, offset, 10);
             var type = BinaryPrimitives.ReadUInt16BigEndian(response[offset..]);
             var ttlSeconds = BinaryPrimitives.ReadUInt32BigEndian(response[(offset + 4)..]);
@@ -394,6 +394,59 @@ internal sealed class L2tpDnsResolver
 
     private static uint MinTtl(uint? current, uint candidate) =>
         current is null ? candidate : Math.Min(current.Value, candidate);
+
+    internal static void SkipName(ReadOnlySpan<byte> packet, ref int offset)
+    {
+        var current = offset;
+        var jumped = false;
+        var jumps = 0;
+
+        while (true)
+        {
+            EnsureRemaining(packet, current, 1);
+            var length = packet[current++];
+            if (length == 0)
+            {
+                if (!jumped)
+                {
+                    offset = current;
+                }
+
+                return;
+            }
+
+            if ((length & 0xC0) == 0xC0)
+            {
+                EnsureRemaining(packet, current, 1);
+                var pointer = ((length & 0x3F) << 8) | packet[current++];
+                if (pointer >= packet.Length || ++jumps > 32)
+                {
+                    throw new IOException("Invalid DNS name compression pointer.");
+                }
+
+                if (!jumped)
+                {
+                    offset = current;
+                    jumped = true;
+                }
+
+                current = pointer;
+                continue;
+            }
+
+            if ((length & 0xC0) != 0 || length > 63)
+            {
+                throw new IOException("Invalid DNS label length.");
+            }
+
+            EnsureRemaining(packet, current, length);
+            current += length;
+            if (!jumped)
+            {
+                offset = current;
+            }
+        }
+    }
 
     private static string ReadName(ReadOnlySpan<byte> packet, ref int offset)
     {
