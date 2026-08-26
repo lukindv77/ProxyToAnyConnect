@@ -10,6 +10,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
     private readonly Dictionary<string, VpnLeaseManager> _vpnById;
     private readonly Dictionary<string, ProxyInstanceRuntime> _proxyById;
     private readonly SemaphoreSlim _reconfigureGate = new(1, 1);
+    private readonly object _collectionGate = new();
     private AppOptions _options;
     private int _disposed;
 
@@ -34,7 +35,13 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        foreach (var proxy in _proxyById.Values.Where(item => item.Options.Enabled))
+        ProxyInstanceRuntime[] proxies;
+        lock (_collectionGate)
+        {
+            proxies = _proxyById.Values.Where(item => item.Options.Enabled).ToArray();
+        }
+
+        foreach (var proxy in proxies)
         {
             cancellationToken.ThrowIfCancellationRequested();
             await TryStartProxyAsync(proxy, cancellationToken);
@@ -91,55 +98,88 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 }
             }
 
-            var previousStates = affectedProxyIds
-                .Where(_proxyById.ContainsKey)
-                .ToDictionary(
-                    id => id,
-                    id => _proxyById[id].Snapshot().State,
-                    StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, ProxyInstanceState> previousStates;
+            ProxyInstanceRuntime[] proxiesToDispose;
+            lock (_collectionGate)
+            {
+                previousStates = affectedProxyIds
+                    .Where(_proxyById.ContainsKey)
+                    .ToDictionary(
+                        id => id,
+                        id => _proxyById[id].Snapshot().State,
+                        StringComparer.OrdinalIgnoreCase);
+
+                proxiesToDispose = affectedProxyIds
+                    .Where(_proxyById.ContainsKey)
+                    .Select(id => _proxyById[id])
+                    .ToArray();
+
+                foreach (var proxyId in affectedProxyIds)
+                {
+                    _proxyById.Remove(proxyId);
+                }
+            }
 
             // Stop only proxies whose own settings changed or whose L2TP runtime must be replaced.
-            foreach (var proxyId in affectedProxyIds.Where(_proxyById.ContainsKey).ToArray())
+            foreach (var runtime in proxiesToDispose)
             {
-                var runtime = _proxyById[proxyId];
                 await runtime.DisposeAsync();
-                _proxyById.Remove(proxyId);
             }
 
-            // Changed/removed L2TP managers are safe to dispose after all dependent old proxy leases are released.
-            foreach (var vpnId in changedVpnIds.Where(_vpnById.ContainsKey).ToArray())
+            VpnLeaseManager[] vpnsToDispose;
+            lock (_collectionGate)
             {
-                var runtime = _vpnById[vpnId];
-                await runtime.DisposeAsync();
-                _vpnById.Remove(vpnId);
-            }
+                vpnsToDispose = changedVpnIds
+                    .Where(_vpnById.ContainsKey)
+                    .Select(id => _vpnById[id])
+                    .ToArray();
 
-            foreach (var vpnId in changedVpnIds)
-            {
-                if (newVpnOptions.TryGetValue(vpnId, out var vpnOptions))
+                foreach (var vpnId in changedVpnIds)
                 {
-                    _vpnById[vpnId] = new VpnLeaseManager(vpnOptions);
+                    _vpnById.Remove(vpnId);
                 }
             }
 
-            foreach (var proxyId in affectedProxyIds)
+            // Changed/removed L2TP managers are disposed after all dependent old proxy leases are released.
+            foreach (var runtime in vpnsToDispose)
             {
-                if (newProxyOptions.TryGetValue(proxyId, out var proxyOptions))
-                {
-                    _proxyById[proxyId] = new ProxyInstanceRuntime(
-                        proxyOptions,
-                        _vpnById[proxyOptions.VpnConnectionId]);
-                }
+                await runtime.DisposeAsync();
             }
 
-            _options = newOptions;
+            lock (_collectionGate)
+            {
+                foreach (var vpnId in changedVpnIds)
+                {
+                    if (newVpnOptions.TryGetValue(vpnId, out var vpnOptions))
+                    {
+                        _vpnById[vpnId] = new VpnLeaseManager(vpnOptions);
+                    }
+                }
+
+                foreach (var proxyId in affectedProxyIds)
+                {
+                    if (newProxyOptions.TryGetValue(proxyId, out var proxyOptions))
+                    {
+                        _proxyById[proxyId] = new ProxyInstanceRuntime(
+                            proxyOptions,
+                            _vpnById[proxyOptions.VpnConnectionId]);
+                    }
+                }
+
+                _options = newOptions;
+            }
 
             // Preserve runtime Pause/Running state for existing proxies. A newly enabled proxy,
             // or a proxy that was in Error and whose configuration changed, gets another start attempt.
             foreach (var proxyId in affectedProxyIds)
             {
-                if (!_proxyById.TryGetValue(proxyId, out var runtime) ||
-                    !newProxyOptions.TryGetValue(proxyId, out var newProxy))
+                ProxyInstanceRuntime? runtime;
+                lock (_collectionGate)
+                {
+                    _proxyById.TryGetValue(proxyId, out runtime);
+                }
+
+                if (runtime is null || !newProxyOptions.TryGetValue(proxyId, out var newProxy))
                 {
                     continue;
                 }
@@ -164,6 +204,14 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 }
             }
 
+            int totalProxyCount;
+            int affectedExistingProxyCount;
+            lock (_collectionGate)
+            {
+                totalProxyCount = _proxyById.Count;
+                affectedExistingProxyCount = affectedProxyIds.Count(_proxyById.ContainsKey);
+            }
+
             AppLog.Info(
                 "runtime.reconfigured.selective",
                 "Runtime configuration was applied with selective proxy/L2TP restart.",
@@ -171,7 +219,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 {
                     ChangedVpnCount = changedVpnIds.Count,
                     AffectedProxyCount = affectedProxyIds.Count,
-                    UnaffectedProxyCount = _proxyById.Count - affectedProxyIds.Count(id => _proxyById.ContainsKey(id))
+                    UnaffectedProxyCount = Math.Max(0, totalProxyCount - affectedExistingProxyCount)
                 });
         }
         finally
@@ -180,14 +228,29 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         }
     }
 
-    public IReadOnlyList<ProxyRuntimeSnapshot> GetProxySnapshots() =>
-        _proxyById.Values
+    public IReadOnlyList<ProxyRuntimeSnapshot> GetProxySnapshots()
+    {
+        ProxyInstanceRuntime[] proxies;
+        lock (_collectionGate)
+        {
+            proxies = _proxyById.Values.ToArray();
+        }
+
+        return proxies
             .Select(proxy => proxy.Snapshot())
             .OrderBy(snapshot => snapshot.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToArray();
+    }
 
-    public IReadOnlyList<L2tpRuntimeSnapshot> GetL2tpSnapshots() =>
-        _vpnById.Values
+    public IReadOnlyList<L2tpRuntimeSnapshot> GetL2tpSnapshots()
+    {
+        VpnLeaseManager[] vpns;
+        lock (_collectionGate)
+        {
+            vpns = _vpnById.Values.ToArray();
+        }
+
+        return vpns
             .Select(vpn =>
             {
                 var manager = vpn.ConnectionManager;
@@ -209,16 +272,20 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
             })
             .OrderBy(snapshot => snapshot.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToArray();
+    }
 
     private ProxyInstanceRuntime GetProxy(string proxyId)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        if (!_proxyById.TryGetValue(proxyId, out var proxy))
+        lock (_collectionGate)
         {
-            throw new KeyNotFoundException($"Proxy '{proxyId}' was not found.");
-        }
+            if (!_proxyById.TryGetValue(proxyId, out var proxy))
+            {
+                throw new KeyNotFoundException($"Proxy '{proxyId}' was not found.");
+            }
 
-        return proxy;
+            return proxy;
+        }
     }
 
     private static async Task TryStartProxyAsync(
@@ -251,17 +318,25 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         await _reconfigureGate.WaitAsync();
         try
         {
-            foreach (var proxy in _proxyById.Values.ToArray())
+            ProxyInstanceRuntime[] proxies;
+            VpnLeaseManager[] vpns;
+            lock (_collectionGate)
+            {
+                proxies = _proxyById.Values.ToArray();
+                vpns = _vpnById.Values.ToArray();
+                _proxyById.Clear();
+                _vpnById.Clear();
+            }
+
+            foreach (var proxy in proxies)
             {
                 await proxy.DisposeAsync();
             }
-            _proxyById.Clear();
 
-            foreach (var vpn in _vpnById.Values.ToArray())
+            foreach (var vpn in vpns)
             {
                 await vpn.DisposeAsync();
             }
-            _vpnById.Clear();
         }
         finally
         {
