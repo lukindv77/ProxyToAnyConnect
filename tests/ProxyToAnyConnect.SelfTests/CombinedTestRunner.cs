@@ -25,6 +25,12 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        var routeFailures = await NativeRouteSelfTests.RunAsync();
+        if (routeFailures != 0)
+        {
+            return 1;
+        }
+
         Console.WriteLine("All extended fail-closed self-tests passed.");
         return 0;
     }
