@@ -350,6 +350,7 @@ internal sealed class ProxyServer
         var capacity = Math.Min(InitialHeaderBufferSize, maxHeaderBytes);
         var buffer = pool.Rent(capacity);
         var length = 0;
+        var searchStart = 0;
 
         try
         {
@@ -380,9 +381,13 @@ internal sealed class ProxyServer
 
                 length += read;
                 var data = buffer.AsSpan(0, length);
-                var headerEnd = FindHeaderEnd(data);
+                var headerEnd = FindHeaderEnd(data, searchStart);
                 if (headerEnd < 0)
                 {
+                    // A newly completed CRLFCRLF delimiter can start at most three
+                    // bytes before the previous end. Everything before that point
+                    // has already been proven not to contain the header terminator.
+                    searchStart = Math.Max(0, length - 3);
                     continue;
                 }
 
@@ -411,20 +416,15 @@ internal sealed class ProxyServer
         }
     }
 
-    private static int FindHeaderEnd(ReadOnlySpan<byte> data)
+    internal static int FindHeaderEnd(ReadOnlySpan<byte> data, int searchStart = 0)
     {
-        for (var i = 0; i <= data.Length - 4; i++)
+        if ((uint)searchStart > (uint)data.Length)
         {
-            if (data[i] == (byte)'\r' &&
-                data[i + 1] == (byte)'\n' &&
-                data[i + 2] == (byte)'\r' &&
-                data[i + 3] == (byte)'\n')
-            {
-                return i;
-            }
+            throw new ArgumentOutOfRangeException(nameof(searchStart));
         }
 
-        return -1;
+        var relativeIndex = data[searchStart..].IndexOf("\r\n\r\n"u8);
+        return relativeIndex < 0 ? -1 : searchStart + relativeIndex;
     }
 
     internal static (string Host, int Port) ParseAuthority(string authority, int defaultPort)
