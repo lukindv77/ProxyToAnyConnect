@@ -18,6 +18,8 @@ This document is the current source of truth for product behavior. Later impleme
 
 Proxy data-path performance and efficient memory use across the entire application are first-class architectural requirements, equal in importance to fail-closed correctness.
 
+**Memory optimization must not increase proxy processing/forwarding latency, latency jitter, or reduce sustained throughput.** Reducing process memory, retained objects, allocation rate, cache size or buffer size is not an accepted optimization if the change makes the proxy data path slower.
+
 The implementation must be designed for:
 
 - minimum added latency between accepting an inbound proxy connection and forwarding bytes to the selected L2TP-bound outbound socket;
@@ -28,17 +30,23 @@ The implementation must be designed for:
 - no full-request/full-response buffering for tunneled traffic;
 - backpressure through asynchronous socket/stream reads and writes rather than unbounded application queues;
 - no logging, GUI refresh, metrics aggregation, DNS maintenance or keepalive work that synchronously blocks the proxy byte-transfer hot path;
-- pooled/reused buffers where they reduce allocation/GC pressure without causing excessive pool retention or an unnecessarily large process working set;
+- pooled/reused buffers where they reduce allocation/GC pressure without causing excessive pool retention, contention or an unnecessarily large process working set;
 - avoiding unnecessary byte-array/string copies during request parsing, tunnel setup, metrics snapshots and GUI refresh;
 - low-cost atomic counters for runtime RX/TX metrics rather than per-packet/per-buffer object allocation;
 - bounded caches/collections and explicit cleanup of temporary/runtime state when proxy or L2TP instances stop;
-- no periodic global GC forcing or other latency-spiking memory management techniques.
+- no periodic global GC forcing, working-set trimming or other latency-spiking memory management techniques;
+- no global locks, synchronous waits, extra serialization, extra copies or cleanup-oriented coordination added to the steady-state byte-transfer hot path solely to reduce memory;
+- transfer-buffer sizing chosen primarily for low-latency/high-throughput forwarding under a bounded memory budget; buffers must not be made smaller merely to reduce working set when this increases socket/system-call frequency or degrades throughput.
 
-Optimizations must balance latency, throughput and total process memory. Reducing allocations is not considered an improvement if it causes unreasonable retained memory, and reducing memory is not considered an improvement if it materially increases proxy latency without a justified tradeoff.
+Memory optimization must use bounded ownership, deterministic teardown, bounded caches/collections and removal of stale references rather than adding work to active transfer loops.
+
+When memory footprint and data-path performance conflict, prefer the design with bounded/predictable memory and the lower-latency data path rather than the smallest possible working set.
+
+A memory-only optimization is rejected if repeatable before/after benchmarks under the same workload show increased request/connection processing latency, increased latency jitter/tail latency, or reduced sustained CONNECT throughput beyond normal measurement noise. Any intentional exception requires an explicit change to this requirements document; it must not be accepted implicitly as an implementation tradeoff.
 
 Optimizations must not weaken fail-closed routing, VPN verification, source/interface binding, cancellation on L2TP loss or security invariants.
 
-Performance-sensitive changes should be covered by repeatable local/CI micro or integration tests where practical, including allocation-sensitive and process-memory-oriented checks.
+Performance-sensitive changes should be covered by repeatable local/CI micro or integration tests where practical, including allocation-sensitive and process-memory-oriented checks. Where practical, latency checks should include p50/p95/p99 in addition to averages so memory changes cannot hide increased tail latency.
 
 ## Multi-proxy model
 
