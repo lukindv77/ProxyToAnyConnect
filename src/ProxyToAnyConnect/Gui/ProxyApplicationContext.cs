@@ -19,10 +19,13 @@ internal sealed class ProxyApplicationContext : ApplicationContext
 
         var trayMenu = new ContextMenuStrip();
         var openItem = new ToolStripMenuItem("Открыть");
+        var memoryItem = new ToolStripMenuItem("Состояние памяти...");
         var exitItem = new ToolStripMenuItem("Выйти");
         openItem.Click += (_, _) => _mainForm.ShowFromTray();
+        memoryItem.Click += (_, _) => ShowMemoryHealth();
         exitItem.Click += async (_, _) => await ExitApplicationAsync();
         trayMenu.Items.Add(openItem);
+        trayMenu.Items.Add(memoryItem);
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add(exitItem);
 
@@ -58,6 +61,51 @@ internal sealed class ProxyApplicationContext : ApplicationContext
                 AppLog.Error("runtime.start.failed", "Runtime startup failed.", ex);
             }
         });
+    }
+
+    private static string FormatBytes(long value)
+    {
+        string[] units = ["B", "KiB", "MiB", "GiB", "TiB"];
+        var unit = 0;
+        var number = Math.Max(0, value);
+        var display = (double)number;
+        while (display >= 1024 && unit < units.Length - 1)
+        {
+            display /= 1024;
+            unit++;
+        }
+
+        return unit == 0 ? $"{number} {units[unit]}" : $"{display:F2} {units[unit]}";
+    }
+
+    private void ShowMemoryHealth()
+    {
+        ProcessMemorySnapshot snapshot;
+        try
+        {
+            snapshot = ProcessMemoryHealthMonitor.Capture();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Не удалось получить состояние памяти:\n{ex.Message}",
+                "ProxyToAnyConnect — память",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        MessageBox.Show(
+            $"Managed heap: {FormatBytes(snapshot.ManagedHeapBytes)}\n" +
+            $"Working set: {FormatBytes(snapshot.WorkingSetBytes)}\n" +
+            $"Private bytes: {FormatBytes(snapshot.PrivateBytes)}\n" +
+            $"Allocated since start: {FormatBytes(snapshot.TotalAllocatedBytes)}\n\n" +
+            $"GC Gen0 / Gen1 / Gen2: {snapshot.Gen0Collections} / {snapshot.Gen1Collections} / {snapshot.Gen2Collections}\n" +
+            $"Handles: {snapshot.HandleCount}\n" +
+            $"Threads: {snapshot.ThreadCount}",
+            "ProxyToAnyConnect — состояние памяти",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information);
     }
 
     private async Task ExitApplicationAsync()
