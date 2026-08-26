@@ -57,16 +57,18 @@ internal static class LoggingAndMetricsSelfTests
         var root = CreateTempDirectory();
         try
         {
+            string path;
             using (var store = new DailyJsonlLogStore(root, 30))
             {
                 var now = DateTimeOffset.Now;
                 store.AppendLine("one", now);
                 store.AppendLine("two", now);
-                var path = store.CurrentFilePath ?? throw new InvalidOperationException("No current log file.");
+                path = store.CurrentFilePath ?? throw new InvalidOperationException("No current log file.");
                 Assert(File.Exists(path), "Daily log file was not created.");
-                var lines = File.ReadAllLines(path);
-                Assert(lines.SequenceEqual(["one", "two"]), "Daily log file was not append-only.");
             }
+
+            var lines = File.ReadAllLines(path);
+            Assert(lines.SequenceEqual(["one", "two"]), "Daily log file was not append-only.");
         }
         finally
         {
