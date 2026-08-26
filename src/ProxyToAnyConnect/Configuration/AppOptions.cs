@@ -131,14 +131,19 @@ internal sealed class AppOptions
             }
         }
 
+        // Compare the actual IPv4 endpoint rather than the user-provided text.
+        // IPAddress accepts legacy equivalent IPv4 forms (for example 127.1 ==
+        // 127.0.0.1), and those must never bypass the listener collision guard.
         var duplicateEndpoint = Proxies
             .Where(proxy => proxy.Enabled)
-            .GroupBy(proxy => $"{proxy.ListenAddress}:{proxy.ListenPort}", StringComparer.OrdinalIgnoreCase)
+            .GroupBy(proxy =>
+                (Address: IPAddress.Parse(proxy.ListenAddress), Port: proxy.ListenPort))
             .FirstOrDefault(group => group.Count() > 1);
         if (duplicateEndpoint is not null)
         {
             throw new InvalidOperationException(
-                $"Multiple enabled proxies use the same listener endpoint {duplicateEndpoint.Key}.");
+                $"Multiple enabled proxies use the same listener endpoint " +
+                $"{duplicateEndpoint.Key.Address}:{duplicateEndpoint.Key.Port}.");
         }
 
         if (!string.IsNullOrWhiteSpace(Logging.Directory) &&
