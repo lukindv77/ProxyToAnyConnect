@@ -14,6 +14,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate PowerShell tools
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path './tools/Invoke-WindowsIntegrationEvidence.ps1'),
+            [ref]$tokens,
+            [ref]$errors) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:
