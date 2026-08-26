@@ -67,6 +67,16 @@ internal static class AppLog
         object? data,
         Exception? exception)
     {
+        try
+        {
+            VpnLatestStatusRegistry.UpdateFromLog(eventName, message, data, exception);
+        }
+        catch
+        {
+            // Latest-status projection is optional diagnostics and must never
+            // interfere with the structured log or networking state machine.
+        }
+
         var entry = new LogEntry(
             DateTimeOffset.UtcNow,
             level,
