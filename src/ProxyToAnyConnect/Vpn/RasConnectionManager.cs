@@ -1,6 +1,7 @@
 using System.Net;
 using System.Runtime.InteropServices;
 using ProxyToAnyConnect.Configuration;
+using ProxyToAnyConnect.Diagnostics;
 
 namespace ProxyToAnyConnect.Vpn;
 
@@ -49,13 +50,13 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
             try
             {
-                // Guard 1: fail before RasDial if the Windows profile itself is full tunnel.
                 var profile = await _profileInspector.InspectAsync(_options.EntryName, cancellationToken);
                 WindowsVpnProfileInspector.ValidateForProxy(profile);
+                AppLog.Info(
+                    "vpn.profile.validated",
+                    "Windows VPN profile passed L2TP split-tunnel validation.",
+                    new { profile.Name, profile.TunnelType, profile.SplitTunneling, profile.AllUserConnection });
 
-                // Guard 2: snapshot the actual system IPv4 default routes around RasDial.
-                // If Windows changes them despite the profile metadata, the just-created
-                // VPN is immediately torn down and never becomes visible to proxy traffic.
                 var routesBefore = await _routeInspector.CaptureIPv4Async(cancellationToken);
 
                 result = await Task.Run(ConnectCore, cancellationToken);
@@ -63,11 +64,11 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
                 var routesAfter = await _routeInspector.CaptureIPv4Async(cancellationToken);
                 WindowsDefaultRouteInspector.EnsureUnchanged(routesBefore, routesAfter);
+                AppLog.Info(
+                    "vpn.routes.validated",
+                    "IPv4 default-route set remained unchanged after RasDial.",
+                    new { DefaultRouteCount = routesBefore.Routes.Count });
 
-                // Guard 3: perform a real HTTPS request through a socket constrained to
-                // the L2TP interface and L2TP source IPv4. When publicAddress is IPv4,
-                // the observed Internet address must match it. For a DNS publicAddress,
-                // the IP-equality check is intentionally skipped.
                 var verification = await _connectivityVerifier.VerifyAsync(
                     result.Context,
                     cancellationToken);
@@ -79,14 +80,9 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
                 _rasConnection = result.Handle;
                 _lastVerification = verification;
-
-                // This publication is deliberately last. Until this exact assignment,
-                // L2tpSocketFactory cannot obtain a usable VPN context for proxy traffic.
                 _current = result.Context;
                 SetState(VpnConnectionState.Ready);
 
-                // Keep enforcing the same default-route snapshot that existed before
-                // RasDial. A later route mutation is treated as a fail-closed event too.
                 _monitorTask = MonitorAsync(
                     result.Handle,
                     result.Context,
@@ -105,6 +101,11 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             {
                 CleanupFailedConnection(result);
                 SetState(VpnConnectionState.Disconnected);
+                AppLog.Error(
+                    "vpn.connection.rejected",
+                    "L2TP connection did not pass fail-closed verification.",
+                    ex,
+                    new { EntryName = _options.EntryName });
                 throw new InvalidOperationException(
                     $"L2TP connection '{_options.EntryName}' did not pass fail-closed verification.",
                     ex);
@@ -124,12 +125,17 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             SzEntryName = _options.EntryName
         };
 
-        var getParamsResult = RasNative.RasGetEntryDialParamsW(null, dialParams, out _);
+        var getParamsResult = RasNative.RasGetEntryDialParamsW(null, dialParams, out var hasSavedPassword);
         if (getParamsResult != RasNative.ErrorSuccess)
         {
             throw new InvalidOperationException(
                 $"Unable to load RAS entry '{_options.EntryName}': {RasNative.DescribeError(getParamsResult)}");
         }
+
+        AppLog.Info(
+            "vpn.ras.parameters_loaded",
+            "RAS dial parameters were loaded from the Windows phone book.",
+            new { EntryName = _options.EntryName, HasSavedPassword = hasSavedPassword });
 
         var dialResult = RasNative.RasDialW(
             0,
@@ -150,6 +156,16 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             var localAddress = GetAssignedIPv4(handle);
             var interfaceInfo = VpnInterfaceResolver.ResolveByAddress(localAddress);
             var context = new VpnContext(_options.EntryName, localAddress, interfaceInfo);
+            AppLog.Info(
+                "vpn.ras.connected",
+                "RAS established the L2TP connection and assigned an IPv4 address.",
+                new
+                {
+                    EntryName = _options.EntryName,
+                    LocalIPv4 = localAddress.ToString(),
+                    interfaceInfo.Name,
+                    interfaceInfo.InterfaceIndex
+                });
             return new ConnectionResult(handle, context);
         }
         catch
@@ -217,6 +233,11 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            AppLog.Error(
+                "vpn.monitor.fail_closed",
+                "Continuous L2TP guard rejected the active connection.",
+                ex,
+                new { context.EntryName, LocalIPv4 = context.LocalIPv4.ToString(), context.InterfaceIndex });
             Console.Error.WriteLine($"L2TP fail-closed monitor rejected the active connection: {ex.Message}");
         }
         finally
@@ -242,6 +263,10 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         {
             MarkCurrentDisconnected(context);
             _ = RasNative.RasHangUpW(handle);
+            AppLog.Warning(
+                "vpn.ras.hangup",
+                "RAS connection was hung up after a continuous fail-closed guard failure.",
+                new { context.EntryName });
         }
     }
 
@@ -300,7 +325,14 @@ internal sealed class RasConnectionManager : IAsyncDisposable
 
     private void SetState(VpnConnectionState state)
     {
-        Volatile.Write(ref _state, (int)state);
+        var previous = (VpnConnectionState)Interlocked.Exchange(ref _state, (int)state);
+        if (previous != state)
+        {
+            AppLog.Info(
+                "vpn.state",
+                "VPN lifecycle state changed.",
+                new { Previous = previous.ToString(), Current = state.ToString(), EntryName = _options.EntryName });
+        }
     }
 
     public async Task DisconnectAsync()
@@ -317,6 +349,10 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             if (handle != 0)
             {
                 _ = RasNative.RasHangUpW(handle);
+                AppLog.Info(
+                    "vpn.ras.hangup",
+                    "RAS connection was disconnected.",
+                    new { EntryName = _options.EntryName });
             }
         }
         finally
