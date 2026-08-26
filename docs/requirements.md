@@ -16,25 +16,29 @@ This document is the current source of truth for product behavior. Later impleme
 
 ## Performance and memory invariants
 
-Proxy data-path performance is a first-class architectural requirement, equal in importance to fail-closed correctness.
+Proxy data-path performance and efficient memory use across the entire application are first-class architectural requirements, equal in importance to fail-closed correctness.
 
 The implementation must be designed for:
 
 - minimum added latency between accepting an inbound proxy connection and forwarding bytes to the selected L2TP-bound outbound socket;
 - high sustained throughput for long-lived HTTP/HTTPS `CONNECT` streams;
-- bounded and predictable memory consumption per active connection;
-- minimal managed allocations on the steady-state bidirectional byte-transfer hot path;
+- efficient, bounded and predictable memory use for the whole `ProxyToAnyConnect` process, including proxy sessions, L2TP runtimes, DNS state/cache, GUI models/snapshots, metrics, configuration, logging and background monitoring;
+- bounded memory consumption per active connection as one component of the project-wide memory budget, not as the only memory objective;
+- minimal managed allocations on steady-state hot paths and avoidance of unnecessary long-lived object retention elsewhere in the application;
 - no full-request/full-response buffering for tunneled traffic;
 - backpressure through asynchronous socket/stream reads and writes rather than unbounded application queues;
 - no logging, GUI refresh, metrics aggregation, DNS maintenance or keepalive work that synchronously blocks the proxy byte-transfer hot path;
-- pooled/reused buffers where this reduces allocation/GC pressure without retaining excessive memory;
-- avoiding unnecessary byte-array copies during request-header parsing and tunnel setup;
+- pooled/reused buffers where they reduce allocation/GC pressure without causing excessive pool retention or an unnecessarily large process working set;
+- avoiding unnecessary byte-array/string copies during request parsing, tunnel setup, metrics snapshots and GUI refresh;
 - low-cost atomic counters for runtime RX/TX metrics rather than per-packet/per-buffer object allocation;
+- bounded caches/collections and explicit cleanup of temporary/runtime state when proxy or L2TP instances stop;
 - no periodic global GC forcing or other latency-spiking memory management techniques.
+
+Optimizations must balance latency, throughput and total process memory. Reducing allocations is not considered an improvement if it causes unreasonable retained memory, and reducing memory is not considered an improvement if it materially increases proxy latency without a justified tradeoff.
 
 Optimizations must not weaken fail-closed routing, VPN verification, source/interface binding, cancellation on L2TP loss or security invariants.
 
-Performance-sensitive changes should be covered by repeatable local/CI micro or integration tests where practical, including allocation-sensitive tests for the proxy forwarding path.
+Performance-sensitive changes should be covered by repeatable local/CI micro or integration tests where practical, including allocation-sensitive and process-memory-oriented checks.
 
 ## Multi-proxy model
 
