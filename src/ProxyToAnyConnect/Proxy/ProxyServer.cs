@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Network;
+using ProxyToAnyConnect.Runtime;
 
 namespace ProxyToAnyConnect.Proxy;
 
@@ -13,13 +14,21 @@ internal sealed class ProxyServer
 
     private readonly ProxyOptions _options;
     private readonly IProxyOutboundConnectionFactory _socketFactory;
+    private readonly ProxyRuntimeMetrics? _proxyMetrics;
+    private readonly L2tpRuntimeMetrics? _l2tpMetrics;
     private readonly TaskCompletionSource _listening =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public ProxyServer(ProxyOptions options, IProxyOutboundConnectionFactory socketFactory)
+    public ProxyServer(
+        ProxyOptions options,
+        IProxyOutboundConnectionFactory socketFactory,
+        ProxyRuntimeMetrics? proxyMetrics = null,
+        L2tpRuntimeMetrics? l2tpMetrics = null)
     {
         _options = options;
         _socketFactory = socketFactory;
+        _proxyMetrics = proxyMetrics;
+        _l2tpMetrics = l2tpMetrics;
     }
 
     public Task WaitUntilListeningAsync(CancellationToken cancellationToken) =>
@@ -85,7 +94,7 @@ internal sealed class ProxyServer
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"Unhandled proxy session error: {ex}");
+                System.Diagnostics.Debug.WriteLine($"Unhandled proxy session error: {ex}");
                 await TryWriteErrorAsync(client, 500, "Internal Server Error", "Proxy session failed.", cancellationToken);
             }
         }
@@ -130,14 +139,23 @@ internal sealed class ProxyServer
         if (!remainder.IsEmpty)
         {
             await upstreamStream.WriteAsync(remainder, cancellationToken);
+            RecordSent(remainder.Length);
         }
 
         using var tunnelCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             upstream.LifetimeToken);
 
-        var clientToUpstream = PumpAsync(clientStream, upstreamStream, tunnelCancellation.Token);
-        var upstreamToClient = PumpAsync(upstreamStream, clientStream, tunnelCancellation.Token);
+        var clientToUpstream = PumpAsync(
+            clientStream,
+            upstreamStream,
+            RecordSent,
+            tunnelCancellation.Token);
+        var upstreamToClient = PumpAsync(
+            upstreamStream,
+            clientStream,
+            RecordReceived,
+            tunnelCancellation.Token);
 
         try
         {
@@ -167,17 +185,27 @@ internal sealed class ProxyServer
 
         var originHeader = request.BuildOriginHeader(pathAndQuery);
         await upstreamStream.WriteAsync(originHeader, cancellationToken);
+        RecordSent(originHeader.Length);
         if (!remainder.IsEmpty)
         {
             await upstreamStream.WriteAsync(remainder, cancellationToken);
+            RecordSent(remainder.Length);
         }
 
         using var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             upstream.LifetimeToken);
 
-        var clientToUpstream = PumpAsync(clientStream, upstreamStream, requestCancellation.Token);
-        var upstreamToClient = PumpAsync(upstreamStream, clientStream, requestCancellation.Token);
+        var clientToUpstream = PumpAsync(
+            clientStream,
+            upstreamStream,
+            RecordSent,
+            requestCancellation.Token);
+        var upstreamToClient = PumpAsync(
+            upstreamStream,
+            clientStream,
+            RecordReceived,
+            requestCancellation.Token);
 
         try
         {
@@ -191,7 +219,11 @@ internal sealed class ProxyServer
         }
     }
 
-    private static async Task PumpAsync(Stream source, Stream destination, CancellationToken cancellationToken)
+    private static async Task PumpAsync(
+        Stream source,
+        Stream destination,
+        Action<int> onTransferred,
+        CancellationToken cancellationToken)
     {
         var buffer = new byte[32 * 1024];
         while (true)
@@ -203,8 +235,20 @@ internal sealed class ProxyServer
             }
 
             await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-            await destination.FlushAsync(cancellationToken);
+            onTransferred(read);
         }
+    }
+
+    private void RecordReceived(int bytes)
+    {
+        _proxyMetrics?.Traffic.AddReceived(bytes);
+        _l2tpMetrics?.Traffic.AddReceived(bytes);
+    }
+
+    private void RecordSent(int bytes)
+    {
+        _proxyMetrics?.Traffic.AddSent(bytes);
+        _l2tpMetrics?.Traffic.AddSent(bytes);
     }
 
     private static async Task IgnoreCancellationAsync(Task task)
@@ -278,7 +322,7 @@ internal sealed class ProxyServer
             throw new InvalidDataException("CONNECT target is empty.");
         }
 
-        if (authority.StartsWith('[', StringComparison.Ordinal))
+        if (authority.StartsWith("[", StringComparison.Ordinal))
         {
             throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
         }
