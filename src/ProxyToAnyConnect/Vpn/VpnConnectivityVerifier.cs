@@ -95,13 +95,7 @@ internal sealed class VpnConnectivityVerifier
             },
             cancellationToken);
 
-        var request = Encoding.ASCII.GetBytes(
-            $"GET {_options.ProbePath} HTTP/1.1\r\n" +
-            $"Host: {_options.ProbeHost}\r\n" +
-            "User-Agent: ProxyToAnyConnect/1.0\r\n" +
-            "Accept: text/plain\r\n" +
-            "Accept-Encoding: identity\r\n" +
-            "Connection: close\r\n\r\n");
+        var request = BuildProbeRequest(_options.ProbeHost, _options.ProbePath);
 
         await sslStream.WriteAsync(request, cancellationToken);
         await sslStream.FlushAsync(cancellationToken);
@@ -153,6 +147,40 @@ internal sealed class VpnConnectivityVerifier
         }
 
         return address;
+    }
+
+    internal static byte[] BuildProbeRequest(string? host, string? path)
+    {
+        host ??= string.Empty;
+        path ??= string.Empty;
+
+        ReadOnlySpan<byte> requestPrefix = "GET "u8;
+        ReadOnlySpan<byte> hostPrefix = " HTTP/1.1\r\nHost: "u8;
+        ReadOnlySpan<byte> fixedSuffix =
+            "\r\nUser-Agent: ProxyToAnyConnect/1.0\r\nAccept: text/plain\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"u8;
+
+        var pathByteCount = Encoding.ASCII.GetByteCount(path);
+        var hostByteCount = Encoding.ASCII.GetByteCount(host);
+        var totalLength = checked(
+            requestPrefix.Length +
+            pathByteCount +
+            hostPrefix.Length +
+            hostByteCount +
+            fixedSuffix.Length);
+
+        var request = GC.AllocateUninitializedArray<byte>(totalLength);
+        var destination = request.AsSpan();
+        var offset = 0;
+
+        requestPrefix.CopyTo(destination[offset..]);
+        offset += requestPrefix.Length;
+        offset += Encoding.ASCII.GetBytes(path.AsSpan(), destination[offset..]);
+        hostPrefix.CopyTo(destination[offset..]);
+        offset += hostPrefix.Length;
+        offset += Encoding.ASCII.GetBytes(host.AsSpan(), destination[offset..]);
+        fixedSuffix.CopyTo(destination[offset..]);
+
+        return request;
     }
 
     internal static async Task<byte[]> ReadResponseAsync(
