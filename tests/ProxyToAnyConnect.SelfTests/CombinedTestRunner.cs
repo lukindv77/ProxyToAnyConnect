@@ -111,6 +111,11 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        if (DnsCnameLoopTrackingSelfTests.Run() != 0)
+        {
+            return 1;
+        }
+
         if (VpnContextLifetimeSelfTests.Run() != 0)
         {
             return 1;
@@ -166,7 +171,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, bounded-status, memory-health, configuration/reconfigure, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup, DNS-query/name-skip/address-list/name-materialization, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, bounded-status, memory-health, configuration/reconfigure, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup, DNS-query/name-skip/address-list/name-materialization/cname-loop, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
