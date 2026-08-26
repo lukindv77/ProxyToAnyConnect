@@ -46,6 +46,11 @@ internal static class CombinedTestRunner
             return 1;
         }
 
+        if (EphemeralRasPhonebookSelfTests.Run() != 0)
+        {
+            return 1;
+        }
+
         Console.WriteLine("All extended fail-closed self-tests passed.");
         return 0;
     }
