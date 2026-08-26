@@ -6,16 +6,22 @@ namespace ProxyToAnyConnect.Runtime;
 
 internal sealed class VpnLeaseManager : IAsyncDisposable
 {
+    private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromMilliseconds(500);
+
     private readonly L2tpOptions _options;
     private readonly RasConnectionManager _connectionManager;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly HashSet<string> _consumers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly CancellationTokenSource _lifetime = new();
+
+    private Task? _maintenanceTask;
     private int _disposed;
 
     public VpnLeaseManager(L2tpOptions options)
     {
         _options = options;
-        _connectionManager = new RasConnectionManager(options);
+        Metrics = new L2tpRuntimeMetrics();
+        _connectionManager = new RasConnectionManager(options, Metrics);
     }
 
     public string Id => _options.Id;
@@ -23,7 +29,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     public bool Shared => _options.Shared;
     public L2tpOptions Options => _options;
     public RasConnectionManager ConnectionManager => _connectionManager;
-    public L2tpRuntimeMetrics Metrics { get; } = new();
+    public L2tpRuntimeMetrics Metrics { get; }
 
     public int ActiveProxyCount
     {
@@ -65,6 +71,8 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
                 _consumers.Remove(proxyId);
                 throw;
             }
+
+            EnsureMaintenanceStartedLocked();
 
             AppLog.Info(
                 "vpn.lease.acquired",
@@ -128,12 +136,86 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         }
     }
 
+    private void EnsureMaintenanceStartedLocked()
+    {
+        if (_maintenanceTask is null)
+        {
+            _maintenanceTask = MaintainConnectionAsync(_lifetime.Token);
+        }
+    }
+
+    private async Task MaintainConnectionAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(MaintenanceInterval);
+
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                if (ActiveProxyCount == 0)
+                {
+                    continue;
+                }
+
+                if (_connectionManager.Current is { IsAlive: true } &&
+                    _connectionManager.State == VpnConnectionState.Ready)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    AppLog.Info(
+                        "vpn.maintenance.reconnect_attempt",
+                        "Active proxy leases require L2TP; attempting reconnect and full verification.",
+                        new
+                        {
+                            VpnId = _options.Id,
+                            VpnName = _options.Name,
+                            ActiveProxyCount
+                        });
+
+                    await _connectionManager.ConnectAsync(cancellationToken);
+
+                    AppLog.Info(
+                        "vpn.maintenance.reconnected",
+                        "L2TP reconnect and verification completed while active proxy leases were present.",
+                        new { VpnId = _options.Id, VpnName = _options.Name, ActiveProxyCount });
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException or NotSupportedException)
+                {
+                    // ConnectAsync already applies fail-closed verification and reconnect cooldown.
+                    // Keep trying while active proxy leases exist; unrelated VPN groups are unaffected.
+                    AppLog.Warning(
+                        "vpn.maintenance.reconnect_pending",
+                        "L2TP is still unavailable; active dependent proxies remain fail-closed.",
+                        new
+                        {
+                            VpnId = _options.Id,
+                            VpnName = _options.Name,
+                            ActiveProxyCount,
+                            Error = ex.Message
+                        });
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
         }
+
+        _lifetime.Cancel();
 
         await _gate.WaitAsync();
         try
@@ -144,8 +226,21 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         finally
         {
             _gate.Release();
-            _gate.Dispose();
         }
+
+        if (_maintenanceTask is not null)
+        {
+            try
+            {
+                await _maintenanceTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        _lifetime.Dispose();
+        _gate.Dispose();
     }
 
     internal sealed class VpnLease : IAsyncDisposable
