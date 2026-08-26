@@ -256,7 +256,7 @@ internal sealed class L2tpDnsResolver
 
     internal static byte[] BuildQuery(string host, ushort transactionId)
     {
-        var qnameByteCount = 0;
+        var encodedHostByteCount = Encoding.ASCII.GetByteCount(host);
         var labelStart = 0;
         while (labelStart <= host.Length)
         {
@@ -269,7 +269,6 @@ internal sealed class L2tpDnsResolver
                 throw new InvalidOperationException($"Invalid DNS label in '{host}'.");
             }
 
-            qnameByteCount = checked(qnameByteCount + 1 + labelByteCount);
             if (dot < 0)
             {
                 break;
@@ -278,6 +277,9 @@ internal sealed class L2tpDnsResolver
             labelStart += dot + 1;
         }
 
+        // Replacing each encoded dot with a one-byte DNS label length leaves the
+        // QNAME one byte longer than the encoded host, before the terminal zero.
+        var qnameByteCount = checked(encodedHostByteCount + 1);
         var query = GC.AllocateUninitializedArray<byte>(
             checked(12 + qnameByteCount + 1 + 4));
         var destination = query.AsSpan();
@@ -293,9 +295,10 @@ internal sealed class L2tpDnsResolver
             var remaining = host.AsSpan(labelStart);
             var dot = remaining.IndexOf('.');
             var label = dot < 0 ? remaining : remaining[..dot];
-            var labelByteCount = Encoding.ASCII.GetByteCount(label);
-            destination[written++] = checked((byte)labelByteCount);
-            written += Encoding.ASCII.GetBytes(label, destination[written..]);
+            var lengthOffset = written++;
+            var labelByteCount = Encoding.ASCII.GetBytes(label, destination[written..]);
+            destination[lengthOffset] = checked((byte)labelByteCount);
+            written += labelByteCount;
 
             if (dot < 0)
             {
