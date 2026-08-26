@@ -54,6 +54,14 @@ internal sealed class VpnContext : IDisposable
                 // A racing final reference release already disposed the CTS.
             }
         }
+
+        // MarkDisconnected is the single terminal transition for a RAS context.
+        // Release the manager-owned reference exactly once on every path:
+        // explicit disconnect, monitor fail-closed, failed verification, or disposal.
+        if (Interlocked.Exchange(ref _ownerReleased, 1) == 0)
+        {
+            ReleaseReference();
+        }
     }
 
     internal bool TryAcquireConnectionReference()
@@ -90,14 +98,7 @@ internal sealed class VpnContext : IDisposable
 
     internal void ReleaseConnectionReference() => ReleaseReference();
 
-    public void Dispose()
-    {
-        MarkDisconnected();
-        if (Interlocked.Exchange(ref _ownerReleased, 1) == 0)
-        {
-            ReleaseReference();
-        }
-    }
+    public void Dispose() => MarkDisconnected();
 
     private void ReleaseReference()
     {
