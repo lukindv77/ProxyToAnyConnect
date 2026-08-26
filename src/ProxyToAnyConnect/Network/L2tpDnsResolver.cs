@@ -583,7 +583,7 @@ internal sealed class L2tpDnsResolver
         uint MinimumTtlSeconds);
 }
 
-internal sealed record ParsedDnsResponse(
+internal readonly record struct ParsedDnsResponse(
     IReadOnlyList<IPAddress> Addresses,
     string? CanonicalName,
     bool Truncated,
