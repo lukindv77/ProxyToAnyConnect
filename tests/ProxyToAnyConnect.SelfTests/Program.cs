@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using ProxyToAnyConnect.Network;
+using ProxyToAnyConnect.Proxy;
 using ProxyToAnyConnect.Vpn;
 
 namespace ProxyToAnyConnect.SelfTests;
@@ -23,7 +25,11 @@ internal static class Program
             ("DNS public address skips IP comparison", PublicDnsSkipsComparison),
             ("DNS A response returns IPv4", DnsAResponseReturnsIpv4),
             ("DNS CNAME response returns canonical name", DnsCnameResponseReturnsCanonicalName),
-            ("Truncated DNS response requests TCP fallback", DnsTruncatedResponseIsDetected)
+            ("Truncated DNS response requests TCP fallback", DnsTruncatedResponseIsDetected),
+            ("CONNECT authority uses default HTTPS port", ProxyAuthorityUsesDefaultPort),
+            ("CONNECT authority accepts explicit port", ProxyAuthorityAcceptsExplicitPort),
+            ("IPv6 proxy authority is rejected", ProxyAuthorityRejectsIpv6),
+            ("Origin request strips proxy-only headers", ProxyOriginHeaderStripsProxyHeaders)
         };
 
         var failed = 0;
@@ -157,6 +163,54 @@ internal static class Program
         }
     }
 
+    private static void ProxyAuthorityUsesDefaultPort()
+    {
+        var (host, port) = ProxyServer.ParseAuthority("example.com", 443);
+        if (host != "example.com" || port != 443)
+        {
+            throw new InvalidOperationException("Default CONNECT authority parsing failed.");
+        }
+    }
+
+    private static void ProxyAuthorityAcceptsExplicitPort()
+    {
+        var (host, port) = ProxyServer.ParseAuthority("example.com:8443", 443);
+        if (host != "example.com" || port != 8443)
+        {
+            throw new InvalidOperationException("Explicit CONNECT authority parsing failed.");
+        }
+    }
+
+    private static void ProxyAuthorityRejectsIpv6()
+    {
+        AssertThrows<NotSupportedException>(() =>
+            ProxyServer.ParseAuthority("[2001:db8::1]:443", 443));
+    }
+
+    private static void ProxyOriginHeaderStripsProxyHeaders()
+    {
+        var raw = Encoding.ASCII.GetBytes(
+            "GET http://example.com/path HTTP/1.1\r\n" +
+            "Host: example.com\r\n" +
+            "Proxy-Authorization: Basic secret\r\n" +
+            "Proxy-Connection: keep-alive\r\n" +
+            "Connection: X-Remove\r\n" +
+            "X-Remove: do-not-forward\r\n" +
+            "X-Keep: yes\r\n\r\n");
+
+        var request = ProxyServer.ParsedProxyRequest.Parse(raw);
+        var outbound = Encoding.Latin1.GetString(request.BuildOriginHeader("/path"));
+
+        if (outbound.Contains("Proxy-Authorization", StringComparison.OrdinalIgnoreCase) ||
+            outbound.Contains("Proxy-Connection", StringComparison.OrdinalIgnoreCase) ||
+            outbound.Contains("X-Remove:", StringComparison.OrdinalIgnoreCase) ||
+            !outbound.Contains("X-Keep: yes", StringComparison.OrdinalIgnoreCase) ||
+            !outbound.Contains("Connection: close", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Origin header filtering failed.");
+        }
+    }
+
     private static byte[] BuildDnsResponse(ushort answerType, byte[] answerData)
     {
         var packet = new List<byte>();
@@ -188,7 +242,7 @@ internal static class Program
         var bytes = new List<byte>();
         foreach (var label in name.Split('.'))
         {
-            var labelBytes = System.Text.Encoding.ASCII.GetBytes(label);
+            var labelBytes = Encoding.ASCII.GetBytes(label);
             bytes.Add(checked((byte)labelBytes.Length));
             bytes.AddRange(labelBytes);
         }
