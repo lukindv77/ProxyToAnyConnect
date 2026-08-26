@@ -41,26 +41,11 @@ internal static class Program
             "ProxyToAnyConnect GUI started.",
             new { ConfigPath = configPath });
 
-        ProxyRuntimeCoordinator? runtime = null;
-        string? configurationError = null;
         try
         {
-            options.Validate();
-            runtime = new ProxyRuntimeCoordinator(options);
-        }
-        catch (Exception ex)
-        {
-            configurationError = ex.Message;
-            AppLog.Error(
-                "configuration.invalid",
-                "Runtime was not started because configuration validation failed.",
-                ex);
-        }
-
-        try
-        {
-            var form = new MainForm(options, configPath, runtime, configurationError);
-            var context = new ProxyApplicationContext(form, runtime);
+            var runtimeHost = new ProxyRuntimeHost(options);
+            var form = new MainForm(options, configPath, runtimeHost);
+            var context = new ProxyApplicationContext(form, runtimeHost);
             Application.Run(context);
         }
         catch (Exception ex)
