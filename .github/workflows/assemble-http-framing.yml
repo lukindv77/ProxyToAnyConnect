@@ -24,9 +24,16 @@ jobs:
           cat .assembly/test.* | tr -d '\r\n' | base64 -d > tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs
           cat .assembly/runner.b64 | tr -d '\r\n' | base64 -d > tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs
 
-          test "$(git hash-object src/ProxyToAnyConnect/Proxy/ProxyServer.cs)" = "e72a706217010ea4e11036d86b8e27d0bb4fce4c"
-          test "$(git hash-object tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs)" = "2585f0211bd1290fc2699a0ac38419dfee29cb83"
-          test "$(git hash-object tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs)" = "6818e60dfbf617cbb4c9e495111cc44772bd0f8d"
+          server_sha="$(git hash-object src/ProxyToAnyConnect/Proxy/ProxyServer.cs)"
+          test_sha="$(git hash-object tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs)"
+          runner_sha="$(git hash-object tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs)"
+          echo "server=$server_sha"
+          echo "test=$test_sha"
+          echo "runner=$runner_sha"
+
+          test "$server_sha" = "e72a706217010ea4e11036d86b8e27d0bb4fce4c"
+          test "$test_sha" = "2585f0211bd1290fc2699a0ac38419dfee29cb83"
+          test "$runner_sha" = "6818e60dfbf617cbb4c9e495111cc44772bd0f8d"
 
       - name: Commit assembled files
         shell: bash
