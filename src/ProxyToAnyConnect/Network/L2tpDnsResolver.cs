@@ -375,7 +375,8 @@ internal sealed class L2tpDnsResolver
             offset += 4;
         }
 
-        List<IPAddress>? addresses = null;
+        IPAddress? firstAddress = null;
+        List<IPAddress>? additionalAddresses = null;
         string? canonicalName = null;
         uint? minimumTtlSeconds = null;
 
@@ -391,8 +392,16 @@ internal sealed class L2tpDnsResolver
 
             if (type == 1 && dataLength == 4)
             {
-                (addresses ??= new List<IPAddress>()).Add(
-                    new IPAddress(response.Slice(offset, 4)));
+                var address = new IPAddress(response.Slice(offset, 4));
+                if (firstAddress is null)
+                {
+                    firstAddress = address;
+                }
+                else
+                {
+                    (additionalAddresses ??= new List<IPAddress>()).Add(address);
+                }
+
                 minimumTtlSeconds = MinTtl(minimumTtlSeconds, ttlSeconds);
             }
             else if (type == 5)
@@ -405,9 +414,23 @@ internal sealed class L2tpDnsResolver
             offset += dataLength;
         }
 
-        IReadOnlyList<IPAddress> parsedAddresses = addresses is null
-            ? Array.Empty<IPAddress>()
-            : addresses;
+        IReadOnlyList<IPAddress> parsedAddresses;
+        if (firstAddress is null)
+        {
+            parsedAddresses = Array.Empty<IPAddress>();
+        }
+        else if (additionalAddresses is null)
+        {
+            parsedAddresses = new[] { firstAddress };
+        }
+        else
+        {
+            var result = GC.AllocateUninitializedArray<IPAddress>(additionalAddresses.Count + 1);
+            result[0] = firstAddress;
+            additionalAddresses.CopyTo(result, 1);
+            parsedAddresses = result;
+        }
+
         return new ParsedDnsResponse(
             parsedAddresses,
             canonicalName,
