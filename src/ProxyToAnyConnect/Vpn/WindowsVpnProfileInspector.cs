@@ -117,6 +117,37 @@ internal sealed class WindowsVpnProfileInspector
         }
     }
 
+    public static string? ResolveRasPhoneBook(VpnProfileInfo profile)
+    {
+        if (!profile.AllUserConnection)
+        {
+            // NULL lets RAS use the current user's default phone book.
+            return null;
+        }
+
+        var commonApplicationData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+        if (string.IsNullOrWhiteSpace(commonApplicationData))
+        {
+            throw new InvalidOperationException("Windows CommonApplicationData path is unavailable.");
+        }
+
+        var phoneBook = Path.Combine(
+            commonApplicationData,
+            "Microsoft",
+            "Network",
+            "Connections",
+            "Pbk",
+            "rasphone.pbk");
+
+        if (!File.Exists(phoneBook))
+        {
+            throw new InvalidOperationException(
+                $"Global RAS phone book for AllUserConnection was not found at '{phoneBook}'.");
+        }
+
+        return phoneBook;
+    }
+
     private static void TryKill(Process process)
     {
         try
