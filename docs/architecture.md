@@ -125,6 +125,8 @@ Plain HTTP requests are rewritten from proxy-form to origin-form and the first i
 
 Unsupported request forms produce an explicit HTTP error instead of leaving an unobserved background task failure.
 
+`ProxyServer` depends on the narrow `IProxyOutboundConnectionFactory` abstraction. The production application wires only `L2tpSocketFactory`, which has no DIRECT mode. The abstraction exists so the test project can inject a loopback-only outbound connection and exercise the real proxy server without requiring an Internet connection or L2TP credentials in CI.
+
 ## Diagnostic mode
 
 The executable supports:
@@ -149,7 +151,7 @@ ProxyServer
       +-- HTTPS CONNECT tunnel
       |
       v
-L2tpSocketFactory
+L2tpSocketFactory (production IProxyOutboundConnectionFactory)
       |
       +-- require Ready VpnContext
       +-- otherwise validate profile / RasDial / Verify
@@ -189,10 +191,10 @@ Applies Winsock `IP_UNICAST_IF` to an IPv4 socket using the current L2TP `Interf
 Performs L2TP-bound IPv4 DNS resolution, including CNAME following and TCP fallback for truncated UDP responses.
 
 ### `L2tpSocketFactory`
-The only intended factory for outbound proxy TCP sockets. It has no DIRECT mode. Each socket is source-bound to the current L2TP IPv4 and receives `IP_UNICAST_IF` for the L2TP interface before connecting.
+The only production implementation of `IProxyOutboundConnectionFactory`. It has no DIRECT mode. Each socket is source-bound to the current L2TP IPv4 and receives `IP_UNICAST_IF` for the L2TP interface before connecting.
 
 ### `ProxyServer`
-Listens only on loopback. Implements HTTP forwarding and HTTPS `CONNECT`. Active tunnels are linked to the `VpnContext` lifetime token.
+Listens only on loopback. Implements HTTP forwarding and HTTPS `CONNECT`. Active tunnels are linked to the outbound connection lifetime token, which is the exact `VpnContext` lifetime in production.
 
 ## Explicitly out of scope for the first milestone
 
@@ -208,7 +210,7 @@ Listens only on loopback. Implements HTTP forwarding and HTTPS `CONNECT`. Active
 
 The solution contains `ProxyToAnyConnect.SelfTests`, a dependency-free .NET 10 console test project. GitHub Actions builds the solution on `windows-latest`, runs self-tests, publishes a self-contained Windows x64 package and uploads it as a workflow artifact.
 
-Current self-tests cover:
+Current automated checks cover:
 
 - accepting L2TP + split-tunnel profiles;
 - rejecting full-tunnel profiles;
@@ -223,7 +225,9 @@ Current self-tests cover:
 - detecting truncated DNS replies for TCP fallback;
 - CONNECT authority parsing with default and explicit ports;
 - rejecting IPv6 proxy authorities in the current IPv4-only milestone;
-- stripping proxy-only and connection-scoped headers before HTTP origin forwarding.
+- stripping proxy-only and connection-scoped headers before HTTP origin forwarding;
+- live loopback plain-HTTP forwarding through a real `ProxyServer` instance;
+- live loopback `CONNECT` establishment and byte-perfect bidirectional tunnel forwarding.
 
 ## Integration test
 
@@ -232,7 +236,7 @@ The reproducible Windows test procedure is maintained in [`windows-integration-t
 ## Next hardening work
 
 1. Run the real Windows 11 + L2TP integration test and record results.
-2. Add live proxy integration tests with a local fake origin server and injectable outbound-connection factory.
-3. Add structured logs and a Windows Service host mode.
+2. Add structured logs and a Windows Service host mode.
+3. Replace the synchronous `RasDial` execution with a cancellable asynchronous RAS lifecycle after real-environment validation.
 4. Replace PowerShell-based route/profile inspection with native Windows APIs after the first real-environment validation.
 5. Add a reproducible installer in addition to the existing self-contained ZIP publish.
