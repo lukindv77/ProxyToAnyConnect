@@ -20,6 +20,7 @@ internal sealed class ProxyServer
     private readonly IProxyOutboundConnectionFactory _socketFactory;
     private readonly ProxyRuntimeMetrics? _proxyMetrics;
     private readonly L2tpRuntimeMetrics? _l2tpMetrics;
+    private readonly SemaphoreSlim _sessionSlots;
     private readonly TaskCompletionSource _listening =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -33,6 +34,9 @@ internal sealed class ProxyServer
         _socketFactory = socketFactory;
         _proxyMetrics = proxyMetrics;
         _l2tpMetrics = l2tpMetrics;
+        _sessionSlots = new SemaphoreSlim(
+            options.MaxConcurrentConnections,
+            options.MaxConcurrentConnections);
     }
 
     public Task WaitUntilListeningAsync(CancellationToken cancellationToken) =>
@@ -49,8 +53,23 @@ internal sealed class ProxyServer
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                var client = await listener.AcceptTcpClientAsync(cancellationToken);
-                _ = HandleClientSafelyAsync(client, cancellationToken);
+                await _sessionSlots.WaitAsync(cancellationToken);
+                TcpClient? client = null;
+                try
+                {
+                    // When every user-space session slot is occupied, the loop stops here
+                    // before Accept. Additional clients remain subject to the Windows TCP
+                    // listen backlog instead of creating an unbounded number of Tasks/buffers.
+                    client = await listener.AcceptTcpClientAsync(cancellationToken);
+                    _ = HandleClientAndReleaseSlotAsync(client, cancellationToken);
+                    client = null;
+                }
+                catch
+                {
+                    client?.Dispose();
+                    _sessionSlots.Release();
+                    throw;
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -65,6 +84,20 @@ internal sealed class ProxyServer
         finally
         {
             listener?.Stop();
+        }
+    }
+
+    private async Task HandleClientAndReleaseSlotAsync(
+        TcpClient client,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await HandleClientSafelyAsync(client, cancellationToken);
+        }
+        finally
+        {
+            _sessionSlots.Release();
         }
     }
 
