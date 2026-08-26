@@ -4,7 +4,7 @@ using ProxyToAnyConnect.Vpn;
 
 namespace ProxyToAnyConnect.Network;
 
-internal sealed class L2tpSocketFactory
+internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
 {
     private readonly RasConnectionManager _connectionManager;
     private readonly L2tpDnsResolver _dnsResolver;
@@ -15,7 +15,7 @@ internal sealed class L2tpSocketFactory
         _dnsResolver = dnsResolver;
     }
 
-    public async Task<L2tpConnection> ConnectAsync(
+    public async Task<IProxyOutboundConnection> ConnectAsync(
         string host,
         int port,
         CancellationToken cancellationToken)
@@ -99,7 +99,7 @@ internal sealed class L2tpSocketFactory
     }
 }
 
-internal sealed class L2tpConnection : IAsyncDisposable
+internal sealed class L2tpConnection : IProxyOutboundConnection
 {
     public L2tpConnection(Socket socket, VpnContext context)
     {
@@ -109,6 +109,7 @@ internal sealed class L2tpConnection : IAsyncDisposable
 
     public Socket Socket { get; }
     public VpnContext Context { get; }
+    public CancellationToken LifetimeToken => Context.LifetimeToken;
 
     public ValueTask DisposeAsync()
     {
