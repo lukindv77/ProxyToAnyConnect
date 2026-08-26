@@ -639,6 +639,6 @@ internal sealed class ProxyServer
             return tokens;
         }
 
-        private sealed record HeaderLine(string Name, string Value);
+        private readonly record struct HeaderLine(string Name, string Value);
     }
 }
