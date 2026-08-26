@@ -52,14 +52,23 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             {
                 var profile = await _profileInspector.InspectAsync(_options.EntryName, cancellationToken);
                 WindowsVpnProfileInspector.ValidateForProxy(profile);
+                var phoneBook = WindowsVpnProfileInspector.ResolveRasPhoneBook(profile);
+
                 AppLog.Info(
                     "vpn.profile.validated",
                     "Windows VPN profile passed L2TP split-tunnel validation.",
-                    new { profile.Name, profile.TunnelType, profile.SplitTunneling, profile.AllUserConnection });
+                    new
+                    {
+                        profile.Name,
+                        profile.TunnelType,
+                        profile.SplitTunneling,
+                        profile.AllUserConnection,
+                        PhoneBookScope = profile.AllUserConnection ? "AllUsers" : "CurrentUser"
+                    });
 
                 var routesBefore = await _routeInspector.CaptureIPv4Async(cancellationToken);
 
-                result = await Task.Run(ConnectCore, cancellationToken);
+                result = await Task.Run(() => ConnectCore(phoneBook), cancellationToken);
                 SetState(VpnConnectionState.Verifying);
 
                 var routesAfter = await _routeInspector.CaptureIPv4Async(cancellationToken);
@@ -117,7 +126,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         }
     }
 
-    private ConnectionResult ConnectCore()
+    private ConnectionResult ConnectCore(string? phoneBook)
     {
         var dialParams = new RasNative.RasDialParams
         {
@@ -125,7 +134,7 @@ internal sealed class RasConnectionManager : IAsyncDisposable
             SzEntryName = _options.EntryName
         };
 
-        var getParamsResult = RasNative.RasGetEntryDialParamsW(null, dialParams, out var hasSavedPassword);
+        var getParamsResult = RasNative.RasGetEntryDialParamsW(phoneBook, dialParams, out var hasSavedPassword);
         if (getParamsResult != RasNative.ErrorSuccess)
         {
             throw new InvalidOperationException(
@@ -135,11 +144,16 @@ internal sealed class RasConnectionManager : IAsyncDisposable
         AppLog.Info(
             "vpn.ras.parameters_loaded",
             "RAS dial parameters were loaded from the Windows phone book.",
-            new { EntryName = _options.EntryName, HasSavedPassword = hasSavedPassword });
+            new
+            {
+                EntryName = _options.EntryName,
+                HasSavedPassword = hasSavedPassword,
+                PhoneBookScope = phoneBook is null ? "CurrentUserDefault" : "ExplicitAllUsers"
+            });
 
         var dialResult = RasNative.RasDialW(
             0,
-            null,
+            phoneBook,
             dialParams,
             0,
             0,
