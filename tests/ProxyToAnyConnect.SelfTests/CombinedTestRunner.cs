@@ -10,14 +10,22 @@ internal static class CombinedTestRunner
             return existingResult;
         }
 
-        var additionalFailures = VerificationHttpParserTests.Run();
-        if (additionalFailures != 0)
+        var parserFailures = VerificationHttpParserTests.Run();
+        if (parserFailures != 0)
         {
-            Console.Error.WriteLine($"Additional verification parser tests failed: {additionalFailures}.");
+            Console.Error.WriteLine($"Additional verification parser tests failed: {parserFailures}.");
             return 1;
         }
 
         Console.WriteLine("Additional verification parser tests passed.");
+
+        var lifetimeFailures = await ProxyLifetimeSelfTests.RunAsync();
+        if (lifetimeFailures != 0)
+        {
+            return 1;
+        }
+
+        Console.WriteLine("All extended fail-closed self-tests passed.");
         return 0;
     }
 }
