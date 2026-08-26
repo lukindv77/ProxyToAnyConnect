@@ -6,37 +6,67 @@ namespace ProxyToAnyConnect.Diagnostics;
 internal static class AppLog
 {
     private static readonly object Gate = new();
-    private static string? _filePath;
+    private static DailyJsonlLogStore? _store;
     private static bool _consoleJson;
     private static int _fileDisabled;
 
+    public static string? CurrentLogFile => Volatile.Read(ref _store)?.CurrentFilePath;
+    public static string? LogRootDirectory => Volatile.Read(ref _store)?.RootDirectory;
+
+    // Compatibility bridge while the GUI/settings refactor is in progress.
+    // A legacy filePath is interpreted as its parent directory; a directory path
+    // is used directly. New GUI configuration will call the explicit overload.
     public static void Configure(LoggingOptions options, string configDirectory)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentException.ThrowIfNullOrWhiteSpace(configDirectory);
 
-        _consoleJson = options.ConsoleJson;
-        _filePath = string.IsNullOrWhiteSpace(options.FilePath)
-            ? null
-            : Path.GetFullPath(options.FilePath, configDirectory);
-
-        if (_filePath is null)
+        var configuredPath = options.FilePath;
+        string rootDirectory;
+        if (string.IsNullOrWhiteSpace(configuredPath))
         {
-            return;
+            rootDirectory = AppContext.BaseDirectory;
+        }
+        else
+        {
+            var fullPath = Path.GetFullPath(configuredPath, configDirectory);
+            rootDirectory = Path.HasExtension(fullPath)
+                ? Path.GetDirectoryName(fullPath) ?? AppContext.BaseDirectory
+                : fullPath;
         }
 
+        Configure(rootDirectory, retentionDays: 30, options.ConsoleJson);
+    }
+
+    public static void Configure(string? rootDirectory, int retentionDays, bool consoleJson)
+    {
+        var resolvedRoot = string.IsNullOrWhiteSpace(rootDirectory)
+            ? AppContext.BaseDirectory
+            : Path.GetFullPath(rootDirectory);
+
+        DailyJsonlLogStore? newStore = null;
         try
         {
-            var directory = Path.GetDirectoryName(_filePath);
-            if (!string.IsNullOrWhiteSpace(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
+            newStore = new DailyJsonlLogStore(resolvedRoot, retentionDays);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
             Interlocked.Exchange(ref _fileDisabled, 1);
-            Console.Error.WriteLine($"Structured file logging disabled: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"Structured file logging disabled: {ex.Message}");
+        }
+
+        lock (Gate)
+        {
+            var previous = _store;
+            _store = newStore;
+            _consoleJson = consoleJson;
+            Interlocked.Exchange(ref _fileDisabled, newStore is null ? 1 : 0);
+            previous?.Dispose();
+        }
+
+        if (newStore is not null)
+        {
+            _ = CleanupRetentionSafelyAsync(newStore);
         }
     }
 
@@ -79,25 +109,35 @@ internal static class AppLog
 
         if (_consoleJson)
         {
-            Console.WriteLine(line);
+            System.Diagnostics.Debug.WriteLine(line);
         }
 
-        if (_filePath is null || Volatile.Read(ref _fileDisabled) != 0)
+        var store = Volatile.Read(ref _store);
+        if (store is null || Volatile.Read(ref _fileDisabled) != 0)
         {
             return;
         }
 
-        lock (Gate)
+        try
         {
-            try
-            {
-                File.AppendAllText(_filePath, line + Environment.NewLine);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                Interlocked.Exchange(ref _fileDisabled, 1);
-                Console.Error.WriteLine($"Structured file logging disabled: {ex.Message}");
-            }
+            store.AppendLine(line);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException)
+        {
+            Interlocked.Exchange(ref _fileDisabled, 1);
+            System.Diagnostics.Debug.WriteLine($"Structured file logging disabled: {ex.Message}");
+        }
+    }
+
+    private static async Task CleanupRetentionSafelyAsync(DailyJsonlLogStore store)
+    {
+        try
+        {
+            await store.CleanupRetentionAsync();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine($"Log retention cleanup failed: {ex.Message}");
         }
     }
 
