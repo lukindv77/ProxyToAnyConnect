@@ -10,6 +10,7 @@ internal sealed class MainForm : Form
 
     private readonly string _configPath;
     private readonly ProxyRuntimeHost _runtimeHost;
+    private readonly SerializedConfigurationCommandQueue _configurationCommands = new();
     private readonly DataGridView _proxyGrid = CreateGrid();
     private readonly DataGridView _vpnGrid = CreateGrid();
     private readonly Dictionary<string, DataGridViewRow> _proxyRows = new(StringComparer.OrdinalIgnoreCase);
@@ -66,14 +67,14 @@ internal sealed class MainForm : Form
         {
             if (e.RowIndex >= 0)
             {
-                await EditSelectedProxyAsync();
+                await RunConfigurationCommandAsync(EditSelectedProxyAsync);
             }
         };
         _vpnGrid.CellDoubleClick += async (_, e) =>
         {
             if (e.RowIndex >= 0)
             {
-                await EditSelectedVpnAsync();
+                await RunConfigurationCommandAsync(EditSelectedVpnAsync);
             }
         };
 
@@ -141,9 +142,9 @@ internal sealed class MainForm : Form
         var add = new Button { Text = "Добавить", AutoSize = true };
         var edit = new Button { Text = "Изменить", AutoSize = true };
         var remove = new Button { Text = "Удалить", AutoSize = true };
-        add.Click += async (_, _) => await AddProxyAsync();
-        edit.Click += async (_, _) => await EditSelectedProxyAsync();
-        remove.Click += async (_, _) => await RemoveSelectedProxyAsync();
+        add.Click += async (_, _) => await RunConfigurationCommandAsync(AddProxyAsync);
+        edit.Click += async (_, _) => await RunConfigurationCommandAsync(EditSelectedProxyAsync);
+        remove.Click += async (_, _) => await RunConfigurationCommandAsync(RemoveSelectedProxyAsync);
         toolbar.Controls.AddRange([add, edit, remove]);
 
         var page = new TabPage("Proxies");
@@ -175,9 +176,9 @@ internal sealed class MainForm : Form
         var add = new Button { Text = "Добавить", AutoSize = true };
         var edit = new Button { Text = "Изменить", AutoSize = true };
         var remove = new Button { Text = "Удалить", AutoSize = true };
-        add.Click += async (_, _) => await AddVpnAsync();
-        edit.Click += async (_, _) => await EditSelectedVpnAsync();
-        remove.Click += async (_, _) => await RemoveSelectedVpnAsync();
+        add.Click += async (_, _) => await RunConfigurationCommandAsync(AddVpnAsync);
+        edit.Click += async (_, _) => await RunConfigurationCommandAsync(EditSelectedVpnAsync);
+        remove.Click += async (_, _) => await RunConfigurationCommandAsync(RemoveSelectedVpnAsync);
         toolbar.Controls.AddRange([add, edit, remove]);
 
         var page = new TabPage("L2TP");
@@ -215,7 +216,19 @@ internal sealed class MainForm : Form
         layout.SetColumnSpan(_effectiveLogPath, 2);
 
         var save = new Button { Text = "Сохранить настройки логов", AutoSize = true };
-        save.Click += async (_, _) => await SaveLoggingSettingsAsync();
+        save.Click += async (_, _) =>
+        {
+            // Capture the user's requested log values at click time, but merge them
+            // with the freshest desired proxy/VPN topology only after this command's
+            // serialized turn begins.
+            var requestedLogging = new LoggingOptions
+            {
+                Directory = _logDirectory.Text.Trim(),
+                RetentionDays = decimal.ToInt32(_retentionDays.Value),
+                ConsoleJson = _options.Logging.ConsoleJson
+            };
+            await RunConfigurationCommandAsync(() => SaveLoggingSettingsAsync(requestedLogging));
+        };
         layout.Controls.Add(save, 1, 3);
 
         layout.Controls.Add(_configurationStatus, 0, 5);
@@ -333,6 +346,11 @@ internal sealed class MainForm : Form
             RefreshRuntimeViews();
         }
     }
+
+    private Task RunConfigurationCommandAsync(Func<Task> command) =>
+        _configurationCommands.RunAsync(
+            (_, _) => command(),
+            CancellationToken.None);
 
     private async Task AddProxyAsync()
     {
@@ -588,14 +606,12 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async Task SaveLoggingSettingsAsync()
+    private async Task SaveLoggingSettingsAsync(LoggingOptions newLogging)
     {
-        var newLogging = new LoggingOptions
-        {
-            Directory = _logDirectory.Text.Trim(),
-            RetentionDays = decimal.ToInt32(_retentionDays.Value),
-            ConsoleJson = _options.Logging.ConsoleJson
-        };
+        // This method runs only inside the serialized configuration command queue.
+        // Merge the captured log request with the latest persisted desired topology
+        // so an earlier proxy/VPN generation cannot be overwritten by a stale full
+        // AppOptions snapshot from a later log-only save.
         var newOptions = new AppOptions
         {
             Proxies = _options.Proxies,
