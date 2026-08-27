@@ -16,10 +16,11 @@ internal static class EphemeralRasPhonebookSelfTests
 
         try
         {
+            OrphanRecoveryRespectsCrossProcessOwnership();
             HappyPathCreateAndCleanup();
             PartialCreationFailureCleansPrivateResources();
             Console.WriteLine(
-                "PASS: private ephemeral L2TP RAS phonebook create/PSK/cleanup and partial-failure cleanup smoke tests");
+                "PASS: private ephemeral L2TP RAS phonebook ownership/orphan recovery/create/PSK/cleanup smoke tests");
             return 0;
         }
         catch (Exception ex)
@@ -27,6 +28,97 @@ internal static class EphemeralRasPhonebookSelfTests
             Console.Error.WriteLine($"FAIL: private ephemeral L2TP RAS phonebook smoke test: {ex}");
             return 1;
         }
+    }
+
+    private static void OrphanRecoveryRespectsCrossProcessOwnership()
+    {
+        var root = EphemeralRasPhonebook.SessionRootDirectory;
+        var suffix = Guid.NewGuid().ToString("N");
+        var staleWithoutLock = Path.Combine(root, $"selftest-stale-no-lock-{suffix}");
+        var staleUnlockedLock = Path.Combine(root, $"selftest-stale-unlocked-{suffix}");
+        var active = Path.Combine(root, $"selftest-active-{suffix}");
+        var legacyUnmarked = Path.Combine(root, $"selftest-legacy-{suffix}");
+        FileStream? activeLock = null;
+
+        try
+        {
+            CreateManagedMarker(staleWithoutLock);
+
+            CreateManagedMarker(staleUnlockedLock);
+            File.WriteAllText(
+                Path.Combine(staleUnlockedLock, EphemeralRasPhonebook.OwnershipLockFileName),
+                "stale");
+
+            CreateManagedMarker(active);
+            activeLock = new FileStream(
+                Path.Combine(active, EphemeralRasPhonebook.OwnershipLockFileName),
+                FileMode.CreateNew,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                FileOptions.None);
+
+            Directory.CreateDirectory(legacyUnmarked);
+            File.WriteAllText(Path.Combine(legacyUnmarked, "session.pbk"), "legacy");
+
+            EphemeralRasPhonebook.CleanupOrphanedSessionDirectories();
+
+            if (Directory.Exists(staleWithoutLock))
+            {
+                throw new InvalidOperationException(
+                    "Marked orphan without an owner lock was not recovered.");
+            }
+
+            if (Directory.Exists(staleUnlockedLock))
+            {
+                throw new InvalidOperationException(
+                    "Marked orphan with an unowned lock file was not recovered.");
+            }
+
+            if (!Directory.Exists(active))
+            {
+                throw new InvalidOperationException(
+                    "Orphan cleanup deleted a session whose owner lock is still held.");
+            }
+
+            if (!Directory.Exists(legacyUnmarked))
+            {
+                throw new InvalidOperationException(
+                    "Orphan cleanup deleted an unmarked legacy directory with unknown ownership.");
+            }
+
+            activeLock.Dispose();
+            activeLock = null;
+            EphemeralRasPhonebook.CleanupOrphanedSessionDirectories();
+
+            if (Directory.Exists(active))
+            {
+                throw new InvalidOperationException(
+                    "Marked session was not recovered after its owner lock was released.");
+            }
+
+            if (!Directory.Exists(legacyUnmarked))
+            {
+                throw new InvalidOperationException(
+                    "Second orphan cleanup deleted an unmarked legacy directory.");
+            }
+        }
+        finally
+        {
+            activeLock?.Dispose();
+            BestEffortDelete(staleWithoutLock);
+            BestEffortDelete(staleUnlockedLock);
+            BestEffortDelete(active);
+            BestEffortDelete(legacyUnmarked);
+        }
+    }
+
+    private static void CreateManagedMarker(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(
+            Path.Combine(directory, EphemeralRasPhonebook.OwnershipMarkerFileName),
+            "self-test managed session");
     }
 
     private static void HappyPathCreateAndCleanup()
@@ -54,6 +146,13 @@ internal static class EphemeralRasPhonebookSelfTests
                 {
                     throw new InvalidOperationException(
                         $"Private RAS phonebook was created outside the temporary runtime area: {phoneBookPath}");
+                }
+
+                if (!File.Exists(Path.Combine(sessionDirectory, EphemeralRasPhonebook.OwnershipMarkerFileName)) ||
+                    !File.Exists(Path.Combine(sessionDirectory, EphemeralRasPhonebook.OwnershipLockFileName)))
+                {
+                    throw new InvalidOperationException(
+                        "Private RAS session did not publish its managed ownership marker/lock.");
                 }
 
                 var dialParams = phoneBook.CreateDialParams(options.Custom);
