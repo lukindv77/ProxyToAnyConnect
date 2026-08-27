@@ -14,6 +14,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Synthetic native-command failure sentinel
+        id: native_failure_sentinel
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & $env:ComSpec /d /c 'exit 23'
+          throw 'Native command failure was incorrectly ignored.'
+
+      - name: Assert native-command failure propagation
+        shell: pwsh
+        run: |
+          if ('${{ steps.native_failure_sentinel.outcome }}' -ne 'failure') {
+            throw 'Synthetic native command failure did not fail its Actions step.'
+          }
+
       - name: Validate PowerShell tools
         shell: pwsh
         run: |
