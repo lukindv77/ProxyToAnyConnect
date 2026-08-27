@@ -4,240 +4,102 @@ internal static class CombinedTestRunner
 {
     public static async Task<int> Main()
     {
-        var existingResult = await Program.Main();
-        if (existingResult != 0)
+        var failedSuites = new List<string>();
+
+        async Task RunAsync(string name, Func<Task<int>> suite)
         {
-            return existingResult;
+            try
+            {
+                if (await suite() == 0)
+                {
+                    return;
+                }
+
+                failedSuites.Add(name);
+                Console.Error.WriteLine($"SUITE FAIL: {name} returned a non-zero result.");
+            }
+            catch (Exception ex)
+            {
+                failedSuites.Add(name);
+                Console.Error.WriteLine($"SUITE FAIL: {name} threw outside its normal test boundary: {ex}");
+            }
         }
 
-        var parserFailures = VerificationHttpParserTests.Run();
-        if (parserFailures != 0)
+        void Run(string name, Func<int> suite)
         {
-            Console.Error.WriteLine($"Additional verification parser tests failed: {parserFailures}.");
-            return 1;
+            try
+            {
+                if (suite() == 0)
+                {
+                    return;
+                }
+
+                failedSuites.Add(name);
+                Console.Error.WriteLine($"SUITE FAIL: {name} returned a non-zero result.");
+            }
+            catch (Exception ex)
+            {
+                failedSuites.Add(name);
+                Console.Error.WriteLine($"SUITE FAIL: {name} threw outside its normal test boundary: {ex}");
+            }
         }
 
-        Console.WriteLine("Additional verification parser tests passed.");
+        // Preserve the established order and run every suite sequentially. This
+        // intentionally adds no test parallelism or shared-state concurrency; it
+        // only prevents one independent failure from hiding later regressions in
+        // the same Windows CI run.
+        await RunAsync(nameof(Program), Program.Main);
+        Run(nameof(VerificationHttpParserTests), VerificationHttpParserTests.Run);
+        Run(nameof(VerificationParserSetupSelfTests), VerificationParserSetupSelfTests.Run);
+        Run(nameof(VerificationResponseReadSelfTests), VerificationResponseReadSelfTests.Run);
+        Run(nameof(VerificationChunkedDecodeSelfTests), VerificationChunkedDecodeSelfTests.Run);
+        Run(nameof(VerificationProbeRequestSelfTests), VerificationProbeRequestSelfTests.Run);
+        Run(nameof(VerificationBodyViewSelfTests), VerificationBodyViewSelfTests.Run);
+        Run(nameof(VerificationPooledResponseOwnerSelfTests), VerificationPooledResponseOwnerSelfTests.Run);
+        await RunAsync(nameof(ProxyLifetimeSelfTests), ProxyLifetimeSelfTests.RunAsync);
+        await RunAsync(nameof(ProxyShutdownDrainSelfTests), ProxyShutdownDrainSelfTests.RunAsync);
+        await RunAsync(nameof(AcceptedClientTransportSelfTests), AcceptedClientTransportSelfTests.RunAsync);
+        await RunAsync(nameof(NativeRouteSelfTests), NativeRouteSelfTests.RunAsync);
+        await RunAsync(nameof(IcmpBoundPingSelfTests), IcmpBoundPingSelfTests.RunAsync);
+        await RunAsync(nameof(RasDialerSelfTests), RasDialerSelfTests.RunAsync);
+        Run(nameof(RasReadyPublicationSelfTests), RasReadyPublicationSelfTests.Run);
+        await RunAsync(nameof(VpnLeaseManagerLifetimeSelfTests), VpnLeaseManagerLifetimeSelfTests.RunAsync);
+        await RunAsync(nameof(VpnSharedFailClosedSelfTests), VpnSharedFailClosedSelfTests.RunAsync);
+        Run(nameof(ReconnectCooldownSelfTests), ReconnectCooldownSelfTests.Run);
+        await RunAsync(nameof(LoggingAndMetricsSelfTests), LoggingAndMetricsSelfTests.RunAsync);
+        Run(nameof(DailyLogPathCacheSelfTests), DailyLogPathCacheSelfTests.Run);
+        Run(nameof(DailyLogEncodingSelfTests), DailyLogEncodingSelfTests.Run);
+        await RunAsync(nameof(RetentionCleanupSchedulerSelfTests), RetentionCleanupSchedulerSelfTests.RunAsync);
+        Run(nameof(SecuritySelfTests), SecuritySelfTests.Run);
+        Run(nameof(EphemeralRasPhonebookSelfTests), EphemeralRasPhonebookSelfTests.Run);
+        Run(nameof(DnsCacheSelfTests), DnsCacheSelfTests.Run);
+        Run(nameof(DnsQuerySetupSelfTests), DnsQuerySetupSelfTests.Run);
+        Run(nameof(DnsNameSkipSelfTests), DnsNameSkipSelfTests.Run);
+        Run(nameof(DnsResponseAddressListSelfTests), DnsResponseAddressListSelfTests.Run);
+        Run(nameof(DnsNameMaterializationSelfTests), DnsNameMaterializationSelfTests.Run);
+        Run(nameof(DnsCnameLoopTrackingSelfTests), DnsCnameLoopTrackingSelfTests.Run);
+        Run(nameof(DnsParsedResponseValueSelfTests), DnsParsedResponseValueSelfTests.Run);
+        Run(nameof(DnsAResultStorageSelfTests), DnsAResultStorageSelfTests.Run);
+        Run(nameof(VpnContextLifetimeSelfTests), VpnContextLifetimeSelfTests.Run);
+        Run(nameof(VpnLatestStatusSelfTests), VpnLatestStatusSelfTests.Run);
+        await RunAsync(nameof(ProcessMemoryHealthSelfTests), ProcessMemoryHealthSelfTests.RunAsync);
+        await RunAsync(nameof(ConfigurationAndReconfigureSelfTests), ConfigurationAndReconfigureSelfTests.RunAsync);
+        await RunAsync(nameof(RuntimeReconfigureCancellationSelfTests), RuntimeReconfigureCancellationSelfTests.RunAsync);
+        await RunAsync(nameof(ProxyTransactionalStartupSelfTests), ProxyTransactionalStartupSelfTests.RunAsync);
+        await RunAsync(nameof(SelectiveReconfigureStressSelfTests), SelectiveReconfigureStressSelfTests.RunAsync);
+        Run(nameof(ProxyHeaderScanSelfTests), ProxyHeaderScanSelfTests.Run);
+        Run(nameof(ProxyParserAllocationSelfTests), ProxyParserAllocationSelfTests.Run);
+        Run(nameof(ProxySetupTimingSelfTests), ProxySetupTimingSelfTests.Run);
+        Run(nameof(ProxyConnectSetupSelfTests), ProxyConnectSetupSelfTests.Run);
+        await RunAsync(nameof(ProxyHttpFramingSelfTests), ProxyHttpFramingSelfTests.RunAsync);
+        await RunAsync(nameof(ProxyLifecycleStressSelfTests), ProxyLifecycleStressSelfTests.RunAsync);
+        await RunAsync(nameof(ProxyDataPathSelfTests), ProxyDataPathSelfTests.RunAsync);
 
-        if (VerificationParserSetupSelfTests.Run() != 0)
+        if (failedSuites.Count != 0)
         {
-            return 1;
-        }
-
-        if (VerificationResponseReadSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (VerificationChunkedDecodeSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (VerificationProbeRequestSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (VerificationBodyViewSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (VerificationPooledResponseOwnerSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        var lifetimeFailures = await ProxyLifetimeSelfTests.RunAsync();
-        if (lifetimeFailures != 0)
-        {
-            return 1;
-        }
-
-        if (await ProxyShutdownDrainSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (await AcceptedClientTransportSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        var routeFailures = await NativeRouteSelfTests.RunAsync();
-        if (routeFailures != 0)
-        {
-            return 1;
-        }
-
-        if (await IcmpBoundPingSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (await RasDialerSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (RasReadyPublicationSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (await VpnLeaseManagerLifetimeSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (await VpnSharedFailClosedSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (ReconnectCooldownSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (await LoggingAndMetricsSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (DailyLogPathCacheSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (DailyLogEncodingSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (await RetentionCleanupSchedulerSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (SecuritySelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (EphemeralRasPhonebookSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (DnsCacheSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (DnsQuerySetupSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (DnsNameSkipSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (DnsResponseAddressListSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (DnsNameMaterializationSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (DnsCnameLoopTrackingSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (DnsParsedResponseValueSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (DnsAResultStorageSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (VpnContextLifetimeSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (VpnLatestStatusSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (await ProcessMemoryHealthSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (await ConfigurationAndReconfigureSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (await RuntimeReconfigureCancellationSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (await ProxyTransactionalStartupSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (await SelectiveReconfigureStressSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (ProxyHeaderScanSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (ProxyParserAllocationSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (ProxySetupTimingSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (ProxyConnectSetupSelfTests.Run() != 0)
-        {
-            return 1;
-        }
-
-        if (await ProxyHttpFramingSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (await ProxyLifecycleStressSelfTests.RunAsync() != 0)
-        {
-            return 1;
-        }
-
-        if (await ProxyDataPathSelfTests.RunAsync() != 0)
-        {
+            Console.Error.WriteLine(
+                $"Extended self-test run completed with {failedSuites.Count} failed suite(s): " +
+                string.Join(", ", failedSuites));
             return 1;
         }
 
