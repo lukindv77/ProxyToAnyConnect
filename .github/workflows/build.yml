@@ -136,6 +136,27 @@ jobs:
             -MinimumSamples 2 `
             -MinimumObservedDurationSeconds 1 | Write-Host
 
+          # Prove the manifest covers result.json too. A copied bundle remains valid
+          # until one manifested payload is altered, after which validation must fail.
+          $tamperedOutput = './artifacts/windows-soak-evidence-tampered'
+          Copy-Item -LiteralPath $output -Destination $tamperedOutput -Recurse
+          Add-Content -LiteralPath (Join-Path $tamperedOutput 'result.json') -Value ' ' -Encoding utf8
+          $tamperRejected = $false
+          try {
+            ./tools/Test-WindowsSoakEvidence.ps1 `
+              -OutputDirectory $tamperedOutput `
+              -ExpectedExecutableSha256 $hash `
+              -MinimumSamples 2 `
+              -MinimumObservedDurationSeconds 1 | Out-Null
+          }
+          catch {
+            $tamperRejected = $true
+            Write-Host "PASS: tampered soak bundle rejected: $($_.Exception.Message)"
+          }
+          if (-not $tamperRejected) {
+            throw 'Soak evidence validator accepted a post-manifest result.json mutation.'
+          }
+
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:
