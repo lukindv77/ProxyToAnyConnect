@@ -10,7 +10,8 @@ internal static class DnsParsedResponseValueSelfTests
     private const int AllocationIterations = 1000;
     private const int TimingRounds = 15;
     private const int InitialIterationsPerRound = 65536;
-    private const int MaxIterationsPerRound = 4 * 1024 * 1024;
+    private const int MaxIterationsPerRound = 32 * 1024 * 1024;
+    private const double TargetTimingWindowMilliseconds = 30;
     private const double MinimumTimingWindowMilliseconds = 20;
     private const double MaxMedianSlowdownRatio = 1.25;
     private static int _sink;
@@ -194,7 +195,7 @@ internal static class DnsParsedResponseValueSelfTests
             var minimumMilliseconds = Math.Min(
                 optimizedSample.ElapsedMilliseconds,
                 predecessorSample.ElapsedMilliseconds);
-            if (minimumMilliseconds >= MinimumTimingWindowMilliseconds)
+            if (minimumMilliseconds >= TargetTimingWindowMilliseconds)
             {
                 return iterations;
             }
@@ -202,14 +203,14 @@ internal static class DnsParsedResponseValueSelfTests
             if (iterations >= MaxIterationsPerRound)
             {
                 throw new InvalidOperationException(
-                    $"DNS timing calibration could not reach a {MinimumTimingWindowMilliseconds:F0} ms " +
-                    $"window within {MaxIterationsPerRound:N0} iterations.");
+                    $"DNS timing calibration could not reach a {TargetTimingWindowMilliseconds:F0} ms " +
+                    $"target within {MaxIterationsPerRound:N0} iterations.");
             }
 
             var safeElapsed = Math.Max(minimumMilliseconds, 0.001);
             var requiredScale = Math.Max(
                 2,
-                (int)Math.Ceiling(MinimumTimingWindowMilliseconds / safeElapsed));
+                (int)Math.Ceiling(TargetTimingWindowMilliseconds / safeElapsed));
             var requestedIterations = (long)iterations * requiredScale;
             iterations = (int)Math.Min(MaxIterationsPerRound, requestedIterations);
         }
