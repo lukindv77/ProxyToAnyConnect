@@ -28,7 +28,7 @@ jobs:
           $expectedBase = 'afb2df136dc757ab2f03ec613572d49f03175402'
           git merge-base --is-ancestor $expectedBase HEAD
 
-          $expectedPatchSha = '74c5e570aeabb3d43bfdf94e52e7d13232d5cad33a83513833cb3fd8160ceb3e'
+          $expectedPatchSha = '410b62940d2001f8ae63ebbdb2d2989686a05718aa4a4b7ad3ec19522384a423'
           $actualPatchSha = (Get-FileHash '.github/validation/issue45.patch' -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actualPatchSha -ne $expectedPatchSha) { throw "Unexpected #45 patch SHA-256: $actualPatchSha" }
 
