@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
@@ -201,11 +202,15 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 }
             }
 
-            // Stop only proxies whose own settings changed or whose L2TP runtime must be replaced.
-            foreach (var runtime in proxiesToDispose)
-            {
-                await runtime.DisposeAsync();
-            }
+            Exception? cleanupFailure = null;
+
+            // Stop every affected proxy before touching any changed/removed L2TP
+            // manager. One broken proxy teardown must not leave later removed
+            // runtimes alive but unreachable from the coordinator dictionaries.
+            cleanupFailure = await DisposeOwnedResourcesAsync(
+                proxiesToDispose.Cast<IAsyncDisposable>(),
+                "reconfigure-proxy",
+                cleanupFailure);
 
             VpnLeaseManager[] vpnsToDispose;
             lock (_collectionGate)
@@ -221,11 +226,15 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 }
             }
 
-            // Changed/removed L2TP managers are disposed after all dependent old proxy leases are released.
-            foreach (var runtime in vpnsToDispose)
-            {
-                await runtime.DisposeAsync();
-            }
+            // Changed/removed L2TP managers are disposed only after all dependent
+            // old proxy leases have had their cleanup attempt. Continue through all
+            // VPN managers even if one earlier teardown already failed.
+            cleanupFailure = await DisposeOwnedResourcesAsync(
+                vpnsToDispose.Cast<IAsyncDisposable>(),
+                "reconfigure-vpn",
+                cleanupFailure);
+
+            RethrowCoordinatorCleanupFailure(cleanupFailure);
 
             lock (_collectionGate)
             {
@@ -461,6 +470,48 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
     private static bool ConfigurationEquals<T>(T left, T right) =>
         JsonSerializer.Serialize(left) == JsonSerializer.Serialize(right);
 
+    internal static async Task<Exception?> DisposeOwnedResourcesAsync(
+        IEnumerable<IAsyncDisposable> resources,
+        string phase,
+        Exception? primaryFailure = null)
+    {
+        ArgumentNullException.ThrowIfNull(resources);
+        ArgumentException.ThrowIfNullOrWhiteSpace(phase);
+
+        var index = 0;
+        foreach (var resource in resources)
+        {
+            try
+            {
+                await resource.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                if (primaryFailure is null)
+                {
+                    primaryFailure = ex;
+                }
+                else
+                {
+                    primaryFailure.Data[$"CoordinatorCleanup:{phase}:{index}"] =
+                        $"{ex.GetType().FullName}: {ex.Message}";
+                }
+            }
+
+            index++;
+        }
+
+        return primaryFailure;
+    }
+
+    private static void RethrowCoordinatorCleanupFailure(Exception? cleanupFailure)
+    {
+        if (cleanupFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -487,15 +538,16 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 _pendingStartProxyIds.Clear();
             }
 
-            foreach (var proxy in proxies)
-            {
-                await proxy.DisposeAsync();
-            }
-
-            foreach (var vpn in vpns)
-            {
-                await vpn.DisposeAsync();
-            }
+            Exception? cleanupFailure = null;
+            cleanupFailure = await DisposeOwnedResourcesAsync(
+                proxies.Cast<IAsyncDisposable>(),
+                "dispose-proxy",
+                cleanupFailure);
+            cleanupFailure = await DisposeOwnedResourcesAsync(
+                vpns.Cast<IAsyncDisposable>(),
+                "dispose-vpn",
+                cleanupFailure);
+            RethrowCoordinatorCleanupFailure(cleanupFailure);
         }
         finally
         {
