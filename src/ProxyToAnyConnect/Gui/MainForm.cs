@@ -29,6 +29,7 @@ internal sealed class MainForm : Form
 
     private AppOptions _options;
     private bool _allowExit;
+    private int _configurationCommandsStopping;
 
     public MainForm(AppOptions options, string configPath, ProxyRuntimeHost runtimeHost)
     {
@@ -96,6 +97,12 @@ internal sealed class MainForm : Form
         WindowState = FormWindowState.Normal;
         Activate();
         BringToFront();
+    }
+
+    public Task StopConfigurationCommandsAsync()
+    {
+        Volatile.Write(ref _configurationCommandsStopping, 1);
+        return _configurationCommands.StopAsync();
     }
 
     public void AllowExit()
@@ -227,7 +234,8 @@ internal sealed class MainForm : Form
                 RetentionDays = decimal.ToInt32(_retentionDays.Value),
                 ConsoleJson = _options.Logging.ConsoleJson
             };
-            await RunConfigurationCommandAsync(() => SaveLoggingSettingsAsync(requestedLogging));
+            await RunConfigurationCommandAsync(
+                cancellationToken => SaveLoggingSettingsAsync(requestedLogging, cancellationToken));
         };
         layout.Controls.Add(save, 1, 3);
 
@@ -347,13 +355,29 @@ internal sealed class MainForm : Form
         }
     }
 
-    private Task RunConfigurationCommandAsync(Func<Task> command) =>
-        _configurationCommands.RunAsync(
-            (_, _) => command(),
-            CancellationToken.None);
-
-    private async Task AddProxyAsync()
+    private async Task RunConfigurationCommandAsync(Func<CancellationToken, Task> command)
     {
+        try
+        {
+            await _configurationCommands.RunAsync(
+                (_, cancellationToken) => command(cancellationToken),
+                CancellationToken.None);
+        }
+        catch (OperationCanceledException) when (Volatile.Read(ref _configurationCommandsStopping) != 0)
+        {
+            // Application exit owns cancellation of active/queued configuration
+            // generations. Do not surface a modal error while the UI is shutting down.
+        }
+        catch (ObjectDisposedException) when (Volatile.Read(ref _configurationCommandsStopping) != 0)
+        {
+            // A late click after shutdown started is ignored rather than becoming an
+            // unhandled async WinForms event exception.
+        }
+    }
+
+    private async Task AddProxyAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         if (_options.VpnConnections.Count == 0)
         {
             MessageBox.Show(this, "Сначала создайте L2TP соединение.", "ProxyToAnyConnect", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -366,6 +390,7 @@ internal sealed class MainForm : Form
             return;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         var proxies = _options.Proxies.ToList();
         proxies.Add(dialog.Result);
         await ApplyConfigurationAsync(new AppOptions
@@ -373,11 +398,12 @@ internal sealed class MainForm : Form
             Proxies = proxies,
             VpnConnections = _options.VpnConnections,
             Logging = _options.Logging
-        });
+        }, cancellationToken);
     }
 
-    private async Task EditSelectedProxyAsync()
+    private async Task EditSelectedProxyAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var id = SelectedRowId(_proxyGrid);
         if (id is null)
         {
@@ -396,6 +422,7 @@ internal sealed class MainForm : Form
             return;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         var replacement = dialog.Result;
         var proxies = _options.Proxies
             .Select(proxy => proxy.Id.Equals(id, StringComparison.OrdinalIgnoreCase) ? replacement : proxy)
@@ -405,11 +432,12 @@ internal sealed class MainForm : Form
             Proxies = proxies,
             VpnConnections = _options.VpnConnections,
             Logging = _options.Logging
-        });
+        }, cancellationToken);
     }
 
-    private async Task RemoveSelectedProxyAsync()
+    private async Task RemoveSelectedProxyAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var id = SelectedRowId(_proxyGrid);
         if (id is null)
         {
@@ -433,6 +461,7 @@ internal sealed class MainForm : Form
             return;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         var proxies = _options.Proxies
             .Where(proxy => !proxy.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
             .ToList();
@@ -441,17 +470,19 @@ internal sealed class MainForm : Form
             Proxies = proxies,
             VpnConnections = _options.VpnConnections,
             Logging = _options.Logging
-        });
+        }, cancellationToken);
     }
 
-    private async Task AddVpnAsync()
+    private async Task AddVpnAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         using var dialog = new L2tpSettingsDialog(null);
         if (dialog.ShowDialog(this) != DialogResult.OK)
         {
             return;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         var vpnConnections = _options.VpnConnections.ToList();
         vpnConnections.Add(dialog.Result);
         await ApplyConfigurationAsync(new AppOptions
@@ -459,11 +490,12 @@ internal sealed class MainForm : Form
             Proxies = _options.Proxies,
             VpnConnections = vpnConnections,
             Logging = _options.Logging
-        });
+        }, cancellationToken);
     }
 
-    private async Task EditSelectedVpnAsync()
+    private async Task EditSelectedVpnAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var id = SelectedRowId(_vpnGrid);
         if (id is null)
         {
@@ -482,6 +514,7 @@ internal sealed class MainForm : Form
             return;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         var replacement = dialog.Result;
         var vpnConnections = _options.VpnConnections
             .Select(vpn => vpn.Id.Equals(id, StringComparison.OrdinalIgnoreCase) ? replacement : vpn)
@@ -491,11 +524,12 @@ internal sealed class MainForm : Form
             Proxies = _options.Proxies,
             VpnConnections = vpnConnections,
             Logging = _options.Logging
-        });
+        }, cancellationToken);
     }
 
-    private async Task RemoveSelectedVpnAsync()
+    private async Task RemoveSelectedVpnAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var id = SelectedRowId(_vpnGrid);
         if (id is null)
         {
@@ -539,6 +573,7 @@ internal sealed class MainForm : Form
             return;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         var vpnConnections = _options.VpnConnections
             .Where(vpn => !vpn.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
             .ToList();
@@ -547,25 +582,33 @@ internal sealed class MainForm : Form
             Proxies = _options.Proxies,
             VpnConnections = vpnConnections,
             Logging = _options.Logging
-        });
+        }, cancellationToken);
     }
 
-    private async Task ApplyConfigurationAsync(AppOptions newOptions)
+    private async Task ApplyConfigurationAsync(
+        AppOptions newOptions,
+        CancellationToken cancellationToken)
     {
         var persisted = false;
         try
         {
             await PersistedDesiredConfiguration.SaveThenApplyAsync(
                 newOptions,
-                (desired, cancellationToken) => desired.SaveAsync(_configPath, cancellationToken),
+                (desired, operationToken) => desired.SaveAsync(_configPath, operationToken),
                 desired =>
                 {
                     _options = desired;
                     RebuildVpnNameIndex();
                     persisted = true;
                 },
-                (desired, cancellationToken) => _runtimeHost.ApplyOptionsAsync(desired, cancellationToken),
-                CancellationToken.None);
+                (desired, operationToken) => _runtimeHost.ApplyOptionsAsync(desired, operationToken),
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Exit cancellation may arrive before publication or after durable save.
+            // In the latter case the persisted desired state remains authoritative and
+            // will be reconciled on the next application start.
         }
         catch (Exception ex)
         {
@@ -580,7 +623,7 @@ internal sealed class MainForm : Form
         }
         finally
         {
-            if (persisted)
+            if (persisted && Volatile.Read(ref _configurationCommandsStopping) == 0)
             {
                 // Show the persisted desired settings through subsequent editors and
                 // refresh current runtime/Error state even when reconciliation failed.
@@ -606,7 +649,9 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async Task SaveLoggingSettingsAsync(LoggingOptions newLogging)
+    private async Task SaveLoggingSettingsAsync(
+        LoggingOptions newLogging,
+        CancellationToken cancellationToken)
     {
         // This method runs only inside the serialized configuration command queue.
         // Merge the captured log request with the latest persisted desired topology
@@ -621,10 +666,16 @@ internal sealed class MainForm : Form
 
         try
         {
-            await newOptions.SaveAsync(_configPath, CancellationToken.None);
+            await newOptions.SaveAsync(_configPath, cancellationToken);
             _options = newOptions;
             AppLog.Configure(newLogging);
-            RefreshLoggingSettings();
+            if (Volatile.Read(ref _configurationCommandsStopping) == 0)
+            {
+                RefreshLoggingSettings();
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
         }
         catch (Exception ex)
         {
