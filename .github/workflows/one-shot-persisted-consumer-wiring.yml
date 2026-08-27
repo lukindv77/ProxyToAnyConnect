@@ -1,0 +1,73 @@
+name: one-shot-persisted-consumer-wiring
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/one-shot-persisted-consumer-wiring.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wire one durable generation to all live consumers
+        shell: python {0}
+        run: |
+          from pathlib import Path
+
+          main = Path('src/ProxyToAnyConnect/Gui/MainForm.cs')
+          text = main.read_text(encoding='utf-8')
+          old_runtime = '(desired, operationToken) => _runtimeHost.ApplyOptionsAsync(desired, operationToken),'
+          if text.count(old_runtime) != 1:
+              raise SystemExit('Expected topology runtime apply delegate exactly once.')
+          text = text.replace(old_runtime, 'ApplyPersistedConfigurationAsync,', 1)
+
+          browse_anchor = '    private void BrowseLogDirectory(object? sender, EventArgs e)\n'
+          if text.count(browse_anchor) != 1:
+              raise SystemExit('BrowseLogDirectory anchor missing.')
+          helper = '''    private Task ApplyPersistedConfigurationAsync(\n        AppOptions desired,\n        CancellationToken cancellationToken) =>\n        PersistedConfigurationConsumers.ApplyAsync(\n            desired,\n            logging => AppLog.Configure(logging),\n            (options, operationToken) => _runtimeHost.ApplyOptionsAsync(options, operationToken),\n            cancellationToken);\n\n'''
+          text = text.replace(browse_anchor, helper + browse_anchor, 1)
+
+          start = text.index('    private Task SaveLoggingSettingsAsync(')
+          end = text.index('    private void RefreshLoggingSettings()', start)
+          replacement = '''    private Task SaveLoggingSettingsAsync(\n        LoggingOptions newLogging,\n        CancellationToken cancellationToken)\n    {\n        // Logging may be the final repair that makes a multi-error staged draft\n        // globally valid. Route it through the same full durable-generation path as\n        // topology edits so earlier staged proxy/VPN fixes are reconciled too.\n        return ApplyConfigurationAsync(\n            new AppOptions\n            {\n                Proxies = _options.Proxies,\n                VpnConnections = _options.VpnConnections,\n                Logging = newLogging\n            },\n            cancellationToken);\n    }\n\n'''
+          text = text[:start] + replacement + text[end:]
+          main.write_text(text, encoding='utf-8')
+
+          runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
+          text = runner.read_text(encoding='utf-8')
+          anchor = '        await RunAsync(nameof(EditableConfigurationWorkflowSelfTests), EditableConfigurationWorkflowSelfTests.RunAsync);\n'
+          if text.count(anchor) != 1:
+              raise SystemExit('Editable workflow runner anchor missing.')
+          text = text.replace(
+              anchor,
+              anchor + '        await RunAsync(nameof(PersistedConfigurationConsumersSelfTests), PersistedConfigurationConsumersSelfTests.RunAsync);\n',
+              1)
+          marker = 'persisted-desired-state/editable-draft-repair/GUI-topology-projection'
+          if text.count(marker) != 1:
+              raise SystemExit('Aggregate summary marker missing.')
+          text = text.replace(
+              marker,
+              'persisted-desired-state/editable-draft-repair/persisted-live-consumers/GUI-topology-projection',
+              1)
+          runner.write_text(text, encoding='utf-8')
+
+      - name: Commit source patch to review branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch='automation/persisted-consumer-wiring'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/ProxyToAnyConnect/Gui/MainForm.cs tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs
+          git diff --cached --check
+          git commit -m 'fix: apply persisted configuration to logging and runtime together'
+          git push --force origin "HEAD:refs/heads/$branch"
