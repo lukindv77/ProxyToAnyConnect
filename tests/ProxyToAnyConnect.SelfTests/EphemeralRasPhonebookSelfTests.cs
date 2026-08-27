@@ -19,10 +19,11 @@ internal static class EphemeralRasPhonebookSelfTests
         try
         {
             OrphanRecoveryRespectsCrossProcessOwnership();
+            OrphanRecoveryPreservesAmbiguousFilesystemContent();
             HappyPathCreateAndCleanup();
             PartialCreationFailureChurnCleansPrivateResources();
             Console.WriteLine(
-                $"PASS: private ephemeral L2TP RAS phonebook ownership/orphan recovery/create/PSK/cleanup and {PartialFailureChurnCycles}-cycle failure churn tests");
+                $"PASS: private ephemeral L2TP RAS phonebook exact-leaf/reparse-safe orphan recovery/create/PSK/cleanup and {PartialFailureChurnCycles}-cycle failure churn tests");
             return 0;
         }
         catch (Exception ex)
@@ -120,7 +121,118 @@ internal static class EphemeralRasPhonebookSelfTests
         Directory.CreateDirectory(directory);
         File.WriteAllText(
             Path.Combine(directory, EphemeralRasPhonebook.OwnershipMarkerFileName),
-            "self-test managed session");
+            ExpectedEntryNameForManagedDirectory(directory));
+    }
+
+    private static string ExpectedEntryNameForManagedDirectory(string directory)
+    {
+        var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(directory));
+        var separator = name.LastIndexOf('-');
+        if (separator <= 0)
+        {
+            throw new InvalidOperationException($"Self-test managed directory is not canonical: {directory}");
+        }
+
+        var sanitizedId = name[..separator];
+        var entryName = $"ProxyToAnyConnect-{sanitizedId}";
+        return entryName.Length <= RasNative.RasMaxEntryName
+            ? entryName
+            : entryName[..RasNative.RasMaxEntryName];
+    }
+
+    private static void OrphanRecoveryPreservesAmbiguousFilesystemContent()
+    {
+        var root = EphemeralRasPhonebook.SessionRootDirectory;
+        Directory.CreateDirectory(root);
+        var malformedMarker = Path.Combine(root, $"selftest-malformed-{Guid.NewGuid():N}");
+        var oversizedMarker = Path.Combine(root, $"selftest-oversized-{Guid.NewGuid():N}");
+        var unexpectedChild = Path.Combine(root, $"selftest-unexpected-{Guid.NewGuid():N}");
+        var nonCanonical = Path.Combine(root, "selftest-noncanonical-owned-looking");
+        var externalTarget = Path.Combine(
+            Path.GetTempPath(),
+            $"ProxyToAnyConnect-external-target-{Guid.NewGuid():N}");
+        var reparseSession = Path.Combine(root, $"selftest-reparse-{Guid.NewGuid():N}");
+        var reparseCreated = false;
+
+        try
+        {
+            CreateManagedMarker(malformedMarker);
+            File.WriteAllText(
+                Path.Combine(malformedMarker, EphemeralRasPhonebook.OwnershipMarkerFileName),
+                "ProxyToAnyConnect-wrong-entry");
+            File.WriteAllText(
+                Path.Combine(malformedMarker, EphemeralRasPhonebook.PhoneBookFileName),
+                "keep");
+
+            CreateManagedMarker(oversizedMarker);
+            File.WriteAllText(
+                Path.Combine(oversizedMarker, EphemeralRasPhonebook.OwnershipMarkerFileName),
+                new string('x', 2048));
+
+            CreateManagedMarker(unexpectedChild);
+            File.WriteAllText(
+                Path.Combine(unexpectedChild, "unexpected-child.txt"),
+                "must survive managed cleanup");
+
+            Directory.CreateDirectory(nonCanonical);
+            File.WriteAllText(
+                Path.Combine(nonCanonical, EphemeralRasPhonebook.OwnershipMarkerFileName),
+                "ProxyToAnyConnect-selftest-noncanonical-owned-looking");
+
+            try
+            {
+                Directory.CreateDirectory(externalTarget);
+                File.WriteAllText(Path.Combine(externalTarget, "sentinel.txt"), "external");
+                Directory.CreateSymbolicLink(reparseSession, externalTarget);
+                reparseCreated = true;
+                File.WriteAllText(
+                    Path.Combine(externalTarget, EphemeralRasPhonebook.OwnershipMarkerFileName),
+                    ExpectedEntryNameForManagedDirectory(reparseSession));
+            }
+            catch (Exception ex) when (
+                ex is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+            {
+                reparseCreated = false;
+            }
+
+            EphemeralRasPhonebook.CleanupOrphanedSessionDirectories();
+
+            foreach (var preserved in new[] { malformedMarker, oversizedMarker, unexpectedChild, nonCanonical })
+            {
+                if (!Directory.Exists(preserved))
+                {
+                    throw new InvalidOperationException(
+                        $"Orphan cleanup removed ambiguous managed-looking directory: {preserved}");
+                }
+            }
+
+            if (!File.Exists(Path.Combine(unexpectedChild, "unexpected-child.txt")) ||
+                !File.Exists(Path.Combine(unexpectedChild, EphemeralRasPhonebook.OwnershipMarkerFileName)))
+            {
+                throw new InvalidOperationException(
+                    "Orphan cleanup partially consumed a directory containing an unexpected child.");
+            }
+
+            if (reparseCreated &&
+                (!Directory.Exists(reparseSession) ||
+                 !File.Exists(Path.Combine(externalTarget, "sentinel.txt"))))
+            {
+                throw new InvalidOperationException(
+                    "Orphan cleanup traversed/deleted a reparse-point session or its external target.");
+            }
+        }
+        finally
+        {
+            BestEffortDelete(malformedMarker);
+            BestEffortDelete(oversizedMarker);
+            BestEffortDelete(unexpectedChild);
+            BestEffortDelete(nonCanonical);
+            if (reparseCreated)
+            {
+                BestEffortDelete(reparseSession);
+            }
+            BestEffortDelete(externalTarget);
+        }
     }
 
     private static void HappyPathCreateAndCleanup()
@@ -279,10 +391,15 @@ internal static class EphemeralRasPhonebookSelfTests
     {
         try
         {
-            if (!string.IsNullOrWhiteSpace(path) && Directory.Exists(path))
+            if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
             {
-                Directory.Delete(path, recursive: true);
+                return;
             }
+
+            var attributes = File.GetAttributes(path);
+            Directory.Delete(
+                path,
+                recursive: (attributes & FileAttributes.ReparsePoint) == 0);
         }
         catch
         {
