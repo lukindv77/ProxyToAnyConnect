@@ -29,9 +29,10 @@ jobs:
           $base = (git merge-base HEAD origin/main).Trim()
           if ($base -ne $expectedBase) { throw "Unexpected #44 merge base: $base" }
 
-          # The patch file is guarded by exact post-apply source/test blob identities below.
           git apply --check .github/validation/issue44.patch
           git apply .github/validation/issue44.patch
+          git apply --check .github/validation/issue44-testfix.patch
+          git apply .github/validation/issue44-testfix.patch
           git add -- src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs
 
           $sourceBlob = (git rev-parse ':src/ProxyToAnyConnect/Proxy/ProxyServer.cs').Trim()
@@ -39,7 +40,7 @@ jobs:
           if ($sourceBlob -ne '7033087e57a28d93bdfde3a495a795b8f4b314b1') {
             throw "Unexpected patched ProxyServer blob: $sourceBlob"
           }
-          if ($testBlob -ne 'fd1b736090c9a873a5f591deabbe3bac12b7b446') {
+          if ($testBlob -ne 'aca73652493fd7c769f831bf5011c997c41421a8') {
             throw "Unexpected patched framing-test blob: $testBlob"
           }
           $staged = @(git diff --cached --name-only)
