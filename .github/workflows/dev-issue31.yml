@@ -1,0 +1,183 @@
+name: dev-issue31
+
+on:
+  push:
+    branches: [ dev/issue31-helper-timeout ]
+    paths:
+      - '.github/workflows/dev-issue31.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply timeout seam and run isolated lifetime suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          from pathlib import Path
+
+          production = Path('src/ProxyToAnyConnect/Vpn/WindowsVpnProfileInspector.cs')
+          text = production.read_text(encoding='utf-8')
+          old_signature = '''    internal static async Task<string> ExecutePowerShellAsync(
+                  string script,
+                  string operation,
+                  CancellationToken cancellationToken)
+              {'''
+          new_signature = '''    internal static async Task<string> ExecutePowerShellAsync(
+                  string script,
+                  string operation,
+                  CancellationToken cancellationToken,
+                  TimeSpan? operationTimeout = null)
+              {
+                  var effectiveOperationTimeout = operationTimeout ?? InspectionTimeout;
+                  if (effectiveOperationTimeout <= TimeSpan.Zero)
+                  {
+                      throw new ArgumentOutOfRangeException(nameof(operationTimeout));
+                  }'''
+          if text.count(old_signature) != 1:
+              raise SystemExit(f'expected one ExecutePowerShellAsync signature, got {text.count(old_signature)}')
+          text = text.replace(old_signature, new_signature)
+          old_timeout = '        timeout.CancelAfter(InspectionTimeout);'
+          new_timeout = '        timeout.CancelAfter(effectiveOperationTimeout);'
+          if text.count(old_timeout) != 1:
+              raise SystemExit(f'expected one production inspection timeout arm, got {text.count(old_timeout)}')
+          production.write_text(text.replace(old_timeout, new_timeout), encoding='utf-8', newline='')
+
+          test = Path('tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs')
+          text = test.read_text(encoding='utf-8')
+          timeout_anchor = '    private static readonly TimeSpan HelperStartupObservationTimeout = TimeSpan.FromSeconds(15);\n'
+          timeout_addition = timeout_anchor + '    private static readonly TimeSpan HelperExecutionTimeout = TimeSpan.FromSeconds(30);\n'
+          if text.count(timeout_anchor) != 1:
+              raise SystemExit(f'expected one helper startup timeout anchor, got {text.count(timeout_anchor)}')
+          text = text.replace(timeout_anchor, timeout_addition)
+          old_call = '''            var inspection = WindowsVpnProfileInspector.ExecutePowerShellAsync(
+                      script,
+                      "exercise cancellation ownership",
+                      cancellation.Token);'''
+          new_call = '''            var inspection = WindowsVpnProfileInspector.ExecutePowerShellAsync(
+                      script,
+                      "exercise cancellation ownership",
+                      cancellation.Token,
+                      HelperExecutionTimeout);'''
+          if text.count(old_call) != 1:
+              raise SystemExit(f'expected one synthetic helper call, got {text.count(old_call)}')
+          test.write_text(text.replace(old_call, new_call), encoding='utf-8', newline='')
+          '@ | python -
+          git diff --check
+
+          $runner = 'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          @'
+          namespace ProxyToAnyConnect.SelfTests;
+
+          internal static class CombinedTestRunner
+          {
+              public static async Task<int> Main() =>
+                  await WindowsVpnProfileInspectorLifetimeSelfTests.RunAsync();
+          }
+          '@ | Set-Content -LiteralPath $runner -Encoding utf8
+
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+          git checkout -- $runner
+          git diff --check
+
+  publish:
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish validated timeout seam
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          from pathlib import Path
+
+          production = Path('src/ProxyToAnyConnect/Vpn/WindowsVpnProfileInspector.cs')
+          text = production.read_text(encoding='utf-8')
+          old_signature = '''    internal static async Task<string> ExecutePowerShellAsync(
+                  string script,
+                  string operation,
+                  CancellationToken cancellationToken)
+              {'''
+          new_signature = '''    internal static async Task<string> ExecutePowerShellAsync(
+                  string script,
+                  string operation,
+                  CancellationToken cancellationToken,
+                  TimeSpan? operationTimeout = null)
+              {
+                  var effectiveOperationTimeout = operationTimeout ?? InspectionTimeout;
+                  if (effectiveOperationTimeout <= TimeSpan.Zero)
+                  {
+                      throw new ArgumentOutOfRangeException(nameof(operationTimeout));
+                  }'''
+          if text.count(old_signature) != 1:
+              raise SystemExit('unexpected ExecutePowerShellAsync signature')
+          text = text.replace(old_signature, new_signature)
+          if text.count('        timeout.CancelAfter(InspectionTimeout);') != 1:
+              raise SystemExit('unexpected production timeout arm')
+          production.write_text(
+              text.replace(
+                  '        timeout.CancelAfter(InspectionTimeout);',
+                  '        timeout.CancelAfter(effectiveOperationTimeout);'),
+              encoding='utf-8', newline='')
+
+          test = Path('tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs')
+          text = test.read_text(encoding='utf-8')
+          timeout_anchor = '    private static readonly TimeSpan HelperStartupObservationTimeout = TimeSpan.FromSeconds(15);\n'
+          if text.count(timeout_anchor) != 1:
+              raise SystemExit('unexpected helper timeout anchor')
+          text = text.replace(
+              timeout_anchor,
+              timeout_anchor + '    private static readonly TimeSpan HelperExecutionTimeout = TimeSpan.FromSeconds(30);\n')
+          old_call = '''            var inspection = WindowsVpnProfileInspector.ExecutePowerShellAsync(
+                      script,
+                      "exercise cancellation ownership",
+                      cancellation.Token);'''
+          new_call = '''            var inspection = WindowsVpnProfileInspector.ExecutePowerShellAsync(
+                      script,
+                      "exercise cancellation ownership",
+                      cancellation.Token,
+                      HelperExecutionTimeout);'''
+          if text.count(old_call) != 1:
+              raise SystemExit('unexpected synthetic helper call')
+          test.write_text(text.replace(old_call, new_call), encoding='utf-8', newline='')
+          '@ | python -
+          git diff --check
+
+          $runner = 'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          $runnerBackup = Get-Content -LiteralPath $runner -Raw
+          @'
+          namespace ProxyToAnyConnect.SelfTests;
+
+          internal static class CombinedTestRunner
+          {
+              public static async Task<int> Main() =>
+                  await WindowsVpnProfileInspectorLifetimeSelfTests.RunAsync();
+          }
+          '@ | Set-Content -LiteralPath $runner -Encoding utf8
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+          Set-Content -LiteralPath $runner -Value $runnerBackup -NoNewline -Encoding utf8
+          git checkout -- $runner
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add src/ProxyToAnyConnect/Vpn/WindowsVpnProfileInspector.cs tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs
+          git commit -m 'test: decouple VPN helper cancellation from inspection timeout'
+          git push origin HEAD:refs/heads/dev/issue31-helper-timeout
