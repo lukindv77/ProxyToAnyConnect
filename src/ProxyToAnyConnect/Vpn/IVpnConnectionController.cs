@@ -9,6 +9,10 @@ internal interface IVpnConnectionController : IAsyncDisposable
 
     VpnConnectionState State { get; }
 
+    // Alternate/test controllers that do not implement reconnect throttling remain
+    // immediately eligible. RasConnectionManager supplies its live cooldown value.
+    long ReconnectCooldownRemainingMilliseconds => 0;
+
     Task<VpnContext> ConnectAsync(CancellationToken cancellationToken);
 
     Task DisconnectAsync();
