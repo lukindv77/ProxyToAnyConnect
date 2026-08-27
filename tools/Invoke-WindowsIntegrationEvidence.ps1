@@ -12,7 +12,16 @@ param(
 
     [string] $HttpProbeUrl = '',
 
+    # Backward-compatible default expected egress for every proxy endpoint.
     [string] $ExpectedVpnPublicIPv4 = '',
+
+    # Optional per-endpoint override for heterogeneous shared/dedicated groups.
+    # Example: @{ '127.0.0.1:18080'='198.51.100.10'; '127.0.0.1:18081'='203.0.113.20' }
+    [hashtable] $ExpectedProxyPublicIPv4 = @{},
+
+    # Optional direct host egress assertion proving non-proxy traffic stayed on the
+    # ordinary host path rather than following the L2TP-bound proxy route.
+    [string] $ExpectedDirectPublicIPv4 = '',
 
     [string] $LogDirectory = '',
 
@@ -64,6 +73,23 @@ function Get-OptionalPropertyValue {
     }
 
     return $property.Value
+}
+
+function Assert-IPv4Expectation {
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [AllowEmptyString()][string] $Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return
+    }
+
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($Value, [ref]$parsed) -or
+        $parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        throw "$Name must be an IPv4 address, got '$Value'."
+    }
 }
 
 function Invoke-Capture {
@@ -230,6 +256,32 @@ function Copy-RecentJsonlLogs {
     }
 }
 
+Assert-IPv4Expectation -Name 'ExpectedVpnPublicIPv4' -Value $ExpectedVpnPublicIPv4
+Assert-IPv4Expectation -Name 'ExpectedDirectPublicIPv4' -Value $ExpectedDirectPublicIPv4
+
+$proxyExpectations = @(
+    foreach ($key in @($ExpectedProxyPublicIPv4.Keys | Sort-Object)) {
+        $endpoint = [string]$key
+        $expected = [string]$ExpectedProxyPublicIPv4[$key]
+        if ($ProxyEndpoint -notcontains $endpoint) {
+            throw "ExpectedProxyPublicIPv4 endpoint '$endpoint' is not present in -ProxyEndpoint."
+        }
+        Assert-IPv4Expectation -Name "ExpectedProxyPublicIPv4[$endpoint]" -Value $expected
+        [ordered]@{
+            endpoint = $endpoint
+            publicIPv4 = $expected
+        }
+    }
+)
+
+$requiresExternalExpectation =
+    -not [string]::IsNullOrWhiteSpace($ExpectedVpnPublicIPv4) -or
+    -not [string]::IsNullOrWhiteSpace($ExpectedDirectPublicIPv4) -or
+    $proxyExpectations.Count -gt 0
+if ($SkipExternalProbes -and $requiresExternalExpectation) {
+    throw 'External egress expectations cannot be used together with -SkipExternalProbes.'
+}
+
 $stageName = $Stage.ToLowerInvariant()
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $stageDirectory = Join-Path $OutputDirectory $stageName
@@ -301,8 +353,36 @@ if (-not $SkipExternalProbes) {
 }
 
 $assertions = @()
-if (-not [string]::IsNullOrWhiteSpace($ExpectedVpnPublicIPv4) -and -not $SkipExternalProbes) {
+if (-not [string]::IsNullOrWhiteSpace($ExpectedDirectPublicIPv4) -and -not $SkipExternalProbes) {
+    $probe = $probes | Where-Object name -eq 'directHttps' | Select-Object -First 1
+    $actual = if ($null -ne $probe -and $probe.succeeded -and $probe.value.succeeded) {
+        [string]$probe.value.output
+    }
+    else {
+        ''
+    }
+    $assertions += [ordered]@{
+        name = 'expectedDirectPublicIPv4'
+        expected = $ExpectedDirectPublicIPv4
+        actual = $actual
+        passed = ($actual -eq $ExpectedDirectPublicIPv4)
+    }
+}
+
+if (-not $SkipExternalProbes) {
     foreach ($endpoint in $ProxyEndpoint) {
+        $override = $proxyExpectations | Where-Object endpoint -eq $endpoint | Select-Object -First 1
+        $expected = if ($null -ne $override) {
+            [string]$override.publicIPv4
+        }
+        else {
+            $ExpectedVpnPublicIPv4
+        }
+
+        if ([string]::IsNullOrWhiteSpace($expected)) {
+            continue
+        }
+
         $probe = $probes | Where-Object name -eq "proxyHttps:$endpoint" | Select-Object -First 1
         $actual = if ($null -ne $probe -and $probe.succeeded -and $probe.value.succeeded) {
             [string]$probe.value.output
@@ -311,10 +391,10 @@ if (-not [string]::IsNullOrWhiteSpace($ExpectedVpnPublicIPv4) -and -not $SkipExt
             ''
         }
         $assertions += [ordered]@{
-            name = "expectedVpnPublicIPv4:$endpoint"
-            expected = $ExpectedVpnPublicIPv4
+            name = "expectedProxyPublicIPv4:$endpoint"
+            expected = $expected
             actual = $actual
-            passed = ($actual -eq $ExpectedVpnPublicIPv4)
+            passed = ($actual -eq $expected)
         }
     }
 }
@@ -357,6 +437,11 @@ $record = [ordered]@{
         osVersion = [Environment]::OSVersion.VersionString
         is64BitOperatingSystem = [Environment]::Is64BitOperatingSystem
         powershellVersion = $PSVersionTable.PSVersion.ToString()
+    }
+    expectations = [ordered]@{
+        directPublicIPv4 = if ([string]::IsNullOrWhiteSpace($ExpectedDirectPublicIPv4)) { $null } else { $ExpectedDirectPublicIPv4 }
+        defaultProxyPublicIPv4 = if ([string]::IsNullOrWhiteSpace($ExpectedVpnPublicIPv4)) { $null } else { $ExpectedVpnPublicIPv4 }
+        proxyPublicIPv4 = $proxyExpectations
     }
     routes = $routesCapture
     routeFingerprint = $routeFingerprint
