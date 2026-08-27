@@ -86,6 +86,7 @@ internal static class CombinedTestRunner
         await RunAsync(nameof(ProcessMemoryHealthSelfTests), ProcessMemoryHealthSelfTests.RunAsync);
         await RunAsync(nameof(ConfigurationAndReconfigureSelfTests), ConfigurationAndReconfigureSelfTests.RunAsync);
         await RunAsync(nameof(RuntimeReconfigureCancellationSelfTests), RuntimeReconfigureCancellationSelfTests.RunAsync);
+        await RunAsync(nameof(CoordinatorOperationLifetimeSelfTests), CoordinatorOperationLifetimeSelfTests.RunAsync);
         await RunAsync(nameof(ProxyTransactionalStartupSelfTests), ProxyTransactionalStartupSelfTests.RunAsync);
         await RunAsync(nameof(SelectiveReconfigureStressSelfTests), SelectiveReconfigureStressSelfTests.RunAsync);
         Run(nameof(ProxyHeaderScanSelfTests), ProxyHeaderScanSelfTests.Run);
@@ -104,7 +105,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation, native-ICMP keepalive, cancellable-RAS-dial/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle, shared-VPN fail-closed/reconnect ownership, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation/generation-serialization, native-ICMP keepalive, cancellable-RAS-dial/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle, shared-VPN fail-closed/reconnect ownership, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
