@@ -226,21 +226,49 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             return;
         }
 
-        cancellation.Cancel();
+        Exception? cleanupFailure = null;
         try
         {
-            if (task is not null)
+            try
             {
-                await task;
+                cancellation.Cancel();
             }
-        }
-        catch (OperationCanceledException)
-        {
+            catch (Exception ex)
+            {
+                // Cancellation callbacks are cleanup participants, not owners of the
+                // maintenance task. Even a throwing callback must not skip joining the
+                // exact task or disposing its CTS.
+                CaptureCleanupFailure(ref cleanupFailure, ex, "maintenance-cancel");
+            }
+
+            try
+            {
+                if (task is not null)
+                {
+                    await task;
+                }
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                CaptureCleanupFailure(ref cleanupFailure, ex, "maintenance-task");
+            }
         }
         finally
         {
-            cancellation.Dispose();
+            try
+            {
+                cancellation.Dispose();
+            }
+            catch (Exception ex)
+            {
+                CaptureCleanupFailure(ref cleanupFailure, ex, "maintenance-token");
+            }
         }
+
+        RethrowCleanupFailure(cleanupFailure);
     }
 
     private async Task MaintainConnectionAsync(CancellationToken cancellationToken)
@@ -355,11 +383,21 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             return;
         }
 
-        _lifetime.Cancel();
         Exception? cleanupFailure = null;
-
         try
         {
+            try
+            {
+                _lifetime.Cancel();
+            }
+            catch (Exception ex)
+            {
+                // Manager lifetime cancellation is control flow. A throwing callback
+                // must not strand leases, maintenance, controller, cache or status
+                // ownership during DisposeAsync.
+                CaptureCleanupFailure(ref cleanupFailure, ex, "lifetime-cancel");
+            }
+
             await _gate.WaitAsync();
             try
             {
@@ -396,7 +434,14 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         }
         finally
         {
-            _lifetime.Dispose();
+            try
+            {
+                _lifetime.Dispose();
+            }
+            catch (Exception ex)
+            {
+                CaptureCleanupFailure(ref cleanupFailure, ex, "lifetime-token");
+            }
         }
 
         RethrowCleanupFailure(cleanupFailure);
