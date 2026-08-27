@@ -15,7 +15,8 @@ internal sealed record ProcessMemorySnapshot(
     int Gen0Collections,
     int Gen1Collections,
     int Gen2Collections,
-    int RasCallbackRootCount,
+    int NativeCallbackRootCount,
+    int NativeCallbackRootHighWatermark,
     int HandleCount,
     int ThreadCount);
 
@@ -62,7 +63,8 @@ internal sealed class ProcessMemoryHealthMonitor : IAsyncDisposable
             GC.CollectionCount(0),
             GC.CollectionCount(1),
             GC.CollectionCount(2),
-            WindowsRasDialNative.ActiveCallbackRootCount,
+            NativeCallbackRootHealth.CurrentCount,
+            NativeCallbackRootHealth.HighWatermark,
             process.HandleCount,
             process.Threads.Count);
     }
@@ -108,7 +110,8 @@ internal sealed class ProcessMemoryHealthMonitor : IAsyncDisposable
                 snapshot.Gen0Collections,
                 snapshot.Gen1Collections,
                 snapshot.Gen2Collections,
-                snapshot.RasCallbackRootCount,
+                snapshot.NativeCallbackRootCount,
+                snapshot.NativeCallbackRootHighWatermark,
                 snapshot.HandleCount,
                 snapshot.ThreadCount
             });
