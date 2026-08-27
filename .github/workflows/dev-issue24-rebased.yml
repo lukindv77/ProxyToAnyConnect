@@ -1,0 +1,105 @@
+name: dev-issue24-rebased
+
+on:
+  push:
+    branches: [ dev/issue24-rebased ]
+    paths:
+      - '.github/workflows/dev-issue24-rebased.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact dev head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Apply request-line hardening and run aggregate tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = 'src/ProxyToAnyConnect/Proxy/ProxyServer.cs'
+          $runner = 'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          if ((git hash-object $source).Trim() -ne '0e7fb2493af0cbaa47d87199f137d7e97baa93f5') {
+            throw 'ProxyServer.cs no longer matches the accepted issue #23 source blob.'
+          }
+          if ((git hash-object $runner).Trim() -ne 'b9f4a666d7b16ecb2ec68f99159adebfa48a1cdc') {
+            throw 'CombinedTestRunner.cs no longer matches the audited issue #24 runner blob.'
+          }
+
+          @'
+          from pathlib import Path
+
+          source = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = source.read_text(encoding='utf-8')
+
+          old_uri = '''        if (!Uri.TryCreate(target, UriKind.Absolute, out var uri) ||
+                      !uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+                      string.IsNullOrWhiteSpace(uri.Host))'''
+          new_uri = '''        if (!Uri.TryCreate(target, UriKind.Absolute, out var uri) ||
+                      !uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+                      string.IsNullOrWhiteSpace(uri.Host) ||
+                      !string.IsNullOrEmpty(uri.Fragment) ||
+                      !string.IsNullOrEmpty(uri.UserInfo))'''
+          if text.count(old_uri) != 1:
+              raise SystemExit(f'expected one absolute-URI validation site, got {text.count(old_uri)}')
+          text = text.replace(old_uri, new_uri)
+
+          old_line = '''            var method = requestLine[requestParts[0]].ToString();
+                      var target = requestLine[requestParts[1]].ToString();
+                      var version = requestLine[requestParts[2]].ToString();
+                      var offset = requestLineEnd + 2;'''
+          new_line = '''            var methodSpan = requestLine[requestParts[0]];
+                      var versionSpan = requestLine[requestParts[2]];
+                      if (!IsValidHeaderName(methodSpan))
+                      {
+                          throw new InvalidDataException("Invalid HTTP method token.");
+                      }
+
+                      if (!versionSpan.SequenceEqual("HTTP/1.0".AsSpan()) &&
+                          !versionSpan.SequenceEqual("HTTP/1.1".AsSpan()))
+                      {
+                          throw new InvalidDataException("Unsupported HTTP request version.");
+                      }
+
+                      var method = methodSpan.ToString();
+                      var target = requestLine[requestParts[1]].ToString();
+                      var version = versionSpan.ToString();
+                      var offset = requestLineEnd + 2;'''
+          if text.count(old_line) != 1:
+              raise SystemExit(f'expected one request-line materialization site, got {text.count(old_line)}')
+          text = text.replace(old_line, new_line)
+          source.write_text(text, encoding='utf-8', newline='')
+
+          runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
+          runner_text = runner.read_text(encoding='utf-8')
+          anchor = '        await RunAsync(nameof(ProxyHttpHeaderValueSelfTests), ProxyHttpHeaderValueSelfTests.RunAsync);\n'
+          addition = anchor + '        await RunAsync(nameof(ProxyHttpRequestLineSelfTests), ProxyHttpRequestLineSelfTests.RunAsync);\n'
+          if runner_text.count(anchor) != 1:
+              raise SystemExit(f'expected one header-value runner anchor, got {runner_text.count(anchor)}')
+          runner.write_text(runner_text.replace(anchor, addition), encoding='utf-8', newline='')
+          '@ | python -
+
+          git diff --check
+          $changed = @(git diff --name-only)
+          $expected = @($source, $runner)
+          if ($changed.Count -ne 2 -or @($changed | Where-Object { $_ -notin $expected }).Count -ne 0) {
+            throw "Unexpected request-line patch result: $($changed -join ', ')"
+          }
+
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add $source $runner
+          git commit -m 'proxy: validate HTTP request line and absolute target'
+          git push origin HEAD:refs/heads/dev/issue24-rebased
