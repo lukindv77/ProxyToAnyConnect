@@ -29,10 +29,12 @@ internal static class ProcessMemoryHealthSelfTests
                     $"start={snapshot.ProcessStartTimeUtc:O}/{expectedStartUtc:O}.");
             }
 
-            if (snapshot.RasCallbackRootCount < 0)
+            if (snapshot.NativeCallbackRootCount < 0 ||
+                snapshot.NativeCallbackRootHighWatermark < snapshot.NativeCallbackRootCount)
             {
                 throw new InvalidOperationException(
-                    $"Memory snapshot published an invalid RAS callback-root count: {snapshot.RasCallbackRootCount}.");
+                    $"Memory snapshot published invalid native callback-root health: " +
+                    $"current={snapshot.NativeCallbackRootCount}, high={snapshot.NativeCallbackRootHighWatermark}.");
             }
 
             await ThrowingCancellationCallbackStillDrainsAndDisposesAsync();
@@ -50,7 +52,7 @@ internal static class ProcessMemoryHealthSelfTests
             }
 
             Console.WriteLine(
-                $"PASS: process memory monitor captures process/RAS-root health and drains/disposes ownership through cancellation callback faults ({retained} final async/JIT root)");
+                $"PASS: process memory monitor captures process/native-root health and drains/disposes ownership through cancellation callback faults ({retained} final async/JIT root)");
             return 0;
         }
         catch (Exception ex)
@@ -111,7 +113,8 @@ internal static class ProcessMemoryHealthSelfTests
             if (current.TimestampUtc == default ||
                 current.ProcessId != Environment.ProcessId ||
                 current.ProcessStartTimeUtc != expectedStartUtc ||
-                current.RasCallbackRootCount < 0)
+                current.NativeCallbackRootCount < 0 ||
+                current.NativeCallbackRootHighWatermark < current.NativeCallbackRootCount)
             {
                 throw new InvalidOperationException(
                     $"Memory monitor {i} did not publish a correctly process-bound initial snapshot.");
