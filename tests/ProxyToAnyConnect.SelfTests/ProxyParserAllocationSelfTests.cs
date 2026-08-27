@@ -142,7 +142,7 @@ internal static class ProxyParserAllocationSelfTests
                 "GET http://example.test/multi HTTP/1.1\r\n" +
                 "Host: example.test\r\n" +
                 "connection: X-One\r\n" +
-                "Connection: x-two, , Upgrade\r\n" +
+                "Connection: x-two, Upgrade\r\n" +
                 "X-One: remove-one\r\n" +
                 "X-Two: remove-two\r\n" +
                 "Upgrade: websocket\r\n" +
@@ -172,7 +172,7 @@ internal static class ProxyParserAllocationSelfTests
         var commonRaw = Encoding.Latin1.GetBytes(
             "GET http://example.test/common HTTP/1.1\r\n" +
             "Host: example.test\r\n" +
-            "Connection: X-One, , x-two, X-One\r\n" +
+            "Connection: X-One, x-two, X-One\r\n" +
             "Connection: keep-alive\r\n" +
             "X-One: remove-one\r\n" +
             "X-Two: remove-two\r\n" +
