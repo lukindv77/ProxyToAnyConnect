@@ -96,6 +96,7 @@ if (-not $actualHash.Equals($expectedHash, [StringComparison]::Ordinal)) {
 $metadataPath = Join-Path $outputPath 'metadata.json'
 $samplesPath = Join-Path $outputPath 'process-samples.jsonl'
 $summaryPath = Join-Path $outputPath 'summary.json'
+$resultPath = Join-Path $outputPath 'result.json'
 $manifestPath = Join-Path $outputPath 'manifest.json'
 $startedAtUtc = [DateTimeOffset]::UtcNow
 
@@ -234,8 +235,21 @@ finally {
     }
     Write-JsonFile -Path $summaryPath -Value $summary
 
+    if ($null -eq $failure) {
+        # Keep the result portable: it deliberately contains no absolute output path.
+        # The bundle directory itself is the transport boundary and manifest paths are
+        # relative to that root.
+        Write-JsonFile -Path $resultPath -Value ([ordered]@{
+            schemaVersion = 1
+            completed = $true
+            sampleCount = $sampleCount
+            observedDurationSeconds = $observedDurationSeconds
+            executableSha256 = $actualHash
+        })
+    }
+
     $manifestFiles = @()
-    foreach ($fileName in @('metadata.json', 'process-samples.jsonl', 'summary.json')) {
+    foreach ($fileName in @('metadata.json', 'process-samples.jsonl', 'summary.json', 'result.json')) {
         $filePath = Join-Path $outputPath $fileName
         if (Test-Path -LiteralPath $filePath -PathType Leaf) {
             $item = Get-Item -LiteralPath $filePath
@@ -258,13 +272,5 @@ finally {
 if ($null -ne $failure) {
     throw $failure
 }
-
-Write-JsonFile -Path (Join-Path $outputPath 'result.json') -Value ([ordered]@{
-    schemaVersion = 1
-    completed = $true
-    outputDirectory = $outputPath
-    sampleCount = $sampleCount
-    executableSha256 = $actualHash
-})
 
 Get-Content -LiteralPath $summaryPath -Raw
