@@ -7,6 +7,7 @@ namespace ProxyToAnyConnect.Vpn;
 internal sealed class WindowsVpnProfileInspector
 {
     private static readonly TimeSpan InspectionTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ProcessTerminationTimeout = TimeSpan.FromSeconds(2);
 
     public async Task<VpnProfileInfo> InspectAsync(string entryName, CancellationToken cancellationToken)
     {
@@ -132,7 +133,7 @@ internal sealed class WindowsVpnProfileInspector
         return phoneBook;
     }
 
-    private static async Task<string> ExecutePowerShellAsync(
+    internal static async Task<string> ExecutePowerShellAsync(
         string script,
         string operation,
         CancellationToken cancellationToken)
@@ -169,8 +170,12 @@ internal sealed class WindowsVpnProfileInspector
             throw new InvalidOperationException($"Unable to start Windows PowerShell to {operation}.");
         }
 
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        // Keep draining both redirected pipes independently of caller cancellation.
+        // Cancellation owns the process lifetime below and kills/drains the helper
+        // before returning, so cancelling the readers separately would only make it
+        // easier for a verbose child to block on a full redirected pipe.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(InspectionTimeout);
@@ -179,9 +184,16 @@ internal sealed class WindowsVpnProfileInspector
         {
             await process.WaitForExitAsync(timeout.Token);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            TryKill(process);
+            var callerCancelled = cancellationToken.IsCancellationRequested;
+            await TerminateAndDrainAsync(process, stdoutTask, stderrTask);
+
+            if (callerCancelled)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
             throw new TimeoutException($"Timed out while attempting to {operation}.");
         }
 
@@ -197,6 +209,40 @@ internal sealed class WindowsVpnProfileInspector
         return stdout;
     }
 
+    private static async Task TerminateAndDrainAsync(
+        Process process,
+        Task<string> stdoutTask,
+        Task<string> stderrTask)
+    {
+        TryKill(process);
+
+        using var cleanupTimeout = new CancellationTokenSource(ProcessTerminationTimeout);
+        try
+        {
+            await process.WaitForExitAsync(cleanupTimeout.Token);
+        }
+        catch (OperationCanceledException) when (cleanupTimeout.IsCancellationRequested)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"Timed out while draining cancelled PowerShell process {process.Id}.");
+        }
+        catch (InvalidOperationException)
+        {
+            // Process already exited or was never associated by the time cleanup ran.
+        }
+
+        try
+        {
+            await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(cleanupTimeout.Token);
+        }
+        catch (Exception ex) when (
+            ex is OperationCanceledException or IOException or ObjectDisposedException)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"Unable to fully drain cancelled PowerShell redirected streams: {ex.Message}");
+        }
+    }
+
     private static void TryKill(Process process)
     {
         try
@@ -206,9 +252,16 @@ internal sealed class WindowsVpnProfileInspector
                 process.Kill(entireProcessTree: true);
             }
         }
-        catch (InvalidOperationException)
+        catch (Exception ex) when (
+            ex is InvalidOperationException or
+                System.ComponentModel.Win32Exception or
+                NotSupportedException)
         {
-            // Process exited between HasExited and Kill.
+            // Process exited between HasExited and Kill, or the platform refused
+            // termination. The bounded drain still prevents cancellation teardown
+            // from waiting forever.
+            System.Diagnostics.Debug.WriteLine(
+                $"Unable to terminate PowerShell helper cleanly: {ex.Message}");
         }
     }
 }
