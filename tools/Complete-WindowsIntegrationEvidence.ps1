@@ -7,9 +7,13 @@ param(
 
     [string] $ExpectedVpnPublicIPv4 = '',
 
+    [string] $ExpectedExecutableSha256 = '',
+
     [switch] $RequireExternalProbes,
 
     [switch] $RequireProxyHttpProbe,
+
+    [switch] $RequireProcessLifecycle,
 
     [switch] $AllowDirectPublicIPv4Match
 )
@@ -56,6 +60,41 @@ function Read-StageBundle {
         SummaryPath = $summaryPath
         ManifestPath = $manifestPath
     }
+}
+
+function Get-OptionalPropertyValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        $Object,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+
+    return $property.Value
+}
+
+function Get-CapturedProcesses {
+    param(
+        [Parameter(Mandatory = $true)] $Bundle,
+        [Parameter(Mandatory = $true)][string] $Stage
+    )
+
+    if ($null -eq $Bundle.Evidence.process -or -not $Bundle.Evidence.process.succeeded) {
+        throw "Required '$Stage' process evidence capture did not succeed."
+    }
+
+    return @($Bundle.Evidence.process.value | Where-Object { $null -ne $_ })
 }
 
 function Get-SuccessfulProbeOutput {
@@ -107,6 +146,58 @@ if ([string]::IsNullOrWhiteSpace($profileFingerprint) -or
     throw 'Windows VPN profile fingerprint changed between Baseline and Final checkpoints.'
 }
 
+$baselineProcesses = Get-CapturedProcesses -Bundle $baseline -Stage 'Baseline'
+$readyProcesses = Get-CapturedProcesses -Bundle $ready -Stage 'Ready'
+$finalProcesses = Get-CapturedProcesses -Bundle $final -Stage 'Final'
+
+if ($RequireProcessLifecycle) {
+    if ($baselineProcesses.Count -ne 0) {
+        throw "Process lifecycle acceptance expected no ProxyToAnyConnect process at Baseline, found $($baselineProcesses.Count)."
+    }
+    if ($readyProcesses.Count -ne 1) {
+        throw "Process lifecycle acceptance expected exactly one ProxyToAnyConnect process at Ready, found $($readyProcesses.Count)."
+    }
+    if ($finalProcesses.Count -ne 0) {
+        throw "Process lifecycle acceptance expected no ProxyToAnyConnect process after explicit Exit, found $($finalProcesses.Count)."
+    }
+}
+
+$expectedExecutableHash = $ExpectedExecutableSha256.Trim().ToLowerInvariant()
+if (-not [string]::IsNullOrWhiteSpace($expectedExecutableHash) -and
+    $expectedExecutableHash -notmatch '^[0-9a-f]{64}$') {
+    throw '-ExpectedExecutableSha256 must be exactly 64 hexadecimal SHA-256 characters.'
+}
+
+$readyExecutableSha256 = $null
+if (-not [string]::IsNullOrWhiteSpace($expectedExecutableHash)) {
+    if ($readyProcesses.Count -ne 1) {
+        throw "Exact binary acceptance requires exactly one ProxyToAnyConnect process at Ready, found $($readyProcesses.Count)."
+    }
+
+    $readyExecutableSha256 = [string](Get-OptionalPropertyValue -Object $readyProcesses[0] -Name 'ExecutableSha256')
+    $readyExecutableHashError = [string](Get-OptionalPropertyValue -Object $readyProcesses[0] -Name 'ExecutableHashError')
+    if ([string]::IsNullOrWhiteSpace($readyExecutableSha256)) {
+        $detail = if ([string]::IsNullOrWhiteSpace($readyExecutableHashError)) {
+            'no hash or hash-error metadata was recorded'
+        }
+        else {
+            "capture error type '$readyExecutableHashError'"
+        }
+        throw "Ready process executable SHA-256 was not captured ($detail)."
+    }
+
+    $readyExecutableSha256 = $readyExecutableSha256.Trim().ToLowerInvariant()
+    if ($readyExecutableSha256 -ne $expectedExecutableHash) {
+        throw "Ready ProxyToAnyConnect executable SHA-256 '$readyExecutableSha256' does not match expected CI binary '$expectedExecutableHash'."
+    }
+}
+elseif ($readyProcesses.Count -eq 1) {
+    $capturedHash = [string](Get-OptionalPropertyValue -Object $readyProcesses[0] -Name 'ExecutableSha256')
+    if (-not [string]::IsNullOrWhiteSpace($capturedHash)) {
+        $readyExecutableSha256 = $capturedHash.Trim().ToLowerInvariant()
+    }
+}
+
 $directPublicIPv4 = $null
 $proxyPublicIPv4 = [ordered]@{}
 $proxyHttpValidated = [ordered]@{}
@@ -146,7 +237,8 @@ elseif ($RequireProxyHttpProbe) {
 
 function New-StageSummary {
     param(
-        [Parameter(Mandatory = $true)] $Bundle
+        [Parameter(Mandatory = $true)] $Bundle,
+        [Parameter(Mandatory = $true)] $Processes
     )
 
     return [ordered]@{
@@ -156,6 +248,7 @@ function New-StageSummary {
         validatedFileCount = $Bundle.Manifest.fileCount
         routeFingerprint = [string]$Bundle.Evidence.routeFingerprint
         profileFingerprint = [string]$Bundle.Evidence.profileFingerprint
+        processCount = $Processes.Count
         assertionCount = $Bundle.Summary.assertionCount
         failedAssertionCount = $Bundle.Summary.failedAssertionCount
     }
@@ -169,6 +262,9 @@ $acceptance = [ordered]@{
     routeFingerprint = $routeFingerprint
     baselineProfileFingerprint = $profileFingerprint
     finalProfileFingerprint = [string]$final.Evidence.profileFingerprint
+    processLifecycleRequired = [bool]$RequireProcessLifecycle
+    expectedExecutableSha256 = if ([string]::IsNullOrWhiteSpace($expectedExecutableHash)) { $null } else { $expectedExecutableHash }
+    readyExecutableSha256 = $readyExecutableSha256
     externalProbesRequired = [bool]$RequireExternalProbes
     proxyHttpProbeRequired = [bool]$RequireProxyHttpProbe
     allowDirectPublicIPv4Match = [bool]$AllowDirectPublicIPv4Match
@@ -177,9 +273,9 @@ $acceptance = [ordered]@{
     proxyPublicIPv4 = $proxyPublicIPv4
     proxyHttpValidated = $proxyHttpValidated
     stages = [ordered]@{
-        Baseline = New-StageSummary -Bundle $baseline
-        Ready = New-StageSummary -Bundle $ready
-        Final = New-StageSummary -Bundle $final
+        Baseline = New-StageSummary -Bundle $baseline -Processes $baselineProcesses
+        Ready = New-StageSummary -Bundle $ready -Processes $readyProcesses
+        Final = New-StageSummary -Bundle $final -Processes $finalProcesses
     }
 }
 
