@@ -1,0 +1,94 @@
+name: dev-issue24-rebuilt
+
+on:
+  push:
+    branches: [ dev/issue24-rebuilt ]
+    paths:
+      - '.github/workflows/dev-issue24-rebuilt.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Align strict request-line comparators
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = @{
+            'src/ProxyToAnyConnect/Proxy/ProxyServer.cs' = 'a38656c5469b7ac3d0202fb536b7ef04114e479b'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs' = 'c5ffd7cd47534124727acf34aa6ac653b7872df7'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyHttpRequestLineSelfTests.cs' = '33002187a8587b6eac3b4749767d958752bd41f0'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs' = '7d881fb38d3f699b28827140c740ac7375ff3693'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs' = 'c19acaa333e738c5efb15a4ef327d8a97ff3703e'
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) {
+              throw "Unexpected #24 input blob for $($entry.Key): $actual"
+            }
+          }
+
+          @'
+          from pathlib import Path
+
+          alloc = Path('tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs')
+          text = alloc.read_text(encoding='utf-8')
+          old = '            "GET http://example.test/a HTTP/1.1 extra-data"'
+          new = '            "GET http://example.test/a HTTP/1.0"'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one obsolete request-line fixture, got {text.count(old)}')
+          alloc.write_text(text.replace(old, new), encoding='utf-8', newline='')
+
+          connect = Path('tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs')
+          text = connect.read_text(encoding='utf-8')
+          old = '''        var method = requestLine[requestParts[0]].ToString();
+                  var target = requestLine[requestParts[1]].ToString();
+                  var version = requestLine[requestParts[2]].ToString();'''
+          new = '''        var methodSpan = requestLine[requestParts[0]];
+                  var versionSpan = requestLine[requestParts[2]];
+                  if (!IsValidBaselineHeaderName(methodSpan))
+                  {
+                      throw new InvalidDataException("Invalid HTTP method token.");
+                  }
+
+                  if (!versionSpan.SequenceEqual("HTTP/1.0".AsSpan()) &&
+                      !versionSpan.SequenceEqual("HTTP/1.1".AsSpan()))
+                  {
+                      throw new InvalidDataException("Unsupported HTTP request version.");
+                  }
+
+                  var method = methodSpan.ToString();
+                  var target = requestLine[requestParts[1]].ToString();
+                  var version = versionSpan.ToString();'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one CONNECT comparator request-line block, got {text.count(old)}')
+          connect.write_text(text.replace(old, new), encoding='utf-8', newline='')
+          '@ | python -
+
+          git diff --check
+          $changed = @(git diff --name-only)
+          if ($changed.Count -ne 2 -or
+              $changed -notcontains 'tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs' -or
+              $changed -notcontains 'tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs') {
+            throw "Unexpected #24 comparator patch: $($changed -join ', ')"
+          }
+      - name: Run full aggregate self-tests
+        shell: pwsh
+        run: dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish comparator alignment
+        shell: pwsh
+        run: |
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs
+          git commit -m 'test: align proxy comparators with strict request line'
+          git push origin HEAD:refs/heads/dev/issue24-rebuilt
