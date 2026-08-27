@@ -5,7 +5,14 @@ param(
 
     [string[]] $ProxyEndpoint = @(),
 
+    # Backward-compatible default expected public IPv4 for every proxy endpoint.
     [string] $ExpectedVpnPublicIPv4 = '',
+
+    # Optional per-endpoint override for heterogeneous shared/dedicated groups.
+    [hashtable] $ExpectedProxyPublicIPv4 = @{},
+
+    # Optional expected public IPv4 for the ordinary, non-proxy host path.
+    [string] $ExpectedDirectPublicIPv4 = '',
 
     [string] $ExpectedExecutableSha256 = '',
 
@@ -84,6 +91,27 @@ function Get-OptionalPropertyValue {
     return $property.Value
 }
 
+function Assert-IPv4Expectation {
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [AllowEmptyString()][string] $Value,
+        [switch] $RequireValue
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        if ($RequireValue) {
+            throw "$Name must contain an IPv4 address."
+        }
+        return
+    }
+
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($Value, [ref]$parsed) -or
+        $parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        throw "$Name must be an IPv4 address, got '$Value'."
+    }
+}
+
 function Get-CapturedProcesses {
     param(
         [Parameter(Mandatory = $true)] $Bundle,
@@ -116,6 +144,84 @@ function Get-SuccessfulProbeOutput {
     }
 
     return ([string]$probe.value.output).Trim()
+}
+
+function Get-RecordedExpectationContract {
+    param([Parameter(Mandatory = $true)] $Evidence)
+
+    $metadata = Get-OptionalPropertyValue -Object $Evidence -Name 'expectations'
+    if ($null -eq $metadata) {
+        throw 'Ready evidence does not contain expectation-contract metadata.'
+    }
+
+    $direct = [string](Get-OptionalPropertyValue -Object $metadata -Name 'directPublicIPv4')
+    $defaultProxy = [string](Get-OptionalPropertyValue -Object $metadata -Name 'defaultProxyPublicIPv4')
+    $proxy = [ordered]@{}
+    foreach ($record in @((Get-OptionalPropertyValue -Object $metadata -Name 'proxyPublicIPv4') | Where-Object { $null -ne $_ })) {
+        $endpoint = [string](Get-OptionalPropertyValue -Object $record -Name 'endpoint')
+        $expected = [string](Get-OptionalPropertyValue -Object $record -Name 'publicIPv4')
+        if ([string]::IsNullOrWhiteSpace($endpoint) -or $proxy.Contains($endpoint)) {
+            throw "Ready evidence contains an invalid/duplicate per-proxy expectation endpoint '$endpoint'."
+        }
+        Assert-IPv4Expectation -Name "Ready expectations.proxyPublicIPv4[$endpoint]" -Value $expected -RequireValue
+        $proxy[$endpoint] = $expected
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($direct)) {
+        Assert-IPv4Expectation -Name 'Ready expectations.directPublicIPv4' -Value $direct
+    }
+    if (-not [string]::IsNullOrWhiteSpace($defaultProxy)) {
+        Assert-IPv4Expectation -Name 'Ready expectations.defaultProxyPublicIPv4' -Value $defaultProxy
+    }
+
+    return [pscustomobject]@{
+        Direct = $direct
+        DefaultProxy = $defaultProxy
+        Proxy = $proxy
+    }
+}
+
+Assert-IPv4Expectation -Name 'ExpectedVpnPublicIPv4' -Value $ExpectedVpnPublicIPv4
+Assert-IPv4Expectation -Name 'ExpectedDirectPublicIPv4' -Value $ExpectedDirectPublicIPv4
+
+$seenProxyEndpoints = @{}
+foreach ($endpointValue in $ProxyEndpoint) {
+    $endpoint = [string]$endpointValue
+    if ([string]::IsNullOrWhiteSpace($endpoint)) {
+        throw 'ProxyEndpoint values must not be empty.'
+    }
+    if ($seenProxyEndpoints.ContainsKey($endpoint)) {
+        throw "ProxyEndpoint contains duplicate endpoint '$endpoint'."
+    }
+    $seenProxyEndpoints[$endpoint] = $true
+}
+
+if ($null -eq $ExpectedProxyPublicIPv4) {
+    $ExpectedProxyPublicIPv4 = @{}
+}
+$requestedProxyExpectations = [ordered]@{}
+foreach ($key in @($ExpectedProxyPublicIPv4.Keys | Sort-Object)) {
+    $endpoint = [string]$key
+    $expected = [string]$ExpectedProxyPublicIPv4[$key]
+    if ([string]::IsNullOrWhiteSpace($endpoint)) {
+        throw 'ExpectedProxyPublicIPv4 endpoint keys must not be empty.'
+    }
+    if (-not $seenProxyEndpoints.ContainsKey($endpoint)) {
+        throw "ExpectedProxyPublicIPv4 endpoint '$endpoint' is not present in -ProxyEndpoint."
+    }
+    Assert-IPv4Expectation -Name "ExpectedProxyPublicIPv4[$endpoint]" -Value $expected -RequireValue
+    $requestedProxyExpectations[$endpoint] = $expected
+}
+
+$hasRequestedEgressExpectations =
+    -not [string]::IsNullOrWhiteSpace($ExpectedVpnPublicIPv4) -or
+    -not [string]::IsNullOrWhiteSpace($ExpectedDirectPublicIPv4) -or
+    $requestedProxyExpectations.Count -gt 0
+if ($hasRequestedEgressExpectations -and -not $RequireExternalProbes) {
+    throw 'Public-IPv4 expectations require -RequireExternalProbes so they cannot be silently accepted without probe validation.'
+}
+if ($RequireProxyHttpProbe -and -not $RequireExternalProbes) {
+    throw '-RequireProxyHttpProbe also requires -RequireExternalProbes.'
 }
 
 $validator = Join-Path $PSScriptRoot 'Test-WindowsIntegrationEvidence.ps1'
@@ -198,8 +304,18 @@ elseif ($readyProcesses.Count -eq 1) {
     }
 }
 
+$recordedExpectations = Get-RecordedExpectationContract -Evidence $ready.Evidence
+$recordedHasEgressExpectations =
+    -not [string]::IsNullOrWhiteSpace($recordedExpectations.Direct) -or
+    -not [string]::IsNullOrWhiteSpace($recordedExpectations.DefaultProxy) -or
+    $recordedExpectations.Proxy.Count -gt 0
+if ($recordedHasEgressExpectations -and -not $RequireExternalProbes) {
+    throw 'Ready evidence contains public-IPv4 expectations; aggregate acceptance must use -RequireExternalProbes.'
+}
+
 $directPublicIPv4 = $null
 $proxyPublicIPv4 = [ordered]@{}
+$effectiveExpectedProxyPublicIPv4 = [ordered]@{}
 $proxyHttpValidated = [ordered]@{}
 
 if ($RequireExternalProbes) {
@@ -207,18 +323,45 @@ if ($RequireExternalProbes) {
         throw '-RequireExternalProbes requires at least one -ProxyEndpoint.'
     }
 
-    $directPublicIPv4 = Get-SuccessfulProbeOutput -Evidence $ready.Evidence -Name 'directHttps'
-    foreach ($endpoint in $ProxyEndpoint) {
-        if ([string]::IsNullOrWhiteSpace($endpoint)) {
-            throw 'ProxyEndpoint values must not be empty.'
+    if ([string]$recordedExpectations.Direct -ne [string]$ExpectedDirectPublicIPv4) {
+        throw "Ready evidence direct egress expectation '$($recordedExpectations.Direct)' does not match aggregate expectation '$ExpectedDirectPublicIPv4'."
+    }
+    if ([string]$recordedExpectations.DefaultProxy -ne [string]$ExpectedVpnPublicIPv4) {
+        throw "Ready evidence default proxy egress expectation '$($recordedExpectations.DefaultProxy)' does not match aggregate expectation '$ExpectedVpnPublicIPv4'."
+    }
+    if ($recordedExpectations.Proxy.Count -ne $requestedProxyExpectations.Count) {
+        throw 'Ready evidence per-proxy expectation set does not match aggregate expectation set.'
+    }
+    foreach ($endpoint in $requestedProxyExpectations.Keys) {
+        if (-not $recordedExpectations.Proxy.Contains($endpoint) -or
+            [string]$recordedExpectations.Proxy[$endpoint] -ne [string]$requestedProxyExpectations[$endpoint]) {
+            throw "Ready evidence per-proxy expectation for '$endpoint' does not match aggregate expectation."
         }
+    }
 
+    $directPublicIPv4 = Get-SuccessfulProbeOutput -Evidence $ready.Evidence -Name 'directHttps'
+    Assert-IPv4Expectation -Name 'Observed direct public IPv4' -Value $directPublicIPv4 -RequireValue
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedDirectPublicIPv4) -and
+        $directPublicIPv4 -ne $ExpectedDirectPublicIPv4) {
+        throw "Direct host egress '$directPublicIPv4' does not match expected public IPv4 '$ExpectedDirectPublicIPv4'."
+    }
+
+    foreach ($endpoint in $ProxyEndpoint) {
         $proxyOutput = Get-SuccessfulProbeOutput -Evidence $ready.Evidence -Name "proxyHttps:$endpoint"
+        Assert-IPv4Expectation -Name "Observed proxy '$endpoint' public IPv4" -Value $proxyOutput -RequireValue
         $proxyPublicIPv4[$endpoint] = $proxyOutput
 
-        if (-not [string]::IsNullOrWhiteSpace($ExpectedVpnPublicIPv4) -and
-            $proxyOutput -ne $ExpectedVpnPublicIPv4) {
-            throw "Proxy '$endpoint' egress '$proxyOutput' does not match expected VPN public IPv4 '$ExpectedVpnPublicIPv4'."
+        $expectedProxyOutput = if ($requestedProxyExpectations.Contains($endpoint)) {
+            [string]$requestedProxyExpectations[$endpoint]
+        }
+        else {
+            $ExpectedVpnPublicIPv4
+        }
+        $effectiveExpectedProxyPublicIPv4[$endpoint] = if ([string]::IsNullOrWhiteSpace($expectedProxyOutput)) { $null } else { $expectedProxyOutput }
+
+        if (-not [string]::IsNullOrWhiteSpace($expectedProxyOutput) -and
+            $proxyOutput -ne $expectedProxyOutput) {
+            throw "Proxy '$endpoint' egress '$proxyOutput' does not match expected public IPv4 '$expectedProxyOutput'."
         }
 
         if (-not $AllowDirectPublicIPv4Match -and $directPublicIPv4 -eq $proxyOutput) {
@@ -230,9 +373,6 @@ if ($RequireExternalProbes) {
             $proxyHttpValidated[$endpoint] = $true
         }
     }
-}
-elseif ($RequireProxyHttpProbe) {
-    throw '-RequireProxyHttpProbe also requires -RequireExternalProbes.'
 }
 
 function New-StageSummary {
@@ -268,8 +408,11 @@ $acceptance = [ordered]@{
     externalProbesRequired = [bool]$RequireExternalProbes
     proxyHttpProbeRequired = [bool]$RequireProxyHttpProbe
     allowDirectPublicIPv4Match = [bool]$AllowDirectPublicIPv4Match
+    expectedDirectPublicIPv4 = if ([string]::IsNullOrWhiteSpace($ExpectedDirectPublicIPv4)) { $null } else { $ExpectedDirectPublicIPv4 }
     directPublicIPv4 = $directPublicIPv4
     expectedVpnPublicIPv4 = if ([string]::IsNullOrWhiteSpace($ExpectedVpnPublicIPv4)) { $null } else { $ExpectedVpnPublicIPv4 }
+    expectedProxyPublicIPv4 = $requestedProxyExpectations
+    effectiveExpectedProxyPublicIPv4 = $effectiveExpectedProxyPublicIPv4
     proxyPublicIPv4 = $proxyPublicIPv4
     proxyHttpValidated = $proxyHttpValidated
     stages = [ordered]@{

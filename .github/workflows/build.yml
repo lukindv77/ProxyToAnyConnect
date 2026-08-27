@@ -115,6 +115,167 @@ jobs:
             throw 'Evidence lifecycle did not enforce exact Ready binary/process identity.'
           }
 
+          # Exercise the heterogeneous egress contract without contacting the network.
+          # The Ready bundle is mutated as one internally-consistent synthetic capture;
+          # Test-WindowsIntegrationEvidence must validate the recorded expectation/probe/
+          # assertion relationship before Complete aggregates it.
+          $proxyA = '127.0.0.1:18080'
+          $proxyB = '127.0.0.1:18081'
+          $proxyADefaultIPv4 = '198.51.100.10'
+          $proxyBOverrideIPv4 = '203.0.113.20'
+          $directExpectedIPv4 = '192.0.2.30'
+          $readyEvidence = Get-Content -LiteralPath $readyEvidencePath -Raw | ConvertFrom-Json
+          $readyEvidence.expectations = [pscustomobject]@{
+            directPublicIPv4 = $directExpectedIPv4
+            defaultProxyPublicIPv4 = $proxyADefaultIPv4
+            proxyPublicIPv4 = @(
+              [pscustomobject]@{ endpoint = $proxyB; publicIPv4 = $proxyBOverrideIPv4 }
+            )
+          }
+          $readyEvidence.probes = @(
+            [pscustomobject]@{
+              name = 'directHttps'
+              succeeded = $true
+              value = [pscustomobject]@{ output = $directExpectedIPv4; succeeded = $true }
+              error = $null
+            },
+            [pscustomobject]@{
+              name = "proxyHttps:$proxyA"
+              succeeded = $true
+              value = [pscustomobject]@{ output = $proxyADefaultIPv4; succeeded = $true }
+              error = $null
+            },
+            [pscustomobject]@{
+              name = "proxyHttps:$proxyB"
+              succeeded = $true
+              value = [pscustomobject]@{ output = $proxyBOverrideIPv4; succeeded = $true }
+              error = $null
+            }
+          )
+          $readyEvidence.assertions = @(
+            @($readyEvidence.assertions) + @(
+              [pscustomobject]@{
+                name = 'expectedDirectPublicIPv4'
+                expected = $directExpectedIPv4
+                actual = $directExpectedIPv4
+                passed = $true
+              },
+              [pscustomobject]@{
+                name = "expectedProxyPublicIPv4:$proxyA"
+                expected = $proxyADefaultIPv4
+                actual = $proxyADefaultIPv4
+                passed = $true
+              },
+              [pscustomobject]@{
+                name = "expectedProxyPublicIPv4:$proxyB"
+                expected = $proxyBOverrideIPv4
+                actual = $proxyBOverrideIPv4
+                passed = $true
+              }
+            )
+          )
+          $readyEvidence | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $readyEvidencePath -Encoding utf8
+
+          $readySummaryPath = Join-Path (Join-Path $output 'ready') 'summary.json'
+          $readySummary = Get-Content -LiteralPath $readySummaryPath -Raw | ConvertFrom-Json
+          $readyFailedAssertions = @($readyEvidence.assertions | Where-Object { -not $_.passed })
+          $readySummary.assertionCount = @($readyEvidence.assertions).Count
+          $readySummary.failedAssertionCount = $readyFailedAssertions.Count
+          $readySummary.failedAssertions = @($readyFailedAssertions | ForEach-Object name)
+          $readySummary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $readySummaryPath -Encoding utf8
+
+          $syntheticProxyExpectations = @{ $proxyB = $proxyBOverrideIPv4 }
+          ./tools/Complete-WindowsIntegrationEvidence.ps1 `
+            -OutputDirectory $output `
+            -ProxyEndpoint @($proxyA, $proxyB) `
+            -ExpectedVpnPublicIPv4 $proxyADefaultIPv4 `
+            -ExpectedProxyPublicIPv4 $syntheticProxyExpectations `
+            -ExpectedDirectPublicIPv4 $directExpectedIPv4 `
+            -ExpectedExecutableSha256 $syntheticExecutableSha256 `
+            -RequireProcessLifecycle `
+            -RequireExternalProbes | Write-Host
+
+          $egressAcceptance = Get-Content -LiteralPath $acceptancePath -Raw | ConvertFrom-Json
+          $expectedProxyA = [string]$egressAcceptance.effectiveExpectedProxyPublicIPv4.PSObject.Properties[$proxyA].Value
+          $expectedProxyB = [string]$egressAcceptance.effectiveExpectedProxyPublicIPv4.PSObject.Properties[$proxyB].Value
+          $observedProxyA = [string]$egressAcceptance.proxyPublicIPv4.PSObject.Properties[$proxyA].Value
+          $observedProxyB = [string]$egressAcceptance.proxyPublicIPv4.PSObject.Properties[$proxyB].Value
+          if (-not $egressAcceptance.externalProbesRequired -or
+              $egressAcceptance.expectedDirectPublicIPv4 -ne $directExpectedIPv4 -or
+              $egressAcceptance.directPublicIPv4 -ne $directExpectedIPv4 -or
+              $expectedProxyA -ne $proxyADefaultIPv4 -or
+              $expectedProxyB -ne $proxyBOverrideIPv4 -or
+              $observedProxyA -ne $proxyADefaultIPv4 -or
+              $observedProxyB -ne $proxyBOverrideIPv4) {
+            throw 'Evidence lifecycle did not preserve heterogeneous proxy/direct egress expectations.'
+          }
+
+          # Aggregate mismatches must fail without replacing the last successful verdict.
+          $acceptedHash = (Get-FileHash -LiteralPath $acceptancePath -Algorithm SHA256).Hash
+          $wrongProxyRejected = $false
+          try {
+            ./tools/Complete-WindowsIntegrationEvidence.ps1 `
+              -OutputDirectory $output `
+              -ProxyEndpoint @($proxyA, $proxyB) `
+              -ExpectedVpnPublicIPv4 $proxyADefaultIPv4 `
+              -ExpectedProxyPublicIPv4 @{ $proxyB = '203.0.113.21' } `
+              -ExpectedDirectPublicIPv4 $directExpectedIPv4 `
+              -ExpectedExecutableSha256 $syntheticExecutableSha256 `
+              -RequireProcessLifecycle `
+              -RequireExternalProbes | Out-Null
+          }
+          catch {
+            $wrongProxyRejected = $true
+          }
+          if (-not $wrongProxyRejected) {
+            throw 'Aggregate evidence accepted an incorrect per-proxy public IPv4 expectation.'
+          }
+
+          $wrongDirectRejected = $false
+          try {
+            ./tools/Complete-WindowsIntegrationEvidence.ps1 `
+              -OutputDirectory $output `
+              -ProxyEndpoint @($proxyA, $proxyB) `
+              -ExpectedVpnPublicIPv4 $proxyADefaultIPv4 `
+              -ExpectedProxyPublicIPv4 $syntheticProxyExpectations `
+              -ExpectedDirectPublicIPv4 '192.0.2.31' `
+              -ExpectedExecutableSha256 $syntheticExecutableSha256 `
+              -RequireProcessLifecycle `
+              -RequireExternalProbes | Out-Null
+          }
+          catch {
+            $wrongDirectRejected = $true
+          }
+          if (-not $wrongDirectRejected) {
+            throw 'Aggregate evidence accepted an incorrect direct-host public IPv4 expectation.'
+          }
+          if ((Get-FileHash -LiteralPath $acceptancePath -Algorithm SHA256).Hash -ne $acceptedHash) {
+            throw 'A rejected aggregate egress verdict replaced the last successful acceptance summary.'
+          }
+
+          # Stage validation must also reject internally inconsistent expectation metadata.
+          $tamperedOutput = './artifacts/integration-evidence-egress-tampered'
+          if (Test-Path -LiteralPath $tamperedOutput) {
+            Remove-Item -LiteralPath $tamperedOutput -Recurse -Force
+          }
+          Copy-Item -LiteralPath $output -Destination $tamperedOutput -Recurse
+          $tamperedReadyPath = Join-Path (Join-Path $tamperedOutput 'ready') 'evidence.json'
+          $tamperedReady = Get-Content -LiteralPath $tamperedReadyPath -Raw | ConvertFrom-Json
+          $tamperedReady.expectations.directPublicIPv4 = '192.0.2.31'
+          $tamperedReady | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tamperedReadyPath -Encoding utf8
+          $tamperedRejected = $false
+          try {
+            ./tools/Test-WindowsIntegrationEvidence.ps1 `
+              -Stage Ready `
+              -OutputDirectory $tamperedOutput | Out-Null
+          }
+          catch {
+            $tamperedRejected = $true
+          }
+          if (-not $tamperedRejected) {
+            throw 'Stage evidence validator accepted inconsistent direct-egress expectation metadata.'
+          }
+
       - name: Smoke-test Windows soak evidence lifecycle
         shell: pwsh
         run: |
