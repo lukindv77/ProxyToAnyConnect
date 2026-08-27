@@ -358,6 +358,17 @@ internal sealed class MainForm : Form
             return;
         }
 
+        // Start/Pause is a GUI control generation just like Add/Edit/Remove. Queue it
+        // behind any earlier configuration transaction and recompute desired/runtime
+        // state only when its turn begins, so a stale row click cannot overtake a
+        // reconfigure or target a proxy that was removed by an earlier generation.
+        await RunConfigurationCommandAsync(
+            cancellationToken => ToggleProxyAsync(proxyId, cancellationToken));
+    }
+
+    private async Task ToggleProxyAsync(string proxyId, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         var view = RuntimeViewProjection.ProjectProxies(
                 _options.Proxies,
                 _runtimeHost.GetProxySnapshots(),
@@ -372,20 +383,30 @@ internal sealed class MainForm : Form
         {
             if (view.State is nameof(ProxyInstanceState.Running) or nameof(ProxyInstanceState.Starting))
             {
-                await _runtimeHost.PauseProxyAsync(proxyId);
+                await _runtimeHost.PauseProxyAsync(proxyId, cancellationToken);
             }
             else
             {
-                await _runtimeHost.StartProxyAsync(proxyId);
+                await _runtimeHost.StartProxyAsync(proxyId, cancellationToken);
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.Message, "ProxyToAnyConnect", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (Volatile.Read(ref _configurationCommandsStopping) == 0)
+            {
+                MessageBox.Show(this, ex.Message, "ProxyToAnyConnect", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
         finally
         {
-            RefreshRuntimeViews();
+            if (Volatile.Read(ref _configurationCommandsStopping) == 0)
+            {
+                RefreshRuntimeViews();
+            }
         }
     }
 
