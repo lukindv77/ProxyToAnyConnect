@@ -789,6 +789,11 @@ internal sealed class ProxyServer
             return result;
         }
 
+        private static bool IsValidHeaderNameCharacter(char character) =>
+            character <= 0x7F &&
+            (char.IsAsciiLetterOrDigit(character) ||
+             character is '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~');
+
         private static bool IsValidHeaderName(ReadOnlySpan<char> name)
         {
             if (name.IsEmpty)
@@ -798,9 +803,7 @@ internal sealed class ProxyServer
 
             foreach (var character in name)
             {
-                if (character > 0x7F ||
-                    !(char.IsAsciiLetterOrDigit(character) ||
-                      character is '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~'))
+                if (!IsValidHeaderNameCharacter(character))
                 {
                     return false;
                 }
@@ -839,21 +842,37 @@ internal sealed class ProxyServer
                 }
 
                 var line = remaining[..lineEnd];
-                var separator = line.IndexOf(':');
-                if (separator <= 0 || char.IsWhiteSpace(line[separator - 1]))
+                var separator = -1;
+                for (var i = 0; i < line.Length; i++)
+                {
+                    var character = line[i];
+                    if (separator < 0)
+                    {
+                        if (character == ':')
+                        {
+                            if (i == 0)
+                            {
+                                throw new InvalidDataException("Invalid HTTP header line.");
+                            }
+
+                            separator = i;
+                            continue;
+                        }
+
+                        if (!IsValidHeaderNameCharacter(character))
+                        {
+                            throw new InvalidDataException("Invalid HTTP header name.");
+                        }
+                    }
+                    else if ((character < 0x20 && character != '\t') || character == 0x7F)
+                    {
+                        throw new InvalidDataException("Invalid HTTP header field value.");
+                    }
+                }
+
+                if (separator < 0)
                 {
                     throw new InvalidDataException("Invalid HTTP header line.");
-                }
-
-                var name = line[..separator];
-                if (!IsValidHeaderName(name))
-                {
-                    throw new InvalidDataException("Invalid HTTP header name.");
-                }
-
-                if (!IsValidHeaderValue(line[(separator + 1)..]))
-                {
-                    throw new InvalidDataException("Invalid HTTP header field value.");
                 }
 
                 offset += lineEnd + 2;
