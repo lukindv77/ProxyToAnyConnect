@@ -6,6 +6,8 @@ namespace ProxyToAnyConnect.SelfTests;
 
 internal static class EphemeralRasPhonebookSelfTests
 {
+    private const int PartialFailureChurnCycles = 16;
+
     public static int Run()
     {
         if (!OperatingSystem.IsWindows())
@@ -18,9 +20,9 @@ internal static class EphemeralRasPhonebookSelfTests
         {
             OrphanRecoveryRespectsCrossProcessOwnership();
             HappyPathCreateAndCleanup();
-            PartialCreationFailureCleansPrivateResources();
+            PartialCreationFailureChurnCleansPrivateResources();
             Console.WriteLine(
-                "PASS: private ephemeral L2TP RAS phonebook ownership/orphan recovery/create/PSK/cleanup smoke tests");
+                $"PASS: private ephemeral L2TP RAS phonebook ownership/orphan recovery/create/PSK/cleanup and {PartialFailureChurnCycles}-cycle failure churn tests");
             return 0;
         }
         catch (Exception ex)
@@ -172,43 +174,57 @@ internal static class EphemeralRasPhonebookSelfTests
         }
     }
 
-    private static void PartialCreationFailureCleansPrivateResources()
+    private static void PartialCreationFailureChurnCleansPrivateResources()
     {
-        var id = $"ci-failure-{Guid.NewGuid():N}";
-        var sanitizedId = new string(id.Where(
-            character => char.IsLetterOrDigit(character) || character is '-' or '_').ToArray());
         var rasRoot = Path.Combine(Path.GetTempPath(), "ProxyToAnyConnect", "ras");
-        var prefix = $"{sanitizedId}-";
-        var before = ExistingMatchingDirectories(rasRoot, prefix);
-
-        var options = CreateOptions(
-            id,
-            protectedPsk: "intentionally-not-a-dpapi-payload");
+        var runPrefix = $"ci-failure-churn-{Guid.NewGuid():N}";
+        var before = ExistingMatchingDirectories(rasRoot, runPrefix);
 
         try
         {
-            _ = EphemeralRasPhonebook.Create(options);
-            throw new InvalidOperationException(
-                "Ephemeral RAS creation unexpectedly accepted an invalid protected PSK.");
-        }
-        catch (InvalidOperationException ex) when (
-            ex.Message.Contains("Protected secret", StringComparison.OrdinalIgnoreCase) ||
-            ex.Message.Contains("DPAPI", StringComparison.OrdinalIgnoreCase))
-        {
-            // Expected after the private PBK entry has been prepared and before Create returns.
-        }
+            for (var cycle = 0; cycle < PartialFailureChurnCycles; cycle++)
+            {
+                var id = $"{runPrefix}-{cycle:D2}";
+                var options = CreateOptions(
+                    id,
+                    protectedPsk: "intentionally-not-a-dpapi-payload");
 
-        var after = ExistingMatchingDirectories(rasRoot, prefix);
-        var leaked = after.Except(before, StringComparer.OrdinalIgnoreCase).ToArray();
-        if (leaked.Length != 0)
+                try
+                {
+                    _ = EphemeralRasPhonebook.Create(options);
+                    throw new InvalidOperationException(
+                        $"Ephemeral RAS creation unexpectedly accepted an invalid protected PSK on cycle {cycle}.");
+                }
+                catch (InvalidOperationException ex) when (
+                    ex.Message.Contains("Protected secret", StringComparison.OrdinalIgnoreCase) ||
+                    ex.Message.Contains("DPAPI", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Expected after the private PBK entry has been prepared and before
+                    // Create returns. The failed creation owns all partial resources.
+                }
+
+                var residual = ExistingMatchingDirectories(rasRoot, id);
+                if (residual.Count != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Partial CustomEphemeral creation retained a private RAS directory after cycle {cycle}: {string.Join(", ", residual)}");
+                }
+            }
+        }
+        finally
         {
+            var after = ExistingMatchingDirectories(rasRoot, runPrefix);
+            var leaked = after.Except(before, StringComparer.OrdinalIgnoreCase).ToArray();
             foreach (var path in leaked)
             {
                 BestEffortDelete(path);
             }
 
-            throw new InvalidOperationException(
-                $"Partial CustomEphemeral creation leaked temporary RAS directorie(s): {string.Join(", ", leaked)}");
+            if (leaked.Length != 0)
+            {
+                throw new InvalidOperationException(
+                    $"{PartialFailureChurnCycles}-cycle CustomEphemeral failure churn leaked temporary RAS directorie(s): {string.Join(", ", leaked)}");
+            }
         }
     }
 
