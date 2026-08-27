@@ -11,6 +11,7 @@ internal sealed class MainForm : Form
     private readonly string _configPath;
     private readonly ProxyRuntimeHost _runtimeHost;
     private readonly SerializedConfigurationCommandQueue _configurationCommands = new();
+    private readonly ConfigurationDialogOwner _configurationDialogs = new();
     private readonly DataGridView _proxyGrid = CreateGrid();
     private readonly DataGridView _vpnGrid = CreateGrid();
     private readonly Dictionary<string, DataGridViewRow> _proxyRows = new(StringComparer.OrdinalIgnoreCase);
@@ -99,10 +100,40 @@ internal sealed class MainForm : Form
         BringToFront();
     }
 
-    public Task StopConfigurationCommandsAsync()
+    public async Task StopConfigurationCommandsAsync()
     {
         Volatile.Write(ref _configurationCommandsStopping, 1);
-        return _configurationCommands.StopAsync();
+
+        Exception? dialogFailure = null;
+        try
+        {
+            _configurationDialogs.Stop();
+        }
+        catch (Exception ex)
+        {
+            // A modal-close defect must not prevent cancellation/drain of the exact
+            // configuration generation before runtime-host disposal is attempted.
+            dialogFailure = ex;
+        }
+
+        try
+        {
+            await _configurationCommands.StopAsync();
+        }
+        catch (Exception queueFailure)
+        {
+            if (dialogFailure is not null)
+            {
+                throw new AggregateException(dialogFailure, queueFailure);
+            }
+
+            throw;
+        }
+
+        if (dialogFailure is not null)
+        {
+            throw dialogFailure;
+        }
     }
 
     public void AllowExit()
@@ -385,7 +416,7 @@ internal sealed class MainForm : Form
         }
 
         using var dialog = new ProxySettingsDialog(null, _options.VpnConnections);
-        if (dialog.ShowDialog(this) != DialogResult.OK)
+        if (_configurationDialogs.Run(dialog, this) != DialogResult.OK)
         {
             return;
         }
@@ -417,7 +448,7 @@ internal sealed class MainForm : Form
         }
 
         using var dialog = new ProxySettingsDialog(existing, _options.VpnConnections);
-        if (dialog.ShowDialog(this) != DialogResult.OK)
+        if (_configurationDialogs.Run(dialog, this) != DialogResult.OK)
         {
             return;
         }
@@ -477,7 +508,7 @@ internal sealed class MainForm : Form
     {
         cancellationToken.ThrowIfCancellationRequested();
         using var dialog = new L2tpSettingsDialog(null);
-        if (dialog.ShowDialog(this) != DialogResult.OK)
+        if (_configurationDialogs.Run(dialog, this) != DialogResult.OK)
         {
             return;
         }
@@ -509,7 +540,7 @@ internal sealed class MainForm : Form
         }
 
         using var dialog = new L2tpSettingsDialog(existing);
-        if (dialog.ShowDialog(this) != DialogResult.OK)
+        if (_configurationDialogs.Run(dialog, this) != DialogResult.OK)
         {
             return;
         }
