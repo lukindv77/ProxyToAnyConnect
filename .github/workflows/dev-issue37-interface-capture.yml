@@ -1,0 +1,83 @@
+name: dev-issue37-interface-capture
+
+on:
+  push:
+    branches: [ dev/issue37-interface-capture ]
+    paths:
+      - '.github/workflows/dev-issue37-interface-capture.yml'
+      - '.github/scripts/dev-issue37.py'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply interface evidence hardening
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python .github/scripts/dev-issue37.py
+          git diff --check
+          $changed = @(git diff --name-only)
+          if ($changed.Count -ne 1 -or $changed[0] -ne 'tools/Invoke-WindowsIntegrationEvidence.ps1') {
+            throw "Unexpected #37 patch surface: $($changed -join ', ')"
+          }
+      - name: Validate PowerShell and actual runner interface lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path './tools/Invoke-WindowsIntegrationEvidence.ps1'),
+            [ref]$tokens,
+            [ref]$errors) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            throw 'Invoke-WindowsIntegrationEvidence.ps1 has parser errors.'
+          }
+
+          $output = './artifacts/issue37-interface-smoke'
+          foreach ($stage in @('Baseline', 'Ready', 'Final')) {
+            ./tools/Invoke-WindowsIntegrationEvidence.ps1 `
+              -Stage $stage `
+              -OutputDirectory $output `
+              -SkipExternalProbes | Out-Null
+            ./tools/Test-WindowsIntegrationEvidence.ps1 `
+              -Stage $stage `
+              -OutputDirectory $output | Out-Null
+          }
+          ./tools/Complete-WindowsIntegrationEvidence.ps1 `
+            -OutputDirectory $output | Out-Null
+
+          foreach ($stage in @('baseline', 'ready', 'final')) {
+            $evidence = Get-Content -LiteralPath (Join-Path (Join-Path $output $stage) 'evidence.json') -Raw | ConvertFrom-Json
+            $interfaces = @($evidence.captures | Where-Object name -eq 'interfaces')
+            if ($interfaces.Count -ne 1 -or -not $interfaces[0].succeeded) {
+              throw "Stage $stage did not produce a successful interface capture."
+            }
+            foreach ($item in @($interfaces[0].value)) {
+              foreach ($required in @('InterfaceAlias','InterfaceIndex','InterfaceDescription','NetProfileName','IPv4Address','IPv4DefaultGateway','DnsServers')) {
+                if ($null -eq $item.PSObject.Properties[$required]) {
+                  throw "Stage $stage interface snapshot omitted '$required'."
+                }
+              }
+            }
+          }
+      - name: Publish validated interface collector
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add tools/Invoke-WindowsIntegrationEvidence.ps1
+          git commit -m 'evidence: harden multi-adapter interface capture'
+          git push origin HEAD:refs/heads/dev/issue37-interface-capture
