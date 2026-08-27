@@ -1,0 +1,119 @@
+name: dev-issue26
+
+on:
+  push:
+    branches: [ dev/issue26-connection-options ]
+    paths:
+      - '.github/workflows/dev-issue26.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply Connection option validation and run aggregate tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = 'src/ProxyToAnyConnect/Proxy/ProxyServer.cs'
+          $runner = 'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          if ((git rev-parse "HEAD:$source").Trim() -ne 'c8786b30c6b9454e43be3afdba0e0c08d7477ca0') {
+            throw 'ProxyServer.cs no longer matches issue #26 audited blob.'
+          }
+          if ((git rev-parse "HEAD:$runner").Trim() -ne 'b9f4a666d7b16ecb2ec68f99159adebfa48a1cdc') {
+            throw 'CombinedTestRunner.cs no longer matches issue #26 audited blob.'
+          }
+
+          @'
+          from pathlib import Path
+
+          source = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = source.read_text(encoding='utf-8')
+          anchor = '''                var value = rawValue.Trim();
+                          var header = new HeaderLine(name.ToString(), value.ToString());'''
+          replacement = '''                if (name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                          {
+                              ValidateConnectionOptions(rawValue);
+                          }
+
+                          var value = rawValue.Trim();
+                          var header = new HeaderLine(name.ToString(), value.ToString());'''
+          if text.count(anchor) != 1:
+              raise SystemExit(f'expected one plain-header materialization site, got {text.count(anchor)}')
+          text = text.replace(anchor, replacement)
+
+          helper_anchor = '''        private static void ValidateHeaderLines(string text, int offset)
+                  {'''
+          helper = '''        private static void ValidateConnectionOptions(ReadOnlySpan<char> value)
+                  {
+                      var segmentStart = 0;
+                      while (segmentStart <= value.Length)
+                      {
+                          var remaining = value[segmentStart..];
+                          var comma = remaining.IndexOf(',');
+                          var segment = comma < 0 ? remaining : remaining[..comma];
+                          var trimStart = 0;
+                          while (trimStart < segment.Length && segment[trimStart] is ' ' or '\\t')
+                          {
+                              trimStart++;
+                          }
+
+                          var trimEnd = segment.Length;
+                          while (trimEnd > trimStart && segment[trimEnd - 1] is ' ' or '\\t')
+                          {
+                              trimEnd--;
+                          }
+
+                          var option = segment[trimStart..trimEnd];
+                          if (!IsValidHeaderName(option))
+                          {
+                              throw new InvalidDataException("Invalid HTTP Connection option.");
+                          }
+
+                          if (comma < 0)
+                          {
+                              return;
+                          }
+
+                          segmentStart += comma + 1;
+                      }
+                  }
+
+              private static void ValidateHeaderLines(string text, int offset)
+                  {'''
+          if text.count(helper_anchor) != 1:
+              raise SystemExit(f'expected one Connection helper insertion site, got {text.count(helper_anchor)}')
+          text = text.replace(helper_anchor, helper)
+          source.write_text(text, encoding='utf-8', newline='')
+
+          runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
+          runner_text = runner.read_text(encoding='utf-8')
+          runner_anchor = '        await RunAsync(nameof(ProxyHttpHeaderValueSelfTests), ProxyHttpHeaderValueSelfTests.RunAsync);\n'
+          runner_addition = runner_anchor + '        await RunAsync(nameof(ProxyConnectionOptionSelfTests), ProxyConnectionOptionSelfTests.RunAsync);\n'
+          if runner_text.count(runner_anchor) != 1:
+              raise SystemExit(f'expected one header-value runner anchor, got {runner_text.count(runner_anchor)}')
+          runner.write_text(runner_text.replace(runner_anchor, runner_addition), encoding='utf-8', newline='')
+          '@ | python -
+
+          git diff --check
+          $changed = @(git diff --name-only)
+          $expected = @($source, $runner)
+          if ($changed.Count -ne 2 -or @($changed | Where-Object { $_ -notin $expected }).Count -ne 0) {
+            throw "Unexpected issue #26 patch: $($changed -join ', ')"
+          }
+
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add $source $runner
+          git commit -m 'proxy: validate Connection options before outbound routing'
+          git push origin HEAD:refs/heads/dev/issue26-connection-options
