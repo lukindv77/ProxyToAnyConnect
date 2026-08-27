@@ -9,6 +9,8 @@ internal sealed class EphemeralRasPhonebook : IDisposable
 {
     internal const string OwnershipMarkerFileName = ".managed-session-v1";
     internal const string OwnershipLockFileName = ".owner.lock";
+    internal const string PhoneBookFileName = "session.pbk";
+    private const long MaxOwnershipMarkerBytes = 1024;
 
     private readonly string _sessionDirectory;
     private readonly FileStream _ownershipLock;
@@ -44,8 +46,13 @@ internal sealed class EphemeralRasPhonebook : IDisposable
 
         CleanupOrphanedSessionDirectories();
 
+        var productTempRoot = Path.Combine(Path.GetTempPath(), "ProxyToAnyConnect");
+        Directory.CreateDirectory(productTempRoot);
+        EnsureRegularDirectory(productTempRoot, "ProxyToAnyConnect temporary root");
+
         var rasRoot = SessionRootDirectory;
         Directory.CreateDirectory(rasRoot);
+        EnsureRegularDirectory(rasRoot, "ProxyToAnyConnect RAS session root");
         var sanitizedId = SanitizeId(options.Id);
         var sessionRoot = Path.Combine(
             rasRoot,
@@ -81,7 +88,7 @@ internal sealed class EphemeralRasPhonebook : IDisposable
                 Path.Combine(sessionRoot, OwnershipMarkerFileName),
                 entryName);
 
-            var phoneBookPath = Path.Combine(sessionRoot, "session.pbk");
+            var phoneBookPath = Path.Combine(sessionRoot, PhoneBookFileName);
             resource = new EphemeralRasPhonebook(
                 sessionRoot,
                 phoneBookPath,
@@ -138,7 +145,7 @@ internal sealed class EphemeralRasPhonebook : IDisposable
             else
             {
                 ownershipLock?.Dispose();
-                TryDeleteSessionDirectory(sessionRoot);
+                _ = TryDeleteOwnedSessionDirectory(sessionRoot);
             }
 
             throw;
@@ -148,7 +155,13 @@ internal sealed class EphemeralRasPhonebook : IDisposable
     internal static void CleanupOrphanedSessionDirectories()
     {
         var root = SessionRootDirectory;
-        if (!Directory.Exists(root))
+        if (!Directory.Exists(root) || !IsRegularDirectory(root))
+        {
+            return;
+        }
+
+        var productTempRoot = Path.GetDirectoryName(root);
+        if (string.IsNullOrWhiteSpace(productTempRoot) || !IsRegularDirectory(productTempRoot))
         {
             return;
         }
@@ -167,12 +180,17 @@ internal sealed class EphemeralRasPhonebook : IDisposable
 
         foreach (var sessionDirectory in sessionDirectories)
         {
-            var markerPath = Path.Combine(sessionDirectory, OwnershipMarkerFileName);
-            if (!File.Exists(markerPath))
+            if (!TryGetExpectedEntryName(sessionDirectory, out var expectedEntryName) ||
+                !TryValidateManagedLeafSet(sessionDirectory))
             {
-                // Do not infer ownership for directories created by an older build,
-                // another application, or a creator that died before publishing its
-                // marker. Ambiguous ownership is intentionally preserved fail-safe.
+                // Non-canonical names, reparse points and unknown children are not
+                // exact filesystem owners. Preserve ambiguous content fail-safe.
+                continue;
+            }
+
+            var markerPath = Path.Combine(sessionDirectory, OwnershipMarkerFileName);
+            if (!TryReadValidOwnershipMarker(markerPath, expectedEntryName))
+            {
                 continue;
             }
 
@@ -182,33 +200,142 @@ internal sealed class EphemeralRasPhonebook : IDisposable
                 continue;
             }
 
-            TryDeleteRecoveredRasEntry(sessionDirectory, markerPath);
-            TryDeleteSessionDirectory(sessionDirectory);
+            // Re-check after probing the owner lock. Deletion remains non-recursive,
+            // so a child raced in later can only make final directory removal fail.
+            if (!TryValidateManagedLeafSet(sessionDirectory))
+            {
+                continue;
+            }
+
+            TryDeleteRecoveredRasEntry(sessionDirectory, expectedEntryName);
+            _ = TryDeleteOwnedSessionDirectory(sessionDirectory);
         }
     }
 
-    private static void TryDeleteRecoveredRasEntry(string sessionDirectory, string markerPath)
+    private static bool TryGetExpectedEntryName(string sessionDirectory, out string entryName)
+    {
+        entryName = string.Empty;
+        try
+        {
+            var fullSessionPath = Path.GetFullPath(sessionDirectory);
+            var fullRoot = Path.GetFullPath(SessionRootDirectory);
+            var parent = Path.GetDirectoryName(fullSessionPath);
+            if (!string.Equals(parent, fullRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var directoryName = Path.GetFileName(Path.TrimEndingDirectorySeparator(fullSessionPath));
+            var separator = directoryName.LastIndexOf('-');
+            if (separator <= 0 || separator == directoryName.Length - 1)
+            {
+                return false;
+            }
+
+            var sanitizedId = directoryName[..separator];
+            var generation = directoryName[(separator + 1)..];
+            if (!Guid.TryParseExact(generation, "N", out _) ||
+                sanitizedId.Any(character =>
+                    !char.IsLetterOrDigit(character) && character != '-' && character != '_'))
+            {
+                return false;
+            }
+
+            entryName = $"ProxyToAnyConnect-{sanitizedId}";
+            if (entryName.Length > RasNative.RasMaxEntryName)
+            {
+                entryName = entryName[..RasNative.RasMaxEntryName];
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryValidateManagedLeafSet(string sessionDirectory)
     {
         try
         {
-            var entryName = File.ReadAllText(markerPath).Trim();
-            if (!entryName.StartsWith("ProxyToAnyConnect-", StringComparison.Ordinal) ||
-                entryName.Length > RasNative.RasMaxEntryName)
+            if (!IsRegularDirectory(sessionDirectory))
             {
-                return;
+                return false;
             }
 
-            var phoneBookPath = Path.Combine(sessionDirectory, "session.pbk");
-            if (File.Exists(phoneBookPath))
+            foreach (var child in Directory.EnumerateFileSystemEntries(
+                         sessionDirectory,
+                         "*",
+                         SearchOption.TopDirectoryOnly))
+            {
+                var name = Path.GetFileName(child);
+                if (name is not (OwnershipMarkerFileName or OwnershipLockFileName or PhoneBookFileName))
+                {
+                    return false;
+                }
+
+                var attributes = File.GetAttributes(child);
+                if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadValidOwnershipMarker(string markerPath, string expectedEntryName)
+    {
+        try
+        {
+            if (!IsRegularFile(markerPath))
+            {
+                return false;
+            }
+
+            using var stream = new FileStream(
+                markerPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 256,
+                FileOptions.SequentialScan);
+            if (stream.Length is <= 0 or > MaxOwnershipMarkerBytes)
+            {
+                return false;
+            }
+
+            using var reader = new StreamReader(stream);
+            var markerEntryName = reader.ReadToEnd().Trim();
+            return markerEntryName.Equals(expectedEntryName, StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static void TryDeleteRecoveredRasEntry(string sessionDirectory, string entryName)
+    {
+        try
+        {
+            var phoneBookPath = Path.Combine(sessionDirectory, PhoneBookFileName);
+            if (IsRegularFile(phoneBookPath))
             {
                 _ = RasNative.RasDeleteEntryW(phoneBookPath, entryName);
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // The directory deletion below is still safe after ownership was proven
-            // stale. Failure to read the recovery metadata must not turn startup
-            // cleanup into a fatal path.
+            // Native entry cleanup is best effort. Filesystem cleanup below remains
+            // bounded to exact managed leaves even if RAS metadata removal fails.
         }
     }
 
@@ -233,9 +360,93 @@ internal sealed class EphemeralRasPhonebook : IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // A sharing violation means another live process owns the session. An
-            // access-denied result is treated the same way: cleanup must fail safe
-            // and preserve a directory whose ownership cannot be proven stale.
+            // access-denied result is treated the same way: cleanup must fail safe.
             return true;
+        }
+    }
+
+    private static bool IsRegularDirectory(string path)
+    {
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            return (attributes & FileAttributes.Directory) != 0 &&
+                   (attributes & FileAttributes.ReparsePoint) == 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsRegularFile(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            return (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static void EnsureRegularDirectory(string path, string description)
+    {
+        if (!IsRegularDirectory(path))
+        {
+            throw new IOException($"{description} is not a regular directory: {path}");
+        }
+    }
+
+    private static bool TryDeleteOwnedSessionDirectory(string path)
+    {
+        if (!TryGetExpectedEntryName(path, out _) || !TryValidateManagedLeafSet(path))
+        {
+            return false;
+        }
+
+        // Delete the durable marker last. If an earlier exact-leaf delete fails, a
+        // later process can still recognize and retry this managed residue.
+        foreach (var leafName in new[] { PhoneBookFileName, OwnershipLockFileName, OwnershipMarkerFileName })
+        {
+            var leafPath = Path.Combine(path, leafName);
+            if (!File.Exists(leafPath))
+            {
+                continue;
+            }
+
+            try
+            {
+                if (!IsRegularFile(leafPath))
+                {
+                    return false;
+                }
+
+                File.Delete(leafPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+
+        try
+        {
+            Directory.Delete(path, recursive: false);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A raced-in child leaves an ambiguous residue instead of widening the
+            // ownership boundary to recursive deletion.
+            return false;
         }
     }
 
@@ -408,20 +619,6 @@ internal sealed class EphemeralRasPhonebook : IDisposable
         return string.IsNullOrWhiteSpace(sanitized) ? "session" : sanitized;
     }
 
-    private static void TryDeleteSessionDirectory(string path)
-    {
-        try
-        {
-            if (Directory.Exists(path))
-            {
-                Directory.Delete(path, recursive: true);
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-        }
-    }
-
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -431,7 +628,7 @@ internal sealed class EphemeralRasPhonebook : IDisposable
 
         try
         {
-            if (File.Exists(PhoneBookPath))
+            if (TryValidateManagedLeafSet(_sessionDirectory) && IsRegularFile(PhoneBookPath))
             {
                 _ = RasNative.RasDeleteEntryW(PhoneBookPath, EntryName);
             }
@@ -448,19 +645,12 @@ internal sealed class EphemeralRasPhonebook : IDisposable
         {
         }
 
-        try
-        {
-            if (Directory.Exists(_sessionDirectory))
-            {
-                Directory.Delete(_sessionDirectory, recursive: true);
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        if (Directory.Exists(_sessionDirectory) && !TryDeleteOwnedSessionDirectory(_sessionDirectory))
         {
             AppLog.Warning(
-                "vpn.ephemeral.cleanup_failed",
-                "Unable to remove a temporary private RAS phonebook directory.",
-                new { SessionDirectory = _sessionDirectory, Error = ex.Message });
+                "vpn.ephemeral.cleanup_preserved_ambiguous",
+                "Temporary private RAS session directory was preserved because exact filesystem ownership could not be proven for every leaf.",
+                new { SessionDirectory = _sessionDirectory });
         }
     }
 }
