@@ -31,6 +31,60 @@ function Read-JsonFile {
     return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
 }
 
+function Get-RequiredJsonStringProperty {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Json,
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName,
+        [Parameter(Mandatory = $true)]
+        [string]$Context
+    )
+
+    $document = $null
+    try {
+        $document = [System.Text.Json.JsonDocument]::Parse($Json)
+        $property = $document.RootElement.GetProperty($PropertyName)
+        if ($property.ValueKind -ne [System.Text.Json.JsonValueKind]::String) {
+            throw "'$PropertyName' is not a JSON string."
+        }
+
+        $value = $property.GetString()
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            throw "'$PropertyName' is empty."
+        }
+
+        return $value
+    }
+    catch {
+        throw "Invalid $Context '$PropertyName': $($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $document) {
+            $document.Dispose()
+        }
+    }
+}
+
+function ConvertFrom-RoundTripTimestamp {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value,
+        [Parameter(Mandatory = $true)]
+        [string]$Context
+    )
+
+    try {
+        return [DateTimeOffset]::ParseExact(
+            $Value,
+            'O',
+            [Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+    }
+    catch {
+        throw "Invalid $Context timestamp '$Value': $($_.Exception.Message)"
+    }
+}
+
 $expectedHash = $ExpectedExecutableSha256.Trim().ToLowerInvariant()
 if ($expectedHash -notmatch '^[0-9a-f]{64}$') {
     throw 'ExpectedExecutableSha256 must be exactly 64 hexadecimal characters.'
@@ -44,6 +98,11 @@ $resultPath = Join-Path $outputPath 'result.json'
 $manifestPath = Join-Path $outputPath 'manifest.json'
 
 $metadata = Read-JsonFile -Path $metadataPath
+$metadataJson = Get-Content -LiteralPath $metadataPath -Raw
+$metadataProcessStartTimeUtc = Get-RequiredJsonStringProperty `
+    -Json $metadataJson `
+    -PropertyName 'processStartTimeUtc' `
+    -Context 'soak metadata'
 $summary = Read-JsonFile -Path $summaryPath
 $resultFile = Read-JsonFile -Path $resultPath
 $manifest = Read-JsonFile -Path $manifestPath
@@ -128,9 +187,19 @@ foreach ($line in Get-Content -LiteralPath $samplesPath) {
     if ($sample.schemaVersion -ne 1 -or [int]$sample.index -ne $sampleCount) {
         throw "Soak sample index/schema mismatch at position $sampleCount."
     }
+
+    $sampleProcessStartTimeUtc = Get-RequiredJsonStringProperty `
+        -Json $line `
+        -PropertyName 'processStartTimeUtc' `
+        -Context "soak sample $sampleCount"
+    $sampleTimestampUtc = Get-RequiredJsonStringProperty `
+        -Json $line `
+        -PropertyName 'timestampUtc' `
+        -Context "soak sample $sampleCount"
+
     if ([int]$sample.processId -ne [int]$metadata.processId -or
         -not ([string]$sample.processName).Equals(([string]$metadata.processName), [StringComparison]::OrdinalIgnoreCase) -or
-        -not ([string]$sample.processStartTimeUtc).Equals(([string]$metadata.processStartTimeUtc), [StringComparison]::Ordinal)) {
+        -not $sampleProcessStartTimeUtc.Equals($metadataProcessStartTimeUtc, [StringComparison]::Ordinal)) {
         throw "Soak process identity drift detected at sample $sampleCount."
     }
 
@@ -141,7 +210,9 @@ foreach ($line in Get-Content -LiteralPath $samplesPath) {
         }
     }
 
-    $timestamp = [DateTimeOffset]::Parse([string]$sample.timestampUtc).ToUniversalTime()
+    $timestamp = ConvertFrom-RoundTripTimestamp `
+        -Value $sampleTimestampUtc `
+        -Context "soak sample $sampleCount"
     if ($null -ne $previousTimestamp -and $timestamp -lt $previousTimestamp) {
         throw "Soak sample timestamps are not monotonic at sample $sampleCount."
     }
@@ -184,7 +255,7 @@ $result = [ordered]@{
     validated = $true
     processId = [int]$metadata.processId
     processName = [string]$metadata.processName
-    processStartTimeUtc = [string]$metadata.processStartTimeUtc
+    processStartTimeUtc = $metadataProcessStartTimeUtc
     executableSha256 = [string]$metadata.executableSha256
     sampleCount = $sampleCount
     observedDurationSeconds = [double]$summary.observedDurationSeconds
