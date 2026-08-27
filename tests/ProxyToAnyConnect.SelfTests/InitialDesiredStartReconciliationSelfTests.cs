@@ -124,15 +124,17 @@ internal static class InitialDesiredStartReconciliationSelfTests
         {
             await operation;
         }
-        catch (OperationCanceledException ex) when (
-            token.IsCancellationRequested &&
-            ex.CancellationToken == token)
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
+            // Coordinator operations intentionally use a token linked to both the
+            // caller and coordinator lifetime. Cancellation ownership is proven by
+            // the caller token being cancelled, not by token-object identity on the
+            // propagated OperationCanceledException.
             return;
         }
 
         throw new InvalidOperationException(
-            "Desired-start operation did not preserve caller cancellation.");
+            "Desired-start operation did not propagate caller cancellation.");
     }
 
     private static AppOptions CreateOptions(bool enabled) =>
