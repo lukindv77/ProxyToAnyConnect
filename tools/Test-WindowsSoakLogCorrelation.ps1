@@ -65,7 +65,7 @@ foreach ($logPathInput in $ApplicationLogPath) {
             $entry = $line | ConvertFrom-Json
         }
         catch {
-            throw "Application JSONL parse failure at ${logPath}:$lineNumber: $($_.Exception.Message)"
+            throw "Application JSONL parse failure at ${logPath}:${lineNumber}: $($_.Exception.Message)"
         }
 
         $eventName = [string]$entry.Event
@@ -79,19 +79,19 @@ foreach ($logPathInput in $ApplicationLogPath) {
         }
 
         if ($null -eq $entry.Data) {
-            throw "Memory-health log entry at ${logPath}:$lineNumber has no Data payload."
+            throw "Memory-health log entry at ${logPath}:${lineNumber} has no Data payload."
         }
 
         $processIdProperty = $entry.Data.PSObject.Properties['ProcessId']
         $processStartProperty = $entry.Data.PSObject.Properties['ProcessStartTimeUtc']
         if ($null -eq $processIdProperty -or $null -eq $processStartProperty) {
-            throw "Memory-health log entry at ${logPath}:$lineNumber lacks ProcessId/ProcessStartTimeUtc identity fields."
+            throw "Memory-health log entry at ${logPath}:${lineNumber} lacks ProcessId/ProcessStartTimeUtc identity fields."
         }
 
         $processId = [int]$processIdProperty.Value
         $processStart = [DateTimeOffset]::Parse([string]$processStartProperty.Value).ToUniversalTime()
         if ($processId -ne $expectedProcessId -or $processStart -ne $expectedProcessStart) {
-            throw "Memory-health log process identity mismatch at ${logPath}:$lineNumber: " +
+            throw "Memory-health log process identity mismatch at ${logPath}:${lineNumber}: " +
                   "pid=$processId/$expectedProcessId start=$($processStart.ToString('O'))/$($expectedProcessStart.ToString('O'))."
         }
 
@@ -107,7 +107,7 @@ foreach ($logPathInput in $ApplicationLogPath) {
             'ThreadCount')) {
             $property = $entry.Data.PSObject.Properties[$requiredMetric]
             if ($null -eq $property -or [long]$property.Value -lt 0) {
-                throw "Memory-health log entry at ${logPath}:$lineNumber has invalid '$requiredMetric'."
+                throw "Memory-health log entry at ${logPath}:${lineNumber} has invalid '$requiredMetric'."
             }
         }
 
