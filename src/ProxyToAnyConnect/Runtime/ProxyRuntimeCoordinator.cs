@@ -12,6 +12,8 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
     private readonly HashSet<string> _pendingStartProxyIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _reconfigureGate = new(1, 1);
     private readonly object _collectionGate = new();
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly CancellationToken _lifetimeToken;
     private AppOptions _options;
     private int _disposed;
 
@@ -20,6 +22,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(options);
         options.Validate();
         _options = options;
+        _lifetimeToken = _lifetime.Token;
 
         _vpnById = options.VpnConnections.ToDictionary(
             vpn => vpn.Id,
@@ -36,41 +39,88 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        ProxyInstanceRuntime[] proxies;
-        lock (_collectionGate)
-        {
-            proxies = _proxyById.Values.Where(item => item.Options.Enabled).ToArray();
-        }
+        using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _lifetimeToken);
+        var operationToken = operationCancellation.Token;
 
-        foreach (var proxy in proxies)
+        await _reconfigureGate.WaitAsync(operationToken);
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            await TryStartProxyAsync(proxy, cancellationToken);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            ProxyInstanceRuntime[] proxies;
+            lock (_collectionGate)
+            {
+                proxies = _proxyById.Values.Where(item => item.Options.Enabled).ToArray();
+            }
+
+            foreach (var proxy in proxies)
+            {
+                operationToken.ThrowIfCancellationRequested();
+                await TryStartProxyAsync(proxy, operationToken);
+            }
+        }
+        finally
+        {
+            _reconfigureGate.Release();
         }
     }
 
     public async Task StartProxyAsync(string proxyId, CancellationToken cancellationToken = default)
     {
-        var proxy = GetProxy(proxyId);
-        await proxy.StartAsync(cancellationToken);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        lock (_collectionGate)
+        using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _lifetimeToken);
+        var operationToken = operationCancellation.Token;
+
+        await _reconfigureGate.WaitAsync(operationToken);
+        try
         {
-            if (_proxyById.TryGetValue(proxyId, out var current) && ReferenceEquals(current, proxy))
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            var proxy = GetProxy(proxyId);
+            await proxy.StartAsync(operationToken);
+
+            lock (_collectionGate)
             {
-                _pendingStartProxyIds.Remove(proxyId);
+                if (_proxyById.TryGetValue(proxyId, out var current) && ReferenceEquals(current, proxy))
+                {
+                    _pendingStartProxyIds.Remove(proxyId);
+                }
             }
+        }
+        finally
+        {
+            _reconfigureGate.Release();
         }
     }
 
     public async Task PauseProxyAsync(string proxyId, CancellationToken cancellationToken = default)
     {
-        var proxy = GetProxy(proxyId);
-        await proxy.PauseAsync(cancellationToken);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        lock (_collectionGate)
+        using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _lifetimeToken);
+        var operationToken = operationCancellation.Token;
+
+        await _reconfigureGate.WaitAsync(operationToken);
+        try
         {
-            _pendingStartProxyIds.Remove(proxyId);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            var proxy = GetProxy(proxyId);
+            await proxy.PauseAsync(operationToken);
+
+            lock (_collectionGate)
+            {
+                _pendingStartProxyIds.Remove(proxyId);
+            }
+        }
+        finally
+        {
+            _reconfigureGate.Release();
         }
     }
 
@@ -80,7 +130,12 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         newOptions.Validate();
 
-        await _reconfigureGate.WaitAsync(cancellationToken);
+        using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _lifetimeToken);
+        var operationToken = operationCancellation.Token;
+
+        await _reconfigureGate.WaitAsync(operationToken);
         try
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -250,7 +305,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
 
             foreach (var proxyId in startCandidateIds)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                operationToken.ThrowIfCancellationRequested();
 
                 ProxyInstanceRuntime? runtime;
                 lock (_collectionGate)
@@ -270,7 +325,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                     continue;
                 }
 
-                if (await TryStartProxyAsync(runtime, cancellationToken))
+                if (await TryStartProxyAsync(runtime, operationToken))
                 {
                     lock (_collectionGate)
                     {
@@ -389,7 +444,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Caller cancellation is control flow, not an isolated proxy/L2TP failure.
+            // Caller/coordinator cancellation is control flow, not an isolated proxy/L2TP failure.
             // It must stop the foreground operation and remain visible to the caller.
             throw;
         }
@@ -412,6 +467,11 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         {
             return;
         }
+
+        // Cancel pending foreground lifecycle operations before waiting for their
+        // shared operation gate. This lets a Start blocked inside VPN acquisition
+        // unwind without requiring its caller to own a cancellation token.
+        _lifetime.Cancel();
 
         await _reconfigureGate.WaitAsync();
         try
@@ -441,6 +501,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         {
             _reconfigureGate.Release();
             _reconfigureGate.Dispose();
+            _lifetime.Dispose();
         }
     }
 }
