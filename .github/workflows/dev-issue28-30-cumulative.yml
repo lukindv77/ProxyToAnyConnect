@@ -1,0 +1,75 @@
+name: dev-issue28-30-cumulative
+
+on:
+  push:
+    branches: [ dev/issue28-30-cumulative ]
+    paths:
+      - '.github/workflows/dev-issue28-30-cumulative.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Reapply validated routing delta on current main
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '159e5797deca5455aa38ccbb177003a4184d832d'
+          $validatedRoutingCommit = 'ec3e019667d1109087d80c496241da34a76130a3'
+          $parent = (git rev-parse 'HEAD^').Trim()
+          if ($parent -ne $expectedBase) {
+            throw "Unexpected cumulative #28/#30 base: $parent"
+          }
+          $proxyBlob = (git rev-parse 'HEAD^:src/ProxyToAnyConnect/Proxy/ProxyServer.cs').Trim()
+          $runnerBlob = (git rev-parse 'HEAD^:tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs').Trim()
+          if ($proxyBlob -ne '3bb2fe974567a41b000383ac197a9334a472b781' -or
+              $runnerBlob -ne '79b7a191d1edb66a7cc8d249a34f70a1a5c7b516') {
+            throw "Unexpected current-main #26 source inputs: proxy=$proxyBlob runner=$runnerBlob"
+          }
+
+          git checkout $validatedRoutingCommit -- `
+            tests/ProxyToAnyConnect.SelfTests/ProxyHttpCanonicalHostSelfTests.cs `
+            tests/ProxyToAnyConnect.SelfTests/ProxyRoutingHostCanonicalizationSelfTests.cs
+          git cherry-pick -n $validatedRoutingCommit
+          git -c core.whitespace=cr-at-eol diff --cached --check
+
+          $changed = @(git diff --cached --name-only)
+          $expected = @(
+            'src/ProxyToAnyConnect/Proxy/ProxyServer.cs',
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs',
+            'tests/ProxyToAnyConnect.SelfTests/ProxyHttpCanonicalHostSelfTests.cs',
+            'tests/ProxyToAnyConnect.SelfTests/ProxyRoutingHostCanonicalizationSelfTests.cs'
+          )
+          if ($changed.Count -ne $expected.Count) {
+            throw "Unexpected cumulative #28/#30 patch surface: $($changed -join ', ')"
+          }
+          foreach ($path in $expected) {
+            if ($changed -notcontains $path) {
+              throw "Cumulative #28/#30 omitted expected path: $path"
+            }
+          }
+      - name: Run full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish cumulative routing sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git commit -m 'proxy: canonicalize routing hosts before outbound ownership'
+          git push origin HEAD:refs/heads/dev/issue28-30-cumulative
