@@ -15,10 +15,11 @@ internal static class VpnLeaseManagerLifetimeSelfTests
             await DisposeRejectsSuccessfulConnectRacingShutdownAsync();
             await SharedLeaseDisconnectsOnlyAfterLastReleaseAsync();
             await DedicatedLeaseRejectsConcurrentConsumerAsync();
+            await RepeatedReconnectFailuresRecoverAndStopAfterLastLeaseAsync();
             await RepeatedLeaseManagerCyclesBecomeCollectibleAsync();
 
             Console.WriteLine(
-                "PASS: VPN lease manager owner cancellation, shutdown race barrier, shared last-release, dedicated exclusivity and collection churn");
+                "PASS: VPN lease manager owner cancellation, shutdown race barrier, shared last-release, dedicated exclusivity, reconnect churn and collection churn");
             return 0;
         }
         catch (Exception ex)
@@ -176,6 +177,92 @@ internal static class VpnLeaseManagerLifetimeSelfTests
         {
             throw new InvalidOperationException(
                 $"Dedicated sequential leases produced {controller.DisconnectCount} disconnects; expected 2.");
+        }
+    }
+
+    private static async Task RepeatedReconnectFailuresRecoverAndStopAfterLastLeaseAsync()
+    {
+        const int reconnectCycles = 24;
+        var contextReferences = await ExecuteReconnectChurnAsync(reconnectCycles);
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        var alive = contextReferences.Count(reference => reference.IsAlive);
+        if (alive != 0)
+        {
+            throw new InvalidOperationException(
+                $"Reconnect churn retained {alive} of {contextReferences.Length} replaced VPN contexts.");
+        }
+    }
+
+    private static async Task<WeakReference[]> ExecuteReconnectChurnAsync(int reconnectCycles)
+    {
+        var controller = new CyclingReconnectVpnConnectionController();
+        var manager = new VpnLeaseManager(
+            new L2tpOptions
+            {
+                Id = "vpn-reconnect-churn",
+                Name = "VPN reconnect churn",
+                Shared = true
+            },
+            controller,
+            TimeSpan.FromMilliseconds(10));
+
+        try
+        {
+            var lease = await manager.AcquireAsync("proxy-reconnect", CancellationToken.None);
+            var references = new WeakReference[reconnectCycles + 1];
+
+            for (var cycle = 0; cycle < reconnectCycles; cycle++)
+            {
+                var current = controller.Current
+                    ?? throw new InvalidOperationException($"Reconnect cycle {cycle} had no Ready context.");
+                references[cycle] = new WeakReference(current);
+
+                var nextGeneration = controller.Generation + 1;
+                controller.FailCurrent(transientFailures: cycle % 3 + 1);
+                await controller.WaitForGenerationAsync(nextGeneration, TimeSpan.FromSeconds(2));
+
+                if (manager.ActiveProxyCount != 1 ||
+                    controller.Current is not { IsAlive: true } ||
+                    controller.State != VpnConnectionState.Ready)
+                {
+                    throw new InvalidOperationException(
+                        $"Reconnect cycle {cycle} did not restore a Ready shared VPN while its lease remained active.");
+                }
+            }
+
+            var finalContext = controller.Current
+                ?? throw new InvalidOperationException("Reconnect churn lost its final Ready context.");
+            references[^1] = new WeakReference(finalContext);
+
+            var attemptsBeforeRelease = controller.ConnectAttemptCount;
+            await lease.DisposeAsync();
+
+            if (manager.ActiveProxyCount != 0 || controller.DisconnectCount != 1)
+            {
+                throw new InvalidOperationException(
+                    $"Last release after reconnect churn produced active={manager.ActiveProxyCount}, " +
+                    $"disconnects={controller.DisconnectCount}; expected 0/1.");
+            }
+
+            var attemptsAtRelease = controller.ConnectAttemptCount;
+            await Task.Delay(TimeSpan.FromMilliseconds(80));
+            if (controller.ConnectAttemptCount != attemptsAtRelease || attemptsAtRelease < attemptsBeforeRelease)
+            {
+                throw new InvalidOperationException(
+                    "VPN maintenance continued reconnect attempts after the last lease was released.");
+            }
+
+            await manager.DisposeAsync();
+            return references;
+        }
+        catch
+        {
+            await manager.DisposeAsync();
+            throw;
         }
     }
 
@@ -381,6 +468,126 @@ internal static class VpnLeaseManagerLifetimeSelfTests
             current?.MarkDisconnected();
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class CyclingReconnectVpnConnectionController : IVpnConnectionController
+    {
+        private readonly object _gate = new();
+        private TaskCompletionSource _generationChanged = NewSignal();
+        private VpnContext? _current;
+        private int _generation;
+        private int _transientFailuresRemaining;
+        private int _connectAttemptCount;
+        private int _disconnectCount;
+        private int _disposed;
+
+        public VpnContext? Current => Volatile.Read(ref _current);
+        public VpnConnectionState State => Current is { IsAlive: true }
+            ? VpnConnectionState.Ready
+            : VpnConnectionState.Disconnected;
+        public int Generation => Volatile.Read(ref _generation);
+        public int ConnectAttemptCount => Volatile.Read(ref _connectAttemptCount);
+        public int DisconnectCount => Volatile.Read(ref _disconnectCount);
+
+        public Task<VpnContext> ConnectAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            TaskCompletionSource? signal = null;
+            VpnContext context;
+            lock (_gate)
+            {
+                if (_current is { IsAlive: true } current)
+                {
+                    return Task.FromResult(current);
+                }
+
+                Interlocked.Increment(ref _connectAttemptCount);
+                if (_transientFailuresRemaining > 0)
+                {
+                    _transientFailuresRemaining--;
+                    throw new InvalidOperationException("Injected transient reconnect failure.");
+                }
+
+                var generation = ++_generation;
+                context = CreateContext($"reconnect-{generation}", 100 + generation);
+                Volatile.Write(ref _current, context);
+                signal = _generationChanged;
+                _generationChanged = NewSignal();
+            }
+
+            signal.TrySetResult();
+            return Task.FromResult(context);
+        }
+
+        public void FailCurrent(int transientFailures)
+        {
+            if (transientFailures < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(transientFailures));
+            }
+
+            VpnContext? current;
+            lock (_gate)
+            {
+                _transientFailuresRemaining = transientFailures;
+                current = Interlocked.Exchange(ref _current, null);
+            }
+
+            current?.MarkDisconnected();
+        }
+
+        public async Task WaitForGenerationAsync(int expectedGeneration, TimeSpan timeout)
+        {
+            using var timeoutCancellation = new CancellationTokenSource(timeout);
+            while (true)
+            {
+                Task signal;
+                lock (_gate)
+                {
+                    if (_generation >= expectedGeneration)
+                    {
+                        return;
+                    }
+
+                    signal = _generationChanged.Task;
+                }
+
+                await signal.WaitAsync(timeoutCancellation.Token);
+            }
+        }
+
+        public Task DisconnectAsync()
+        {
+            Interlocked.Increment(ref _disconnectCount);
+            VpnContext? current;
+            lock (_gate)
+            {
+                current = Interlocked.Exchange(ref _current, null);
+            }
+            current?.MarkDisconnected();
+            return Task.CompletedTask;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return ValueTask.CompletedTask;
+            }
+
+            VpnContext? current;
+            lock (_gate)
+            {
+                current = Interlocked.Exchange(ref _current, null);
+            }
+            current?.MarkDisconnected();
+            return ValueTask.CompletedTask;
+        }
+
+        private static TaskCompletionSource NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     private static VpnContext CreateContext(string entryName, int interfaceIndex) =>
