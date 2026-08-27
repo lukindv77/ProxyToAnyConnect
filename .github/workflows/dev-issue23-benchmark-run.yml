@@ -1,0 +1,25 @@
+name: dev-issue23-benchmark-run
+
+on:
+  push:
+    branches: [ dev/issue23-benchmark-contract ]
+    paths:
+      - '.github/workflows/dev-issue23-benchmark-run.yml'
+
+jobs:
+  aggregate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Verify exact comparator and run aggregate self-tests
+        shell: pwsh
+        run: |
+          $test = 'tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs'
+          $blob = (git rev-parse "HEAD:$test").Trim()
+          if ($blob -ne '3737e6c7df7739141d5989eb35195d5e4dd72c95') {
+            throw "Unexpected CONNECT benchmark comparator blob: $blob"
+          }
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
