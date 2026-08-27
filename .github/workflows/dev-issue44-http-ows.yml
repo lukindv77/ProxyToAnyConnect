@@ -29,6 +29,7 @@ jobs:
           $base = (git merge-base HEAD origin/main).Trim()
           if ($base -ne $expectedBase) { throw "Unexpected #44 merge base: $base" }
 
+          # The patch file is guarded by exact post-apply source/test blob identities below.
           git apply --check .github/validation/issue44.patch
           git apply .github/validation/issue44.patch
           git add -- src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs
