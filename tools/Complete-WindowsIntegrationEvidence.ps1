@@ -121,9 +121,7 @@ if ($RequireExternalProbes) {
             throw 'ProxyEndpoint values must not be empty.'
         }
 
-        $proxyOutput = Get-SuccessfulProbeOutput \
-            -Evidence $ready.Evidence \
-            -Name "proxyHttps:$endpoint"
+        $proxyOutput = Get-SuccessfulProbeOutput -Evidence $ready.Evidence -Name "proxyHttps:$endpoint"
         $proxyPublicIPv4[$endpoint] = $proxyOutput
 
         if (-not [string]::IsNullOrWhiteSpace($ExpectedVpnPublicIPv4) -and
@@ -136,9 +134,7 @@ if ($RequireExternalProbes) {
         }
 
         if ($RequireProxyHttpProbe) {
-            $null = Get-SuccessfulProbeOutput \
-                -Evidence $ready.Evidence \
-                -Name "proxyHttp:$endpoint"
+            $null = Get-SuccessfulProbeOutput -Evidence $ready.Evidence -Name "proxyHttp:$endpoint"
             $proxyHttpValidated[$endpoint] = $true
         }
     }
