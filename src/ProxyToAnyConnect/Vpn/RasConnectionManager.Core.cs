@@ -68,6 +68,12 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
 
             await StopMonitorLockedAsync();
 
+            // A prior fail-closed/rejected generation may have failed native hangup.
+            // Never dial a replacement until the retained exact HRASCONN reaches the
+            // documented terminal invalid-handle state and its dependent private PBK
+            // can be released safely.
+            await DrainPendingRasOwnershipLockedAsync();
+
             var retryRemaining = GetReconnectCooldownRemainingMilliseconds(
                 Environment.TickCount64,
                 Volatile.Read(ref _retryNotBeforeTickCount64));
@@ -157,15 +163,17 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
 
                 return result.Context;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException ex)
             {
-                await CleanupFailedConnectionAsync(result);
+                await CleanupFailedConnectionAsync(result, ex);
+                RetainEphemeralPhonebookForPendingRas(ref localEphemeralPhonebook);
                 SetState(VpnConnectionState.Disconnected);
                 throw;
             }
             catch (Exception ex)
             {
-                await CleanupFailedConnectionAsync(result);
+                await CleanupFailedConnectionAsync(result, ex);
+                RetainEphemeralPhonebookForPendingRas(ref localEphemeralPhonebook);
                 SetState(VpnConnectionState.Disconnected);
                 ArmReconnectCooldown("Dialing or verification failed.");
                 AppLog.Error(
@@ -354,9 +362,19 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
                 });
             return new ConnectionResult(handle, context);
         }
-        catch
+        catch (Exception ex)
         {
-            await _dialer.HangUpAndDrainAsync(handle);
+            try
+            {
+                await _dialer.HangUpAndDrainAsync(handle);
+            }
+            catch (Exception cleanupError)
+            {
+                _ = Interlocked.CompareExchange(ref _rasConnection, handle, 0);
+                ex.Data["RasCleanup:connect-core-hangup"] =
+                    $"{cleanupError.GetType().FullName}: {cleanupError.Message}";
+            }
+
             throw;
         }
     }
