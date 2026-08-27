@@ -14,10 +14,12 @@ internal static class VpnLeaseCleanupFailureSelfTests
         try
         {
             await LastReleaseClearsCacheWhenDisconnectFailsAsync();
+            await LastReleaseDrainsMaintenanceWhenCancellationCallbackThrowsAsync();
             await DisposeReleasesIndependentOwnersWhenControllerFailsAsync();
+            await DisposeContinuesWhenLifetimeCancellationCallbackThrowsAsync();
 
             Console.WriteLine(
-                "PASS: VPN lease teardown releases cache/status/token ownership even when controller cleanup fails");
+                "PASS: VPN lease teardown releases maintenance/cache/status/token ownership through cleanup and cancellation callback faults");
             return 0;
         }
         catch (Exception ex)
@@ -68,6 +70,57 @@ internal static class VpnLeaseCleanupFailureSelfTests
             throw new InvalidOperationException(
                 $"Expected one disconnect attempt, got {controller.DisconnectCount}.");
         }
+    }
+
+    private static async Task LastReleaseDrainsMaintenanceWhenCancellationCallbackThrowsAsync()
+    {
+        var controller = new CleanupFailureController();
+        var manager = new VpnLeaseManager(
+            CreateOptions("cleanup-maintenance-cancel"),
+            controller,
+            TimeSpan.FromMinutes(5));
+        var lease = await manager.AcquireAsync("proxy-a", CancellationToken.None);
+        var maintenanceCancellation = GetPrivateField<CancellationTokenSource>(
+            manager,
+            "_maintenanceCancellation");
+        var maintenanceTask = GetPrivateField<Task>(manager, "_maintenanceTask");
+        _ = maintenanceCancellation.Token.Register(
+            static () => throw new SyntheticCleanupException("maintenance cancellation callback failed"));
+        SeedDnsCache(manager, controller.Current!);
+
+        try
+        {
+            await lease.DisposeAsync();
+            throw new InvalidOperationException(
+                "Throwing maintenance cancellation callback was not surfaced from last-lease release.");
+        }
+        catch (AggregateException ex) when (
+            ex.InnerExceptions.Any(inner =>
+                inner is SyntheticCleanupException synthetic &&
+                synthetic.Message == "maintenance cancellation callback failed"))
+        {
+        }
+
+        if (!maintenanceTask.IsCompleted || !CancellationSourceWasDisposed(maintenanceCancellation))
+        {
+            throw new InvalidOperationException(
+                "Throwing maintenance cancellation callback prevented exact task drain or CTS disposal.");
+        }
+
+        if (GetPrivateField<CancellationTokenSource?>(manager, "_maintenanceCancellation") is not null ||
+            GetPrivateField<Task?>(manager, "_maintenanceTask") is not null)
+        {
+            throw new InvalidOperationException(
+                "Throwing maintenance cancellation callback retained published maintenance ownership.");
+        }
+
+        if (manager.ActiveProxyCount != 0 || manager.DnsCache.Count != 0 || controller.DisconnectCount != 1)
+        {
+            throw new InvalidOperationException(
+                "Throwing maintenance cancellation callback prevented last-lease disconnect/cache cleanup.");
+        }
+
+        await manager.DisposeAsync();
     }
 
     private static async Task DisposeReleasesIndependentOwnersWhenControllerFailsAsync()
@@ -122,7 +175,7 @@ internal static class VpnLeaseCleanupFailureSelfTests
                 "Failed manager disposal retained its latest-status registry entry.");
         }
 
-        if (!LifetimeSourceWasDisposed(lifetime))
+        if (!CancellationSourceWasDisposed(lifetime))
         {
             throw new InvalidOperationException(
                 "Failed manager disposal retained its lifetime CancellationTokenSource.");
@@ -132,6 +185,59 @@ internal static class VpnLeaseCleanupFailureSelfTests
         {
             throw new InvalidOperationException(
                 $"Expected one controller dispose attempt, got {controller.DisposeCount}.");
+        }
+
+        await lease.DisposeAsync();
+    }
+
+    private static async Task DisposeContinuesWhenLifetimeCancellationCallbackThrowsAsync()
+    {
+        var vpnId = $"cleanup-lifetime-cancel-{Guid.NewGuid():N}";
+        var controller = new CleanupFailureController
+        {
+            DisposeFailure = new SyntheticCleanupException("secondary controller dispose failed")
+        };
+        var manager = new VpnLeaseManager(
+            CreateOptions(vpnId),
+            controller,
+            TimeSpan.FromMinutes(5));
+        var lease = await manager.AcquireAsync("proxy-a", CancellationToken.None);
+        SeedDnsCache(manager, controller.Current!);
+        VpnLatestStatusRegistry.UpdateKeepaliveSuccess(
+            vpnId,
+            "10.42.0.1",
+            TimeSpan.FromMilliseconds(8));
+
+        var lifetime = GetPrivateLifetime(manager);
+        _ = lifetime.Token.Register(
+            static () => throw new SyntheticCleanupException("lifetime cancellation callback failed"));
+
+        try
+        {
+            await manager.DisposeAsync();
+            throw new InvalidOperationException(
+                "Throwing lifetime cancellation callback was not propagated from manager disposal.");
+        }
+        catch (AggregateException ex) when (
+            ex.InnerExceptions.Any(inner =>
+                inner is SyntheticCleanupException synthetic &&
+                synthetic.Message == "lifetime cancellation callback failed"))
+        {
+            if (!ex.Data.Contains("VpnCleanup:connection-dispose"))
+            {
+                throw new InvalidOperationException(
+                    "Secondary controller cleanup failure was not attached to the primary lifetime cancellation defect.");
+            }
+        }
+
+        if (manager.ActiveProxyCount != 0 ||
+            manager.DnsCache.Count != 0 ||
+            VpnLatestStatusRegistry.Get(vpnId) is not null ||
+            controller.DisposeCount != 1 ||
+            !CancellationSourceWasDisposed(lifetime))
+        {
+            throw new InvalidOperationException(
+                "Throwing manager lifetime cancellation callback prevented independent VPN ownership cleanup.");
         }
 
         await lease.DisposeAsync();
@@ -150,17 +256,25 @@ internal static class VpnLeaseCleanupFailureSelfTests
         }
     }
 
-    private static CancellationTokenSource GetPrivateLifetime(VpnLeaseManager manager)
+    private static T GetPrivateField<T>(object owner, string fieldName)
     {
-        var field = typeof(VpnLeaseManager).GetField(
-            "_lifetime",
+        var field = owner.GetType().GetField(
+            fieldName,
             BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new MissingFieldException(typeof(VpnLeaseManager).FullName, "_lifetime");
-        return field.GetValue(manager) as CancellationTokenSource
-            ?? throw new InvalidOperationException("VPN manager lifetime field had an unexpected value.");
+            ?? throw new MissingFieldException(owner.GetType().FullName, fieldName);
+        var value = field.GetValue(owner);
+        if (value is null)
+        {
+            return default!;
+        }
+
+        return (T)value;
     }
 
-    private static bool LifetimeSourceWasDisposed(CancellationTokenSource source)
+    private static CancellationTokenSource GetPrivateLifetime(VpnLeaseManager manager) =>
+        GetPrivateField<CancellationTokenSource>(manager, "_lifetime");
+
+    private static bool CancellationSourceWasDisposed(CancellationTokenSource source)
     {
         try
         {
