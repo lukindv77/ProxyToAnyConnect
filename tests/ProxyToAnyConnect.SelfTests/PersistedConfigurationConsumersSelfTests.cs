@@ -13,10 +13,11 @@ internal static class PersistedConfigurationConsumersSelfTests
             await LoggingFailureStillAttemptsRuntimeAsync();
             await RuntimeFailureRemainsPrimaryWhenLoggingSucceedsAsync();
             await BothFailuresPreserveLoggingPrimaryAsync();
+            await CallerCancellationWinsEarlierLoggingFailureAsync();
             await PreCancellationTouchesNoConsumerAsync();
 
             Console.WriteLine(
-                "PASS: one durable configuration generation reaches logging/runtime consumers with independent cleanup-style failure handling");
+                "PASS: one durable configuration generation reaches logging/runtime consumers with independent failures and caller-cancellation precedence");
             return 0;
         }
         catch (Exception ex)
@@ -131,6 +132,35 @@ internal static class PersistedConfigurationConsumersSelfTests
             if (!ReferenceEquals(ex.Data["PersistedConfigurationConsumer:runtime"], runtimeFailure))
             {
                 throw new InvalidOperationException("Secondary runtime failure was not retained diagnostically.");
+            }
+        }
+    }
+
+    private static async Task CallerCancellationWinsEarlierLoggingFailureAsync()
+    {
+        var desired = CreateOptions();
+        var loggingFailure = new SyntheticLoggingException();
+        using var cancellation = new CancellationTokenSource();
+
+        try
+        {
+            await PersistedConfigurationConsumers.ApplyAsync(
+                desired,
+                _ => throw loggingFailure,
+                (_, operationToken) =>
+                {
+                    cancellation.Cancel();
+                    operationToken.ThrowIfCancellationRequested();
+                    return Task.CompletedTask;
+                },
+                cancellation.Token);
+            throw new InvalidOperationException("Caller cancellation was swallowed by an earlier logging failure.");
+        }
+        catch (OperationCanceledException ex) when (cancellation.IsCancellationRequested)
+        {
+            if (!ReferenceEquals(ex.Data["PersistedConfigurationConsumer:logging"], loggingFailure))
+            {
+                throw new InvalidOperationException("Earlier logging defect was not retained under caller cancellation.");
             }
         }
     }
