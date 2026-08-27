@@ -902,7 +902,7 @@ internal sealed class ProxyServer
                     ValidateConnectionOptions(rawValue);
                 }
 
-                var value = rawValue.Trim();
+                var value = TrimHttpOptionalWhitespace(rawValue);
                 var header = new HeaderLine(name.ToString(), value.ToString());
                 headers.Add(header);
 
@@ -942,6 +942,23 @@ internal sealed class ProxyServer
                 version,
                 headers,
                 contentLength ?? 0);
+        }
+
+        private static ReadOnlySpan<char> TrimHttpOptionalWhitespace(ReadOnlySpan<char> value)
+        {
+            var start = 0;
+            while (start < value.Length && (value[start] == ' ' || value[start] == '\t'))
+            {
+                start++;
+            }
+
+            var end = value.Length;
+            while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t'))
+            {
+                end--;
+            }
+
+            return value[start..end];
         }
 
         private static long ParseContentLength(ReadOnlySpan<char> value)
