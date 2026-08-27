@@ -2,11 +2,11 @@
 
 Live protected `main` is authoritative. A source block is called accepted only after an exact-head Windows build completes successfully.
 
-## Authoritative accepted source checkpoint
+## Last fully verified substantive source checkpoint before handoff-only commits
 
-Commit `fb0d2743b815204fe87eb7ba972513894b41f445` — `test: prove independent coordinator starts overlap`.
+Commit `4b100f3bb6c744b08918ce122ab75982fa263740` — `evidence: support per-proxy and direct egress expectations`.
 
-Windows build #531, run `33051006335`, job `98446224154`, completed successfully on `windows-latest`:
+Windows build #534, run `33051353263`, completed successfully on `windows-latest`:
 
 - PowerShell tool validation: PASS;
 - Baseline -> Ready -> Final integration-evidence smoke: PASS;
@@ -17,24 +17,35 @@ Windows build #531, run `33051006335`, job `98446224154`, completed successfully
 - self-contained win-x64 publish: PASS;
 - binary identity manifest / ZIP / artifact upload: PASS.
 
-Artifact `9637611201`, `ProxyToAnyConnect-win-x64`, digest:
-`sha256:8042f82e1343f2f5133d85bbf7e576942cd2bd20857d0f286445404292ba5c55`.
+Build artifact `9637762202`, `ProxyToAnyConnect-win-x64`, digest:
+`sha256:be01041fefa07c4fe4dd39f4a02e5c038b9e729b97049a7da4880d685aedf239`.
 
-This checkpoint includes all previously accepted fail-closed, configuration, RAS/VPN, GUI shutdown and evidence work plus:
+Handoff #340 for the same SHA also succeeded. Its historical archive artifact was `9637723727`, digest `sha256:a5f6938cd10c8ba1cede68e96c4e57968f12c3a0f3bc8d7bca6182f14061b948`.
 
-- staged repair of multiple invalid loaded configuration fields before one complete durable publication;
-- one persisted desired generation applied independently to logging + runtime with caller-cancellation precedence;
+## What this checkpoint includes
+
+This checkpoint includes all previously accepted fail-closed, HTTP framing, transactional proxy startup, configuration, RAS/VPN, GUI shutdown and evidence work plus the current broad hardening state:
+
+- staged multi-step repair of invalid loaded configuration before one complete durable publication;
+- one persisted desired generation consumed independently by logging + runtime, with caller-cancellation precedence;
 - GUI Start/Pause serialized with configuration generations;
 - L2TP dialog-owned Windows-profile helper cancellation/drain before config-generation release;
-- bounded/streaming exact-binary soak evidence and log correlation;
-- process-memory monitor cleanup through throwing cancellation callbacks;
-- process-wide native callback-root current count + high-watermark telemetry, with large sequential/concurrent churn returning to baseline;
-- independent proxy start/restart generations run concurrently inside one serialized coordinator generation;
-- independent proxy cleanup owners run concurrently inside the proxy phase and independent VPN managers concurrently inside the VPN phase;
-- the proxy phase remains a hard barrier before VPN-manager disposal;
-- failed proxy start remains isolated/pending while an unrelated generation may become Running;
-- cleanup primary/secondary diagnostics remain deterministic by input order rather than completion order.
+- bounded/streaming exact-binary soak evidence and managed-log correlation;
+- process-memory monitor and cleanup ownership resilient to cancellation callback faults;
+- process-wide native RAS callback-root current count + high-watermark telemetry;
+- bounded RAS hangup/drain attempt that retains exact native ownership on timeout rather than risking callback-after-free;
+- independent proxy start/restart generations running concurrently inside one serialized coordinator operation;
+- independent cleanup owners running concurrently inside dependency phases, with proxy phase completed before VPN-manager phase;
+- failed independent proxy start isolated/pending while unrelated generation can become Running;
+- cleanup primary/secondary diagnostics deterministic by input order;
+- integration evidence collector support for per-proxy expected public IPv4 plus a separate expected direct-host public IPv4.
+
+## Handoff-only commits after this checkpoint
+
+The handoff preparation intentionally updates documentation and `.github/workflows/handoff.yml`, moving the live SHA forward without changing the accepted runtime/data path. The new handoff workflow includes `tools/`, `RECENT_COMMITS.tsv`, `START_HERE.txt` and 90-day artifact retention.
+
+The new chat must fetch the exact live head and its Actions. Do not call a handoff-only head green solely because `4b100f3...` was green; verify current Actions explicitly.
 
 ## Release boundary still open
 
-Hosted CI cannot replace real Windows 11 + real L2TP endpoint acceptance. Issues #2/#4/#5/#6/#7 remain open for endpoint/UI validation. Issue #13 additionally requires a representative 12–24h exact-binary soak under CONNECT/HTTP traffic, shared/dedicated L2TP, reconnect, Pause/Resume and reconfigure activity, with external soak samples correlated to `process.memory.*` logs.
+Hosted CI cannot replace real Windows 11 + real L2TP endpoint acceptance. Issues #2/#4/#5/#6/#7 remain open for endpoint/UI validation. Issue #13 additionally requires a representative 12–24 h exact-binary soak under CONNECT/HTTP traffic, shared/dedicated L2TP, reconnect, Pause/Resume and reconfigure activity, with external soak samples correlated to `process.memory.*` logs. #11 remains an ongoing performance/memory architecture requirement.
