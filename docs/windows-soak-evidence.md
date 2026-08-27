@@ -21,7 +21,7 @@ After identity is established, the collector samples only process-level diagnost
 
 The collector writes each sample immediately to JSONL and retains only scalar min/max/first/last aggregates in its own process. A 12-24 hour run therefore does not create an unbounded in-memory history.
 
-The application itself already records `process.memory.startup` and `process.memory.periodic` JSONL events containing managed heap, total allocated bytes, GC counts, working set, private bytes, handles and threads. Keep those application logs for the same time window and correlate them with the external soak series. The external collector intentionally does not inject diagnostics into the target process merely to obtain managed-heap data.
+The application itself records `process.memory.startup` and `process.memory.periodic` JSONL events containing process ID/start time, managed heap, total allocated bytes, GC counts, working set, private bytes, handles and threads. Keep those application logs for the same time window. The external collector intentionally does not inject diagnostics into the target process merely to obtain managed-heap data.
 
 ## Required release identity
 
@@ -93,6 +93,26 @@ The validator checks:
 
 Validation means the evidence bundle is internally consistent, portable between machines/directories and belongs to the expected process binary. It does **not** automatically declare the application leak-free.
 
+## Correlate application managed-memory logs
+
+After the external bundle has passed integrity validation, correlate the application's daily JSONL logs from the same soak window:
+
+```powershell
+.\tools\Test-WindowsSoakLogCorrelation.ps1 `
+  -OutputDirectory .\artifacts\soak-12h `
+  -ApplicationLogPath @(
+    '.\logs\2026-08\2026-08-27.jsonl',
+    '.\logs\2026-08\2026-08-28.jsonl'
+  ) `
+  -MinimumMemoryRecords 140
+```
+
+The correlation validator accepts multiple daily files in any order. It selects only `process.memory.startup` / `process.memory.periodic` records within the external soak window (with a small configurable clock-skew allowance) and requires every selected record to carry the same PID and exact process start time recorded in `metadata.json`. This prevents a restarted application, reused PID or unrelated log file from being silently mixed into the same analysis.
+
+The validator verifies the managed-memory/GC/resource metric fields and reports earliest/latest managed-heap/allocated-byte values plus maxima for working set, private bytes, handles and threads. It deliberately retains only a counter, earliest/latest records and scalar maxima while scanning. It does not materialize or sort the full matching history, so validator memory remains bounded when a soak spans many days or many daily files.
+
+Correlation proves that the external process-resource series and the application's managed-memory/GC records belong to the same exact process lifetime. It still does **not** infer a memory leak or a leak-free result automatically; workload-aware interpretation is required.
+
 ## Evidence files and portability contract
 
 The output directory contains exactly these four manifested payload files plus the manifest itself:
@@ -127,10 +147,10 @@ Keep timestamps or operational notes for deliberate lifecycle events so changes 
 
 Do not use a machine-specific absolute working-set number as the sole pass/fail criterion. Windows socket buffers, runtime GC policy, current traffic and OS memory pressure can change the working set without representing retained application ownership.
 
-Review the external sample series together with the application's `process.memory.*` records and lifecycle logs. Repeated session/reconnect/reconfigure cycles must not create monotonic retained growth in managed heap, handles, threads or other owned state after the workload returns to a comparable steady condition.
+Review the external sample series together with the application's correlated `process.memory.*` records and lifecycle logs. Repeated session/reconnect/reconfigure cycles must not create monotonic retained growth in managed heap, handles, threads or other owned state after the workload returns to a comparable steady condition.
 
 If a suspected retention pattern appears, reproduce it with the deterministic ownership/collectability self-tests first. Production code must not add forced `GC.Collect`, working-set trimming, synchronous hot-path cleanup or smaller transfer buffers merely to make soak graphs look smaller.
 
 ## Hosted CI coverage
 
-The Windows build workflow performs a short smoke run of both soak scripts against the current PowerShell process. The smoke validates script syntax, process identity/hash checking, sample emission, complete four-payload manifest integrity, result/summary consistency and validator execution. It also mutates a copied payload after collection and requires the validator to reject that tampered bundle. This hosted smoke does not pretend to replace the required multi-hour Windows 11/L2TP soak.
+The Windows build workflow performs a short smoke run of the soak collector, bundle validator and log-correlation validator against the current PowerShell process. The smoke validates script syntax, process identity/hash checking, sample emission, complete four-payload manifest integrity, result/summary consistency, managed-memory identity correlation and validator execution. It also mutates a copied payload after collection and requires the validator to reject that tampered bundle, and supplies a wrong-PID managed-memory record that correlation must reject. Hosted correlation covers records split across multiple input files in non-chronological file order so earliest/latest aggregation cannot accidentally depend on input order. This hosted smoke does not pretend to replace the required multi-hour Windows 11/L2TP soak.
