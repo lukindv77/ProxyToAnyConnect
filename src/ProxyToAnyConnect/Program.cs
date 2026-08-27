@@ -2,6 +2,7 @@ using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
 using ProxyToAnyConnect.Gui;
 using ProxyToAnyConnect.Runtime;
+using ProxyToAnyConnect.Vpn;
 
 namespace ProxyToAnyConnect;
 
@@ -40,6 +41,25 @@ internal static class Program
             "application.start",
             "ProxyToAnyConnect GUI started.",
             new { ConfigPath = configPath });
+
+        try
+        {
+            // Crash recovery must not depend on another CustomEphemeral dial ever
+            // occurring. A previous process may have died after creating a private
+            // PBK and the next configuration may use only Windows profiles. Recover
+            // only directories that opt into the managed marker protocol and whose
+            // exclusive owner lock is no longer held by a live process.
+            EphemeralRasPhonebook.CleanupOrphanedSessionDirectories();
+        }
+        catch (Exception ex)
+        {
+            // Temporary-resource recovery is best-effort diagnostics. It must never
+            // prevent the repair/settings GUI from opening.
+            AppLog.Warning(
+                "vpn.ephemeral.startup_recovery_failed",
+                "Startup recovery of abandoned private RAS sessions did not complete.",
+                new { Error = ex.Message });
+        }
 
         try
         {
