@@ -25,10 +25,8 @@ jobs:
           text = l2tp.read_text(encoding='utf-8')
           old = '''    private static void SelectEnum<TEnum>(ComboBox combo, TEnum value)\n    {\n        where TEnum : struct, Enum\n        for (var index = 0; index < combo.Items.Count; index++)\n'''
           new = '''    private static void SelectEnum<TEnum>(ComboBox combo, TEnum value)\n        where TEnum : struct, Enum\n    {\n        for (var index = 0; index < combo.Items.Count; index++)\n'''
-          if old not in text:
-              raise SystemExit('Expected broken SelectEnum generic constraint was not found exactly once.')
           if text.count(old) != 1:
-              raise SystemExit('Broken SelectEnum generic constraint was not unique.')
+              raise SystemExit('Expected broken SelectEnum generic constraint was not found exactly once.')
           l2tp.write_text(text.replace(old, new, 1), encoding='utf-8')
 
           main = Path('src/ProxyToAnyConnect/Gui/MainForm.cs')
@@ -49,13 +47,14 @@ jobs:
               text = text.replace(old, new, 1)
           main.write_text(text, encoding='utf-8')
 
-      - name: Commit source patch
+      - name: Commit source patch to review branch
         shell: bash
         run: |
           set -euo pipefail
+          branch='automation/l2tp-profile-shutdown'
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src/ProxyToAnyConnect/Gui/L2tpSettingsDialog.cs src/ProxyToAnyConnect/Gui/MainForm.cs
           git diff --cached --check
           git commit -m 'fix: complete L2TP profile helper shutdown barrier'
-          git push origin HEAD:main
+          git push --force origin "HEAD:refs/heads/$branch"
