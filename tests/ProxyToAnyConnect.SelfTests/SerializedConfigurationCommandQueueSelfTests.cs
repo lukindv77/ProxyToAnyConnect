@@ -11,9 +11,10 @@ internal static class SerializedConfigurationCommandQueueSelfTests
             await PreservesStrictGenerationOrderAndSingleOwnershipAsync();
             await FailureAndCancellationDoNotWedgeSuccessorsAsync();
             await StopCancelsActiveAndQueuedGenerationsAsync();
+            await StopDrainsTailAfterCancellationCallbackFaultAsync();
 
             Console.WriteLine(
-                "PASS: GUI configuration commands serialize strict generations, recover after failure/cancellation and drain on shutdown");
+                "PASS: GUI configuration commands serialize strict generations, recover after failure/cancellation and drain shutdown ownership through callback faults");
             return 0;
         }
         catch (Exception ex)
@@ -230,6 +231,72 @@ internal static class SerializedConfigurationCommandQueueSelfTests
         {
             _ = queue.RunAsync((_, _) => Task.CompletedTask);
             throw new InvalidOperationException("Stopped configuration queue accepted a new generation.");
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    private static async Task StopDrainsTailAfterCancellationCallbackFaultAsync()
+    {
+        var queue = new SerializedConfigurationCommandQueue();
+        var activeEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var activeFinished = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var active = queue.RunAsync(async (_, cancellationToken) =>
+        {
+            using var throwingRegistration = cancellationToken.Register(
+                () => throw new InvalidOperationException("expected GUI shutdown callback fault"));
+            activeEntered.TrySetResult(true);
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            finally
+            {
+                activeFinished.TrySetResult(true);
+            }
+        });
+        await activeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stop = queue.StopAsync();
+        await activeFinished.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Exception? stopFailure = null;
+        try
+        {
+            await stop.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        catch (Exception ex)
+        {
+            stopFailure = ex;
+        }
+
+        if (stopFailure is null ||
+            !stopFailure.ToString().Contains("expected GUI shutdown callback fault", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Queue shutdown did not preserve the cancellation callback cleanup defect after draining its tail.");
+        }
+
+        try
+        {
+            await active;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (AggregateException ex) when (
+            ex.ToString().Contains("expected GUI shutdown callback fault", StringComparison.Ordinal))
+        {
+            // Runtime cancellation callback faults may surface to the active command
+            // as an aggregate while StopAsync independently retains the same cleanup defect.
+        }
+
+        try
+        {
+            _ = queue.RunAsync((_, _) => Task.CompletedTask);
+            throw new InvalidOperationException("Queue accepted a new generation after faulted shutdown completed.");
         }
         catch (ObjectDisposedException)
         {
