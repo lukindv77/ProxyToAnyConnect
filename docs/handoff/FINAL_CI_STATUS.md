@@ -1,35 +1,40 @@
 # Final CI status at handoff — 2026-08-27
 
-Live protected `main` is authoritative. A source block is called accepted only after an exact-head Windows build has completed successfully.
+Live protected `main` is authoritative. A source block is called accepted only after an exact-head Windows build completes successfully.
 
-## Authoritative accepted checkpoint before the current runtime-independence block
+## Authoritative accepted source checkpoint
 
-Commit `03c372e90cd39b52cb261acd59e608e4caef19e5` — `test: prove caller cancellation wins persisted consumer faults`.
+Commit `fb0d2743b815204fe87eb7ba972513894b41f445` — `test: prove independent coordinator starts overlap`.
 
-Windows build #511, run `33047798858`, completed successfully:
+Windows build #531, run `33051006335`, job `98446224154`, completed successfully on `windows-latest`:
 
-- integration/evidence PowerShell smoke: PASS;
-- exact executable/process identity and soak-tool smoke: PASS;
+- PowerShell tool validation: PASS;
+- Baseline -> Ready -> Final integration-evidence smoke: PASS;
+- exact binary/process identity smoke: PASS;
+- Windows soak + managed-log correlation smoke: PASS;
 - restore/build: PASS;
 - aggregate self-tests: PASS;
 - self-contained win-x64 publish: PASS;
-- binary identity/ZIP/artifact upload: PASS.
+- binary identity manifest / ZIP / artifact upload: PASS.
 
-Artifact `9636363559`, `ProxyToAnyConnect-win-x64`, digest:
-`sha256:a604c88db7c8c1e2a5ad168571d6016f45af7eb1f16564f795be17779a108273`.
+Artifact `9637611201`, `ProxyToAnyConnect-win-x64`, digest:
+`sha256:8042f82e1343f2f5133d85bbf7e576942cd2bd20857d0f286445404292ba5c55`.
 
-This accepted checkpoint includes staged repair of invalid loaded configuration, unified persisted configuration consumers, caller-cancellation precedence across consumer faults, serialized GUI Start/Pause generations, L2TP dialog-owned profile-helper drain, streaming/self-validating Windows soak evidence correlation, bounded RAS hangup attempts and the previously accepted fail-closed/lifecycle work.
+This checkpoint includes all previously accepted fail-closed, configuration, RAS/VPN, GUI shutdown and evidence work plus:
 
-## Current development after #511
+- staged repair of multiple invalid loaded configuration fields before one complete durable publication;
+- one persisted desired generation applied independently to logging + runtime with caller-cancellation precedence;
+- GUI Start/Pause serialized with configuration generations;
+- L2TP dialog-owned Windows-profile helper cancellation/drain before config-generation release;
+- bounded/streaming exact-binary soak evidence and log correlation;
+- process-memory monitor cleanup through throwing cancellation callbacks;
+- process-wide native callback-root current count + high-watermark telemetry, with large sequential/concurrent churn returning to baseline;
+- independent proxy start/restart generations run concurrently inside one serialized coordinator generation;
+- independent proxy cleanup owners run concurrently inside the proxy phase and independent VPN managers concurrently inside the VPN phase;
+- the proxy phase remains a hard barrier before VPN-manager disposal;
+- failed proxy start remains isolated/pending while an unrelated generation may become Running;
+- cleanup primary/secondary diagnostics remain deterministic by input order rather than completion order.
 
-The following commits are intentionally newer than the accepted checkpoint and require a new exact-head Windows verdict before they are called accepted:
+## Release boundary still open
 
-- `c111de381280c48fb06c26d32625a78d5e7456a8` — process memory health now exposes live RAS callback-root count and drains its worker/CTS even when a cancellation callback faults;
-- `039ab936e0e88463992389df1bd342bbc355134a` — regression for process-memory cleanup fault ownership and RAS-root diagnostics;
-- coordinator independence work: dispose every independent owner inside one dependency phase concurrently while keeping proxy-before-VPN phase ordering and deterministic input-order error aggregation.
-
-The coordinator change is intended to remove N× teardown-timeout behavior when several dedicated L2TP groups are shutting down or being selectively replaced. One stuck RAS owner must not add its full drain timeout to every unrelated group.
-
-## Remaining release boundary
-
-Hosted CI is not a substitute for real Windows 11 + real L2TP acceptance. Issues #2/#4/#5/#6/#7 still require endpoint-backed verification. Issue #13 additionally requires a representative 12–24h exact-binary soak with matching `process.memory.*` logs and external soak-series correlation.
+Hosted CI cannot replace real Windows 11 + real L2TP endpoint acceptance. Issues #2/#4/#5/#6/#7 remain open for endpoint/UI validation. Issue #13 additionally requires a representative 12–24h exact-binary soak under CONNECT/HTTP traffic, shared/dedicated L2TP, reconnect, Pause/Resume and reconfigure activity, with external soak samples correlated to `process.memory.*` logs.
