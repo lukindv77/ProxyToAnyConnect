@@ -563,17 +563,40 @@ internal sealed class MainForm : Form
 
     private async Task ApplyConfigurationAsync(AppOptions newOptions)
     {
+        var persisted = false;
         try
         {
-            await newOptions.SaveAsync(_configPath, CancellationToken.None);
-            await _runtimeHost.ApplyOptionsAsync(newOptions, CancellationToken.None);
-            _options = newOptions;
-            RebuildVpnNameIndex();
-            RefreshRuntimeViews();
+            await PersistedDesiredConfiguration.SaveThenApplyAsync(
+                newOptions,
+                (desired, cancellationToken) => desired.SaveAsync(_configPath, cancellationToken),
+                desired =>
+                {
+                    _options = desired;
+                    RebuildVpnNameIndex();
+                    persisted = true;
+                },
+                (desired, cancellationToken) => _runtimeHost.ApplyOptionsAsync(desired, cancellationToken),
+                CancellationToken.None);
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.Message, "Не удалось применить настройки", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(
+                this,
+                ex.Message,
+                persisted
+                    ? "Настройки сохранены, runtime не применён"
+                    : "Не удалось применить настройки",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            if (persisted)
+            {
+                // Show the persisted desired settings through subsequent editors and
+                // refresh current runtime/Error state even when reconciliation failed.
+                RefreshRuntimeViews();
+            }
         }
     }
 
