@@ -356,5 +356,7 @@ internal static class RasDialerSelfTests
             throw new InvalidOperationException("Throwing native adapter must not enter status polling.");
     }
 
-    private sealed class SyntheticNativeDialException : Exception;
+    private sealed class SyntheticNativeDialException : Exception
+    {
+    }
 }
