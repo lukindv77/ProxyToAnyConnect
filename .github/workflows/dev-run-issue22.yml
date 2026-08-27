@@ -1,0 +1,48 @@
+name: dev-run-issue22
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/dev-run-issue22.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact staging head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply staged issue 22 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_path='src/ProxyToAnyConnect/Proxy/ProxyServer.cs'
+          runner_path='tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          if [[ "$(git hash-object "$source_path")" != 'e72a706217010ea4e11036d86b8e27d0bb4fce4c' ]]; then
+            echo 'ProxyServer.cs no longer matches the audited source blob.' >&2
+            exit 1
+          fi
+
+          awk '/issue22\.patch\.b64/{getline; print; exit}' .github/workflows/dev-apply-issue22.yml |
+            base64 -d > /tmp/issue22.patch
+          git apply --check --ignore-space-change /tmp/issue22.patch
+          git apply --ignore-space-change /tmp/issue22.patch
+          git diff --check
+
+          mapfile -t changed < <(git diff --name-only)
+          if [[ ${#changed[@]} -ne 2 || " ${changed[*]} " != *" $source_path "* || " ${changed[*]} " != *" $runner_path "* ]]; then
+            printf 'Unexpected patch result: %s\n' "${changed[*]}" >&2
+            exit 1
+          fi
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add "$source_path" "$runner_path"
+          git commit -m 'proxy: regenerate Host from absolute HTTP target'
+          git push origin HEAD:main
