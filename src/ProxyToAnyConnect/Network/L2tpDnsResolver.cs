@@ -599,7 +599,51 @@ internal sealed class L2tpDnsResolver
     }
 
     private static string NormalizeDnsName(string host) =>
-        IdnMapping.GetAscii(host.Trim().TrimEnd('.')).ToLowerInvariant();
+        NormalizeDnsHostStrict(host.Trim().TrimEnd('.'));
+
+    internal static string NormalizeDnsHostStrict(string host)
+    {
+        if (string.IsNullOrEmpty(host))
+        {
+            throw new InvalidOperationException("DNS host is empty.");
+        }
+
+        var asciiHost = IdnMapping.GetAscii(host).ToLowerInvariant();
+        if (asciiHost.Length > 253)
+        {
+            throw new InvalidOperationException("DNS host exceeds 253 ASCII characters.");
+        }
+
+        var labelStart = 0;
+        for (var i = 0; i <= asciiHost.Length; i++)
+        {
+            if (i < asciiHost.Length && asciiHost[i] != '.')
+            {
+                continue;
+            }
+
+            var labelLength = i - labelStart;
+            if (labelLength is 0 or > 63 ||
+                asciiHost[labelStart] == '-' ||
+                asciiHost[i - 1] == '-')
+            {
+                throw new InvalidOperationException($"Invalid DNS label in '{host}'.");
+            }
+
+            for (var j = labelStart; j < i; j++)
+            {
+                var character = asciiHost[j];
+                if (!char.IsAsciiLetterOrDigit(character) && character != '-')
+                {
+                    throw new InvalidOperationException($"Invalid DNS label in '{host}'.");
+                }
+            }
+
+            labelStart = i + 1;
+        }
+
+        return asciiHost;
+    }
 
     private readonly record struct DnsResolutionResult(
         IReadOnlyList<IPAddress> Addresses,
