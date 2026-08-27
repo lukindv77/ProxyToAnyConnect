@@ -6,9 +6,9 @@ namespace ProxyToAnyConnect.SelfTests;
 
 internal static class VerificationProbeRequestSelfTests
 {
-    private const int WarmupIterations = 256;
+    private const int WarmupIterations = 4096;
     private const int AllocationIterations = 1000;
-    private const int TimingRounds = 9;
+    private const int TimingRounds = 15;
     private const int IterationsPerRound = 65536;
     private const double MaxMedianSlowdownRatio = 1.25;
     private const string RepresentativeHost = "api64.ipify.org";
@@ -54,12 +54,12 @@ internal static class VerificationProbeRequestSelfTests
                     RepresentativeHost,
                     RepresentativePath));
             var timing = MeasurePaired(optimized, predecessor);
-            if (timing.Ratio > MaxMedianSlowdownRatio)
+            if (timing.PairedRatioMedian > MaxMedianSlowdownRatio)
             {
                 throw new InvalidOperationException(
                     $"Exact-size verification request builder median was {timing.OptimizedMedianNs:F0} ns/op versus " +
                     $"{timing.PredecessorMedianNs:F0} ns/op for interpolated-string + ASCII encoding " +
-                    $"({timing.Ratio:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
+                    $"({timing.PairedRatioMedian:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
             }
 
             Console.WriteLine(
@@ -67,7 +67,7 @@ internal static class VerificationProbeRequestSelfTests
                 $"(alloc {optimizedBytes / (double)AllocationIterations:F0} vs " +
                 $"{predecessorBytes / (double)AllocationIterations:F0} bytes/request; " +
                 $"timing {timing.OptimizedMedianNs:F0} vs {timing.PredecessorMedianNs:F0} ns/op, " +
-                $"{timing.Ratio:F2}x)");
+                $"{timing.PairedRatioMedian:F2}x)");
             return 0;
         }
         catch (Exception ex)
@@ -141,12 +141,14 @@ internal static class VerificationProbeRequestSelfTests
             }
         }
 
+        var pairedRatios = new double[TimingRounds];
+        for (var round = 0; round < TimingRounds; round++)
+        {
+            pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
+        }
         var optimizedMedian = Median(optimizedRounds);
         var predecessorMedian = Median(predecessorRounds);
-        return new TimingResult(
-            optimizedMedian,
-            predecessorMedian,
-            optimizedMedian / predecessorMedian);
+        return new TimingResult(optimizedMedian, predecessorMedian, Median(pairedRatios));
     }
 
     private static double MeasureNanosecondsPerOperation(Action action)
@@ -171,5 +173,5 @@ internal static class VerificationProbeRequestSelfTests
     private readonly record struct TimingResult(
         double OptimizedMedianNs,
         double PredecessorMedianNs,
-        double Ratio);
+        double PairedRatioMedian);
 }

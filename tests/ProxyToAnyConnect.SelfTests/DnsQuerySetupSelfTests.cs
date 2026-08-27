@@ -7,9 +7,9 @@ namespace ProxyToAnyConnect.SelfTests;
 
 internal static class DnsQuerySetupSelfTests
 {
-    private const int WarmupIterations = 256;
+    private const int WarmupIterations = 4096;
     private const int AllocationIterations = 1000;
-    private const int TimingRounds = 9;
+    private const int TimingRounds = 15;
     // The operation is sub-microsecond on hosted runners, so a 4096-op sample
     // is only a few milliseconds and is vulnerable to scheduler/JIT noise. Keep
     // the same 1.25x policy but measure long enough for the median to be stable.
