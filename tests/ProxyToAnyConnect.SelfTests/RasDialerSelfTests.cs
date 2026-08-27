@@ -4,10 +4,14 @@ namespace ProxyToAnyConnect.SelfTests;
 
 internal static class RasDialerSelfTests
 {
+    private const string SyntheticPassword = "self-test-sensitive-password";
+
     public static async Task<int> RunAsync()
     {
         try
         {
+            await NativeHandoffDoesNotRetainManagedPasswordAsync();
+            await NativeThrowStillClearsManagedPasswordAsync();
             await ConnectedNotificationReturnsExactHandleAsync();
             await CallerCancellationHangsUpAndDrainsAsync();
             await InitialFailureWithHandleStillDrainsAsync();
@@ -16,13 +20,77 @@ internal static class RasDialerSelfTests
             await RepeatedCancellationDoesNotDuplicateOwnershipAsync();
 
             Console.WriteLine(
-                "PASS: asynchronous RAS dial ownership cancels and drains exact connection handles");
+                "PASS: asynchronous RAS dial ownership clears managed passwords, cancels and drains exact connection handles");
             return 0;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"FAIL: asynchronous RAS dial lifecycle regression: {ex}");
             return 1;
+        }
+    }
+
+    private static async Task NativeHandoffDoesNotRetainManagedPasswordAsync()
+    {
+        var native = new FakeRasDialNative();
+        var dialer = new RasDialer(native);
+        var dialParams = CreateDialParams(SyntheticPassword);
+
+        // DialAsync runs synchronously through the native handoff before reaching
+        // its first incomplete await. Therefore the returned Task can still be
+        // pending while the managed RASDIALPARAMS password has already been cleared.
+        var dialTask = dialer.DialAsync(null, dialParams, CancellationToken.None);
+
+        if (!string.Equals(native.PasswordObservedDuringDial, SyntheticPassword, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Native RasDial handoff did not receive the supplied plaintext password.");
+        }
+
+        if (dialParams.SzPassword.Length != 0)
+        {
+            throw new InvalidOperationException(
+                "Managed RasDialParams retained plaintext password after the native handoff returned.");
+        }
+
+        if (dialTask.IsCompleted)
+        {
+            throw new InvalidOperationException(
+                "Synthetic asynchronous dial unexpectedly completed before its terminal notification.");
+        }
+
+        // Non-secret dial identity remains available for diagnostics/ownership.
+        if (dialParams.SzEntryName != "SelfTest" ||
+            dialParams.SzUserName != "self-test-user" ||
+            dialParams.SzDomain != "SELFTEST")
+        {
+            throw new InvalidOperationException(
+                "Password cleanup unexpectedly cleared non-secret RAS dial identity fields.");
+        }
+
+        native.Notify(RasDialer.RasCsConnected, RasNative.ErrorSuccess);
+        _ = await dialTask;
+    }
+
+    private static async Task NativeThrowStillClearsManagedPasswordAsync()
+    {
+        var native = new ThrowingRasDialNative();
+        var dialer = new RasDialer(native);
+        var dialParams = CreateDialParams(SyntheticPassword);
+
+        try
+        {
+            _ = await dialer.DialAsync(null, dialParams, CancellationToken.None);
+            throw new InvalidOperationException("Throwing native adapter unexpectedly completed RasDial.");
+        }
+        catch (SyntheticNativeDialException)
+        {
+        }
+
+        if (dialParams.SzPassword.Length != 0)
+        {
+            throw new InvalidOperationException(
+                "Managed RasDialParams retained plaintext password after native Dial threw.");
         }
     }
 
@@ -169,11 +237,14 @@ internal static class RasDialerSelfTests
         }
     }
 
-    private static RasNative.RasDialParams CreateDialParams() =>
+    private static RasNative.RasDialParams CreateDialParams(string password = "") =>
         new()
         {
             DwSize = 1,
-            SzEntryName = "SelfTest"
+            SzEntryName = "SelfTest",
+            SzUserName = "self-test-user",
+            SzPassword = password,
+            SzDomain = "SELFTEST"
         };
 
     private static void AssertSingleDrainedHandle(FakeRasDialNative native, string phase)
@@ -216,6 +287,7 @@ internal static class RasDialerSelfTests
         public nint LastHungUpHandle { get; private set; }
         public int StatusCount => Volatile.Read(ref _statusCount);
         public bool InvalidHandleObserved { get; private set; }
+        public string? PasswordObservedDuringDial { get; private set; }
 
         public uint Dial(
             string? phoneBook,
@@ -223,6 +295,7 @@ internal static class RasDialerSelfTests
             RasDialCallback notifier,
             out nint rasConnection)
         {
+            PasswordObservedDuringDial = dialParams.SzPassword;
             _notifier = notifier;
             rasConnection = Handle;
             _dialStarted.TrySetResult();
@@ -263,4 +336,25 @@ internal static class RasDialerSelfTests
             notifier(Handle, 0, connectionState, error, extendedError);
         }
     }
+
+    private sealed class ThrowingRasDialNative : IRasDialNative
+    {
+        public uint Dial(
+            string? phoneBook,
+            RasNative.RasDialParams dialParams,
+            RasDialCallback notifier,
+            out nint rasConnection)
+        {
+            rasConnection = 0;
+            throw new SyntheticNativeDialException();
+        }
+
+        public uint HangUp(nint rasConnection) =>
+            throw new InvalidOperationException("Throwing native adapter must not enter hangup.");
+
+        public uint GetConnectStatus(nint rasConnection) =>
+            throw new InvalidOperationException("Throwing native adapter must not enter status polling.");
+    }
+
+    private sealed class SyntheticNativeDialException : Exception;
 }
