@@ -33,8 +33,7 @@ def replace_block(data: bytes, old_lf: bytes, new_lf: bytes, label: str) -> byte
 proxy = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
 data = proxy.read_bytes()
 
-# Remove escape-sensitive backslash char-literal generation from the inherited #25 source.
-# Match the unique semantic line by its stable prefix and rewrite it as an explicit numeric code point.
+# Avoid an escape-sensitive C# backslash character literal in the inherited #25 source.
 lines = data.splitlines(keepends=True)
 matches = [
     i for i, line in enumerate(lines)
@@ -48,7 +47,7 @@ newline = b'\r\n' if line.endswith(b'\r\n') else b'\n'
 indent = b'                '
 lines[i] = (
     indent + b'character == (char)0x5C ||' + newline +
-    indent + b"character is '@' or '/' or '?' or '#' or ':'" + newline
+    indent + b"character is '@' or '/' or '?' or '#' or ':')" + newline
 )
 data = b''.join(lines)
 
