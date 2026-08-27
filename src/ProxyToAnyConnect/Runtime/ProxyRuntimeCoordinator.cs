@@ -59,7 +59,28 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
             foreach (var proxy in proxies)
             {
                 operationToken.ThrowIfCancellationRequested();
-                await TryStartProxyAsync(proxy, operationToken);
+
+                lock (_collectionGate)
+                {
+                    if (_proxyById.TryGetValue(proxy.Options.Id, out var current) &&
+                        ReferenceEquals(current, proxy) &&
+                        proxy.Options.Enabled)
+                    {
+                        _pendingStartProxyIds.Add(proxy.Options.Id);
+                    }
+                }
+
+                if (await TryStartProxyAsync(proxy, operationToken))
+                {
+                    lock (_collectionGate)
+                    {
+                        if (_proxyById.TryGetValue(proxy.Options.Id, out var current) &&
+                            ReferenceEquals(current, proxy))
+                        {
+                            _pendingStartProxyIds.Remove(proxy.Options.Id);
+                        }
+                    }
+                }
             }
         }
         finally
