@@ -19,7 +19,8 @@ jobs:
         run: |
           $toolPaths = @(
             './tools/Invoke-WindowsIntegrationEvidence.ps1',
-            './tools/Test-WindowsIntegrationEvidence.ps1'
+            './tools/Test-WindowsIntegrationEvidence.ps1',
+            './tools/Complete-WindowsIntegrationEvidence.ps1'
           )
           foreach ($toolPath in $toolPaths) {
             $tokens = $null
@@ -34,39 +35,45 @@ jobs:
             }
           }
 
-      - name: Smoke-test Windows integration evidence
+      - name: Smoke-test Windows integration evidence lifecycle
         shell: pwsh
         run: |
           $output = './artifacts/integration-evidence-smoke'
-          ./tools/Invoke-WindowsIntegrationEvidence.ps1 `
-            -Stage Baseline `
-            -OutputDirectory $output `
-            -SkipExternalProbes | Write-Host
+          foreach ($stage in @('Baseline', 'Ready', 'Final')) {
+            ./tools/Invoke-WindowsIntegrationEvidence.ps1 `
+              -Stage $stage `
+              -OutputDirectory $output `
+              -SkipExternalProbes | Write-Host
+          }
 
-          ./tools/Test-WindowsIntegrationEvidence.ps1 `
-            -Stage Baseline `
+          ./tools/Complete-WindowsIntegrationEvidence.ps1 `
             -OutputDirectory $output | Write-Host
 
-          $evidencePath = Join-Path $output 'baseline/evidence.json'
-          $summaryPath = Join-Path $output 'baseline/summary.json'
-          $manifestPath = Join-Path $output 'baseline/manifest.json'
-          foreach ($requiredPath in @($evidencePath, $summaryPath, $manifestPath)) {
-            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
-              throw "Evidence harness did not create $requiredPath"
+          foreach ($stage in @('baseline', 'ready', 'final')) {
+            foreach ($fileName in @('evidence.json', 'summary.json', 'manifest.json')) {
+              $requiredPath = Join-Path (Join-Path $output $stage) $fileName
+              if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+                throw "Evidence lifecycle did not create $requiredPath"
+              }
             }
           }
 
-          $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
-          $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
-          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-          if ($evidence.schemaVersion -ne 1 -or $evidence.stage -ne 'Baseline') {
-            throw 'Evidence harness emitted an unexpected schema/stage.'
+          $acceptancePath = Join-Path $output 'acceptance-summary.json'
+          if (-not (Test-Path -LiteralPath $acceptancePath -PathType Leaf)) {
+            throw "Evidence lifecycle did not create $acceptancePath"
           }
-          if ($summary.stage -ne 'Baseline' -or $summary.failedAssertionCount -ne 0) {
-            throw 'Baseline evidence smoke test unexpectedly reported failed assertions.'
+
+          $acceptance = Get-Content -LiteralPath $acceptancePath -Raw | ConvertFrom-Json
+          if ($acceptance.schemaVersion -ne 1 -or -not $acceptance.passed) {
+            throw 'Evidence lifecycle emitted an unsuccessful acceptance summary.'
           }
-          if ($manifest.stage -ne 'Baseline' -or $manifest.fileCount -lt 2) {
-            throw 'Evidence validator emitted an incomplete integrity manifest.'
+          if ($acceptance.externalProbesRequired -or $acceptance.proxyHttpProbeRequired) {
+            throw 'Hosted smoke unexpectedly required external integration probes.'
+          }
+          if ($acceptance.routeFingerprint -ne $acceptance.stages.Baseline.routeFingerprint -or
+              $acceptance.routeFingerprint -ne $acceptance.stages.Ready.routeFingerprint -or
+              $acceptance.routeFingerprint -ne $acceptance.stages.Final.routeFingerprint) {
+            throw 'Acceptance summary did not preserve one route fingerprint across all stages.'
           }
 
       - name: Setup .NET 10
