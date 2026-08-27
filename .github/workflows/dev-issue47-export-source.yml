@@ -1,0 +1,65 @@
+name: dev-issue47-export-source
+
+on:
+  push:
+    branches:
+      - dev/issue47-soak-duration
+    paths:
+      - .github/workflows/dev-issue47-export-source.yml
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reconstruct validated source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git merge-base --is-ancestor e4b9d53177c80639ed142c53a94e45fb6e54f2cf HEAD
+          if ((git rev-parse HEAD:.github/validation/issue47.patch).Trim() -ne 'c0b5315eb3de194d044b6143703cde7f092036e5') {
+            throw 'Unexpected issue47 patch blob.'
+          }
+          if ((git rev-parse HEAD:tools/Test-WindowsSoakEvidence.ps1).Trim() -ne 'b78b102158176c941a6f579f28d5a9fe0c9b55b4') {
+            throw 'Unexpected validator base blob.'
+          }
+          if ((git rev-parse HEAD:.github/workflows/build.yml).Trim() -ne '84506ec43ac3ca27b791e0c00d44b5289a411551') {
+            throw 'Unexpected build workflow base blob.'
+          }
+          git apply --recount --check .github/validation/issue47.patch
+          git apply --recount .github/validation/issue47.patch
+          git add -- tools/Test-WindowsSoakEvidence.ps1 .github/workflows/build.yml
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          $expected = @('.github/workflows/build.yml','tools/Test-WindowsSoakEvidence.ps1')
+          if (($staged -join "`n") -ne ($expected -join "`n")) {
+            throw "Unexpected issue47 source surface: $($staged -join ', ')"
+          }
+          Write-Host "BUILD_BLOB=$((git rev-parse ':.github/workflows/build.yml').Trim())"
+          Write-Host "VALIDATOR_BLOB=$((git rev-parse ':tools/Test-WindowsSoakEvidence.ps1').Trim())"
+
+          New-Item -ItemType Directory -Path './artifacts/issue47-export' -Force | Out-Null
+          Copy-Item -LiteralPath './.github/workflows/build.yml' -Destination './artifacts/issue47-export/build.yml'
+          Copy-Item -LiteralPath './tools/Test-WindowsSoakEvidence.ps1' -Destination './artifacts/issue47-export/Test-WindowsSoakEvidence.ps1'
+      - name: Publish validator blob to dev ref
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git reset HEAD -- .github/workflows/build.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test: preserve serialized soak timestamp precision'
+          git push origin HEAD:dev/issue47-soak-duration
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue47-flat-validated-source
+          path: artifacts/issue47-export
+          if-no-files-found: error
