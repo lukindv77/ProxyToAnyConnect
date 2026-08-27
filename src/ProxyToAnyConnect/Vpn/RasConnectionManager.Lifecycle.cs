@@ -1,4 +1,5 @@
 using System.Net;
+using System.Runtime.ExceptionServices;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
 
@@ -117,35 +118,70 @@ internal sealed partial class RasConnectionManager
         await _gate.WaitAsync();
         try
         {
+            Exception? cleanupFailure = null;
             var context = Interlocked.Exchange(ref _current, null);
-            context?.MarkDisconnected();
             Volatile.Write(ref _lastVerification, null);
             SetState(VpnConnectionState.Disconnected);
+
+            try
+            {
+                context?.MarkDisconnected();
+            }
+            catch (Exception ex)
+            {
+                CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "context-disconnect");
+            }
 
             // Remove the current handle before cancelling the old monitor. Even if
             // the monitor was already entering fail-closed cleanup, its compare-
             // exchange cannot act on a future/replacement RAS session.
             var handle = Interlocked.Exchange(ref _rasConnection, 0);
 
-            await StopMonitorLockedAsync();
+            try
+            {
+                await StopMonitorLockedAsync();
+            }
+            catch (Exception ex)
+            {
+                CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "monitor-stop");
+            }
 
             if (handle != 0)
             {
-                await _dialer.HangUpAndDrainAsync(handle);
-                AppLog.Info(
-                    "vpn.ras.hangup",
-                    "RAS connection was disconnected.",
-                    new
-                    {
-                        VpnId = _options.Id,
-                        VpnName = _options.Name,
-                        Mode = _options.Mode.ToString(),
-                        EntryName = context?.EntryName
-                    });
+                try
+                {
+                    await _dialer.HangUpAndDrainAsync(handle);
+                    AppLog.Info(
+                        "vpn.ras.hangup",
+                        "RAS connection was disconnected.",
+                        new
+                        {
+                            VpnId = _options.Id,
+                            VpnName = _options.Name,
+                            Mode = _options.Mode.ToString(),
+                            EntryName = context?.EntryName
+                        });
+                }
+                catch (Exception ex)
+                {
+                    CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "ras-hangup");
+                }
             }
 
             var ephemeral = Interlocked.Exchange(ref _ephemeralPhonebook, null);
-            ephemeral?.Dispose();
+            if (ephemeral is not null)
+            {
+                try
+                {
+                    ephemeral.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "ephemeral-phonebook");
+                }
+            }
+
+            RethrowLifecycleCleanupFailure(cleanupFailure);
         }
         finally
         {
@@ -160,14 +196,60 @@ internal sealed partial class RasConnectionManager
             return;
         }
 
-        _shutdown.Cancel();
-        await DisconnectAsync();
-        _shutdown.Dispose();
+        Exception? cleanupFailure = null;
+        try
+        {
+            _shutdown.Cancel();
+            try
+            {
+                await DisconnectAsync();
+            }
+            catch (Exception ex)
+            {
+                CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "disconnect");
+            }
+        }
+        finally
+        {
+            try
+            {
+                _shutdown.Dispose();
+            }
+            catch (Exception ex)
+            {
+                CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "shutdown-token");
+            }
+        }
+
+        RethrowLifecycleCleanupFailure(cleanupFailure);
 
         // As with the higher-level runtime gates, AvailableWaitHandle is never
         // requested. Avoid racing SemaphoreSlim.Dispose() against a ConnectAsync
         // caller that passed its pre-wait disposed check just before shutdown;
         // the managed gate is collectible with this manager.
+    }
+
+    private static void CaptureLifecycleCleanupFailure(
+        ref Exception? primaryFailure,
+        Exception failure,
+        string phase)
+    {
+        if (primaryFailure is null)
+        {
+            primaryFailure = failure;
+            return;
+        }
+
+        primaryFailure.Data[$"RasCleanup:{phase}"] =
+            $"{failure.GetType().FullName}: {failure.Message}";
+    }
+
+    private static void RethrowLifecycleCleanupFailure(Exception? cleanupFailure)
+    {
+        if (cleanupFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+        }
     }
 
     private sealed record ConnectionResult(nint Handle, VpnContext Context);
