@@ -6,13 +6,17 @@
 
 Use one output directory for all three stages. Keep the same proxy endpoint list and expected VPN egress identity for the entire run.
 
+For a release-grade run, extract the GitHub Actions `ProxyToAnyConnect-win-x64` artifact and keep its generated `build-identity.json` next to `ProxyToAnyConnect.exe`. The manifest contains the exact Git commit and SHA-256 of the executable produced by that workflow run.
+
 ```powershell
 $evidence = '.\artifacts\integration-evidence'
 $proxy = '127.0.0.1:18080'
 $expectedVpnIPv4 = '<EXPECTED_VPN_IPV4>'
+$buildIdentity = Get-Content '.\ProxyToAnyConnect-win-x64\build-identity.json' -Raw | ConvertFrom-Json
+$expectedExecutableSha256 = [string]$buildIdentity.sha256
 ```
 
-Before ProxyToAnyConnect establishes the test L2TP session, capture the host baseline:
+Before starting ProxyToAnyConnect for the release-grade process-lifecycle run, capture the host baseline:
 
 ```powershell
 .\tools\Invoke-WindowsIntegrationEvidence.ps1 `
@@ -52,6 +56,8 @@ Do not manually infer acceptance from three unrelated JSON files. Run the aggreg
   -OutputDirectory $evidence `
   -ProxyEndpoint $proxy `
   -ExpectedVpnPublicIPv4 $expectedVpnIPv4 `
+  -ExpectedExecutableSha256 $expectedExecutableSha256 `
+  -RequireProcessLifecycle `
   -RequireExternalProbes `
   -RequireProxyHttpProbe
 ```
@@ -61,6 +67,8 @@ Do not manually infer acceptance from three unrelated JSON files. Run the aggreg
 - Baseline, Ready and Final evidence/summary/manifest files all exist and validate;
 - one IPv4 default-route fingerprint is preserved across Baseline -> Ready -> Final;
 - the Windows VPN-profile fingerprint returns to the Baseline value in Final;
+- when `-RequireProcessLifecycle` is used, no ProxyToAnyConnect process exists at Baseline, exactly one exists at Ready, and none remains after explicit Exit at Final;
+- when `-ExpectedExecutableSha256` is supplied, the single Ready process executable hash exactly matches the expected CI-published binary;
 - every requested Ready proxy HTTPS probe succeeded;
 - the direct Ready HTTPS probe succeeded;
 - every requested proxy HTTPS result matches `-ExpectedVpnPublicIPv4` when it is supplied;
@@ -69,7 +77,7 @@ Do not manually infer acceptance from three unrelated JSON files. Run the aggreg
 
 If direct and VPN egress are intentionally the same in the real environment, add `-AllowDirectPublicIPv4Match` explicitly. Do not use that switch merely to make a failed isolation test pass.
 
-On success the script writes `acceptance-summary.json`. The summary contains the aggregate verdict, route/profile fingerprints, probe outputs, and for each stage the evidence/summary/manifest paths, validated file count and assertion counts. This is the machine-readable acceptance record to archive with the tested executable and commit SHA.
+On success the script writes `acceptance-summary.json`. The summary contains the aggregate verdict, route/profile fingerprints, process counts, expected/observed executable SHA-256, probe outputs, and for each stage the evidence/summary/manifest paths, validated file count and assertion counts. This is the machine-readable acceptance record to archive with the tested artifact and Git commit SHA.
 
 If plain HTTP is not available in the test environment, omit both `-HttpProbeUrl` during Ready capture and `-RequireProxyHttpProbe` during completion. HTTPS/direct-route/VPN isolation checks remain mandatory for the real endpoint run.
 
@@ -81,6 +89,7 @@ Each stage records scalar/system evidence only:
 - Current User and All Users Windows VPN profile metadata and profile fingerprint;
 - interface/index/IPv4/default-gateway/DNS metadata;
 - current ProxyToAnyConnect process resource counters when present;
+- SHA-256 of the running ProxyToAnyConnect executable when Windows exposes its process path; the path itself is never persisted, and a hash-capture failure records only the exception type;
 - optional direct and proxy HTTP/HTTPS probe results;
 - optional exact expected L2TP public-IPv4 assertion;
 - optional copies of the most recent application JSONL logs.
@@ -100,8 +109,16 @@ The capture script does not read saved RAS passwords, PSKs, DPAPI payloads or ap
 
 After validation it writes `manifest.json` containing the relative path, byte length and SHA-256 of every stage evidence/log file. The manifest contains hashes and metadata, not credential values.
 
-Keep the entire evidence directory together with the tested executable SHA and Git commit SHA. A real-endpoint acceptance result is not complete if the validator/aggregate completion fails or if the exact tested build cannot be identified.
+Keep the entire evidence directory together with the tested artifact. A real-endpoint acceptance result is not complete if the validator/aggregate completion fails, if `-ExpectedExecutableSha256` does not match the Ready process, or if the exact tested build cannot be identified.
 
 ## CI scope
 
-The Windows GitHub Actions build parses all three PowerShell tools and executes a safe three-stage `Baseline -> Ready -> Final` capture with external probes disabled, followed by `Complete-WindowsIntegrationEvidence.ps1`. The hosted smoke verifies stage creation, per-stage manifests, aggregate route/profile invariants and the final machine-readable acceptance summary. It does **not** replace real Windows 11 + real L2TP endpoint acceptance required by issues #2, #4, #5, #6 and #7.
+The Windows GitHub Actions build parses all three PowerShell tools and executes a safe three-stage `Baseline -> Ready -> Final` capture with external probes disabled, followed by `Complete-WindowsIntegrationEvidence.ps1`. The hosted smoke verifies stage creation, per-stage manifests, aggregate route/profile invariants and the final machine-readable acceptance summary. It additionally injects a synthetic Ready process record into the smoke evidence and re-runs completion with `-ExpectedExecutableSha256` plus `-RequireProcessLifecycle`, so the exact-binary validation path is continuously exercised without launching the application or contacting a VPN endpoint.
+
+Every pushed self-contained artifact now contains:
+
+- `ProxyToAnyConnect.exe`;
+- `ProxyToAnyConnect.exe.sha256` for simple command-line verification;
+- `build-identity.json` with schema version, exact Git commit and executable SHA-256.
+
+Hosted smoke does **not** replace real Windows 11 + real L2TP endpoint acceptance required by issues #2, #4, #5, #6 and #7.
