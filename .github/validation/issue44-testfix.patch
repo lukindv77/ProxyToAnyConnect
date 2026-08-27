@@ -1,0 +1,21 @@
+diff --git a/tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs b/tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs
+index fd1b736..aca7365 100644
+--- a/tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs
++++ b/tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs
+@@ -96,13 +96,13 @@ internal static class ProxyHttpFramingSelfTests
+             "GET http://example.test/ HTTP/1.1\r\n" +
+             "Host: ignored.example\r\n" +
+             "X-Opaque: ",
+-            0xA0,
++            (byte)0xA0,
+             "edge",
+-            0x85,
++            (byte)0x85,
+             " \t\r\n\r\n");
+         var opaque = ProxyServer.ParsedProxyRequest.Parse(opaqueRequest);
+         var originHeader = opaque.BuildOriginHeader("/", "example.test");
+-        var expectedOpaque = BuildRawRequest("X-Opaque: ", 0xA0, "edge", 0x85, "\r\n");
++        var expectedOpaque = BuildRawRequest("X-Opaque: ", (byte)0xA0, "edge", (byte)0x85, "\r\n");
+         if (originHeader.AsSpan().IndexOf(expectedOpaque) < 0)
+         {
+             throw new InvalidOperationException(
