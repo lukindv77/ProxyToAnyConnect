@@ -30,7 +30,8 @@ jobs:
           $changed = @(git diff --name-only)
           $expected = @(
             'src/ProxyToAnyConnect/Proxy/ProxyServer.cs',
-            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs',
+            'tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs'
           )
           if ($changed.Count -ne $expected.Count) {
             throw "Unexpected #26 patch count: $($changed -join ', ')"
@@ -53,6 +54,6 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           git config user.name 'ProxyToAnyConnect CI'
           git config user.email 'actions@github.com'
-          git add src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs tests/ProxyToAnyConnect.SelfTests/ProxyConnectionOptionSelfTests.cs
+          git add src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs tests/ProxyToAnyConnect.SelfTests/ProxyConnectionOptionSelfTests.cs
           git commit -m 'proxy: validate Connection options before outbound routing'
           git push origin HEAD:refs/heads/dev/issue26-clean-rebuild

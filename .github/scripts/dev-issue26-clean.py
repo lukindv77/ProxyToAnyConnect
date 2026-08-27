@@ -5,6 +5,7 @@ expected = {
     'src/ProxyToAnyConnect/Proxy/ProxyServer.cs': '920e8c335bc5488dc0f08dae87e4c0247e9b78eb',
     'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs': '7d1d807e7696a5527e18231814e9f7ebb2e56e79',
     'tests/ProxyToAnyConnect.SelfTests/ProxyConnectionOptionSelfTests.cs': '0b2cca1f4ec732c5e45130fa731dbdc0b44eb292',
+    'tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs': 'dcd750848417390d5bf01696e7b66b36c0974d8f',
 }
 for path, sha in expected.items():
     actual = subprocess.check_output(['git', 'rev-parse', f'HEAD:{path}'], text=True).strip()
@@ -133,3 +134,17 @@ data = replace_block(
 ''',
     'Connection-option runner anchor')
 runner.write_bytes(data)
+
+allocation = Path('tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs')
+data = allocation.read_bytes()
+data = replace_block(
+    data,
+    b'                "Connection: x-two, , Upgrade\\r\\n" +\n',
+    b'                "Connection: x-two, Upgrade\\r\\n" +\n',
+    'origin-header valid Connection fixture')
+data = replace_block(
+    data,
+    b'            "Connection: X-One, , x-two, X-One\\r\\n" +\n',
+    b'            "Connection: X-One, x-two, X-One\\r\\n" +\n',
+    'stack-token valid Connection fixture')
+allocation.write_bytes(data)
