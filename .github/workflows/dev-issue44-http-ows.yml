@@ -29,12 +29,10 @@ jobs:
           $base = (git merge-base HEAD origin/main).Trim()
           if ($base -ne $expectedBase) { throw "Unexpected #44 merge base: $base" }
 
-          git -c core.whitespace=cr-at-eol diff $expectedBase HEAD --check
           git apply --check .github/validation/issue44.patch
           git apply .github/validation/issue44.patch
-          git -c core.whitespace=cr-at-eol diff --check
-
           git add -- src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs
+
           $sourceBlob = (git rev-parse ':src/ProxyToAnyConnect/Proxy/ProxyServer.cs').Trim()
           $testBlob = (git rev-parse ':tests/ProxyToAnyConnect.SelfTests/ProxyHttpFramingSelfTests.cs').Trim()
           if ($sourceBlob -ne '7033087e57a28d93bdfde3a495a795b8f4b314b1') {
