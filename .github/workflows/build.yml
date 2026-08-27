@@ -76,6 +76,42 @@ jobs:
             throw 'Acceptance summary did not preserve one route fingerprint across all stages.'
           }
 
+          # Exercise the release-grade process/binary contract without launching the
+          # application or contacting a real VPN endpoint. The aggregate validator
+          # re-runs stage integrity validation after this controlled Ready mutation.
+          $syntheticExecutableSha256 = ('ab' * 32)
+          $readyEvidencePath = Join-Path (Join-Path $output 'ready') 'evidence.json'
+          $readyEvidence = Get-Content -LiteralPath $readyEvidencePath -Raw | ConvertFrom-Json
+          $readyEvidence.process.value = @(
+            [pscustomobject]@{
+              Id = 4242
+              ProcessName = 'ProxyToAnyConnect'
+              StartTime = [DateTimeOffset]::UtcNow
+              WorkingSet64 = 1
+              PrivateMemorySize64 = 1
+              HandleCount = 1
+              ThreadCount = 1
+              ExecutableSha256 = $syntheticExecutableSha256
+              ExecutableHashError = $null
+            }
+          )
+          $readyEvidence | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $readyEvidencePath -Encoding utf8
+
+          ./tools/Complete-WindowsIntegrationEvidence.ps1 `
+            -OutputDirectory $output `
+            -ExpectedExecutableSha256 $syntheticExecutableSha256 `
+            -RequireProcessLifecycle | Write-Host
+
+          $identityAcceptance = Get-Content -LiteralPath $acceptancePath -Raw | ConvertFrom-Json
+          if (-not $identityAcceptance.processLifecycleRequired -or
+              $identityAcceptance.expectedExecutableSha256 -ne $syntheticExecutableSha256 -or
+              $identityAcceptance.readyExecutableSha256 -ne $syntheticExecutableSha256 -or
+              $identityAcceptance.stages.Baseline.processCount -ne 0 -or
+              $identityAcceptance.stages.Ready.processCount -ne 1 -or
+              $identityAcceptance.stages.Final.processCount -ne 0) {
+            throw 'Evidence lifecycle did not enforce exact Ready binary/process identity.'
+          }
+
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:
@@ -101,6 +137,31 @@ jobs:
           -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true
           --output artifacts/ProxyToAnyConnect-win-x64
+
+      - name: Write binary integrity manifest
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $publishDirectory = './artifacts/ProxyToAnyConnect-win-x64'
+          $executablePath = Join-Path $publishDirectory 'ProxyToAnyConnect.exe'
+          if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+            throw "Published executable is missing: $executablePath"
+          }
+
+          $hash = (Get-FileHash -LiteralPath $executablePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content `
+            -LiteralPath (Join-Path $publishDirectory 'ProxyToAnyConnect.exe.sha256') `
+            -Value "$hash  ProxyToAnyConnect.exe" `
+            -Encoding ascii
+
+          [ordered]@{
+            schemaVersion = 1
+            gitCommit = '${{ github.sha }}'
+            fileName = 'ProxyToAnyConnect.exe'
+            sha256 = $hash
+          } | ConvertTo-Json -Depth 4 | Set-Content `
+            -LiteralPath (Join-Path $publishDirectory 'build-identity.json') `
+            -Encoding utf8
 
       - name: Create ZIP
         if: github.event_name == 'push'
