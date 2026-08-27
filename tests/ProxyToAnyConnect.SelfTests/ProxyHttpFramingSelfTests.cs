@@ -16,9 +16,11 @@ internal static class ProxyHttpFramingSelfTests
         try
         {
             ParserRejectsAmbiguousOrUnsupportedFraming();
+            ParserUsesHttpOwsOnlyForFieldValues();
             InitialRemainderCannotExceedDeclaredBody();
             await ExactContentLengthBoundsClientToOriginBytesAsync();
             await TransferEncodingIsRejectedBeforeOutboundConnectAsync();
+            await NonOwsFramingBytesAreRejectedBeforeOutboundConnectAsync();
 
             Console.WriteLine(
                 "PASS: plain HTTP framing is fail-closed and bounds client-to-origin bytes to one declared request body");
@@ -64,6 +66,48 @@ internal static class ProxyHttpFramingSelfTests
             "POST http://example.test/ HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n");
         AssertParseThrows<InvalidDataException>(
             "POST http://example.test/ HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n");
+    }
+
+    private static void ParserUsesHttpOwsOnlyForFieldValues()
+    {
+        var ows = Parse(
+            "POST http://example.test/upload HTTP/1.1\r\n" +
+            "Host: example.test\r\n" +
+            "Content-Length:\t 5 \t\r\n\r\n");
+        if (ows.ContentLength != 5)
+        {
+            throw new InvalidOperationException("SP/HTAB HTTP OWS was not accepted around Content-Length.");
+        }
+
+        foreach (var invalidWhitespace in new byte[] { 0x85, 0xA0 })
+        {
+            var request = BuildRawRequest(
+                "POST http://example.test/upload HTTP/1.1\r\n" +
+                "Host: example.test\r\n" +
+                "Content-Length: ",
+                invalidWhitespace,
+                "5",
+                invalidWhitespace,
+                "\r\n\r\n");
+            AssertRawParseThrows<InvalidDataException>(request);
+        }
+
+        var opaqueRequest = BuildRawRequest(
+            "GET http://example.test/ HTTP/1.1\r\n" +
+            "Host: ignored.example\r\n" +
+            "X-Opaque: ",
+            (byte)0xA0,
+            "edge",
+            (byte)0x85,
+            " \t\r\n\r\n");
+        var opaque = ProxyServer.ParsedProxyRequest.Parse(opaqueRequest);
+        var originHeader = opaque.BuildOriginHeader("/", "example.test");
+        var expectedOpaque = BuildRawRequest("X-Opaque: ", (byte)0xA0, "edge", (byte)0x85, "\r\n");
+        if (originHeader.AsSpan().IndexOf(expectedOpaque) < 0)
+        {
+            throw new InvalidOperationException(
+                "Non-OWS obs-text at a forwarded header edge was silently trimmed.");
+        }
     }
 
     private static void InitialRemainderCannotExceedDeclaredBody()
@@ -248,6 +292,90 @@ internal static class ProxyHttpFramingSelfTests
             proxyCancellation.Cancel();
             await proxyTask;
         }
+    }
+
+    private static async Task NonOwsFramingBytesAreRejectedBeforeOutboundConnectAsync()
+    {
+        using var timeout = new CancellationTokenSource(Timeout);
+        var factory = new CountingRejectingFactory();
+        var proxyPort = ReserveLoopbackPort();
+        using var proxyCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        var proxy = CreateTestProxy(proxyPort, factory);
+        var proxyTask = proxy.RunAsync(proxyCancellation.Token);
+
+        try
+        {
+            foreach (var invalidWhitespace in new byte[] { 0x85, 0xA0 })
+            {
+                using var client = new TcpClient { NoDelay = true };
+                await client.ConnectAsync(IPAddress.Loopback, proxyPort, timeout.Token);
+                await using var stream = client.GetStream();
+                var request = BuildRawRequest(
+                    "POST http://example.test/upload HTTP/1.1\r\n" +
+                    "Host: example.test\r\n" +
+                    "Content-Length: ",
+                    invalidWhitespace,
+                    "5",
+                    invalidWhitespace,
+                    "\r\n\r\nHELLO");
+                await stream.WriteAsync(request, timeout.Token);
+
+                var response = await ReadFramedResponseAsync(stream, timeout.Token);
+                if (!response.Header.StartsWith("HTTP/1.1 400 Bad Request\r\n", StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"Non-OWS Content-Length byte 0x{invalidWhitespace:X2} was not rejected: {response.Header}");
+                }
+            }
+
+            if (factory.ConnectCount != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Non-OWS malformed framing opened {factory.ConnectCount} outbound connection(s).");
+            }
+        }
+        finally
+        {
+            proxyCancellation.Cancel();
+            await proxyTask;
+        }
+    }
+
+    private static byte[] BuildRawRequest(params object[] parts)
+    {
+        using var buffer = new MemoryStream();
+        foreach (var part in parts)
+        {
+            switch (part)
+            {
+                case string text:
+                    buffer.Write(Encoding.Latin1.GetBytes(text));
+                    break;
+                case byte value:
+                    buffer.WriteByte(value);
+                    break;
+                default:
+                    throw new ArgumentException($"Unsupported raw-request part type {part.GetType()}.", nameof(parts));
+            }
+        }
+
+        return buffer.ToArray();
+    }
+
+    private static void AssertRawParseThrows<TException>(byte[] request)
+        where TException : Exception
+    {
+        try
+        {
+            _ = ProxyServer.ParsedProxyRequest.Parse(request);
+        }
+        catch (TException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Expected {typeof(TException).Name} for malformed raw framing was not thrown.");
     }
 
     private static ProxyServer.ParsedProxyRequest Parse(string text) =>
