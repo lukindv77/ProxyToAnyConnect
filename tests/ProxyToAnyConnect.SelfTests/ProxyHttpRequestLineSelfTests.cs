@@ -35,6 +35,15 @@ internal static class ProxyHttpRequestLineSelfTests
         AssertParseRejected("GET http://example.test/ HTTP/2.0\r\nHost: example.test\r\n\r\n");
         AssertParseRejected("GET http://example.test/ http/1.1\r\nHost: example.test\r\n\r\n");
         AssertParseRejected("CONNECT example.test:443 HTTP/9.9\r\n\r\n");
+        AssertParseRejected("GET  http://example.test/ HTTP/1.1\r\nHost: example.test\r\n\r\n");
+        AssertParseRejected("GET http://example.test/  HTTP/1.1\r\nHost: example.test\r\n\r\n");
+        AssertParseRejected(" GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\n\r\n");
+        AssertParseRejected("GET http://example.test/ HTTP/1.1 \r\nHost: example.test\r\n\r\n");
+        AssertParseRejected("GET\thttp://example.test/\tHTTP/1.1\r\nHost: example.test\r\n\r\n");
+        AssertParseRejected("GET\vhttp://example.test/\vHTTP/1.1\r\nHost: example.test\r\n\r\n");
+        AssertParseRejected("GET\fhttp://example.test/\fHTTP/1.1\r\nHost: example.test\r\n\r\n");
+        AssertParseRejected("GET\rhttp://example.test/\rHTTP/1.1\r\nHost: example.test\r\n\r\n");
+        AssertParseRejected("CONNECT  example.test:443 HTTP/1.1\r\n\r\n");
     }
 
     private static void ParserAcceptsSupportedHttpVersions()
@@ -84,6 +93,15 @@ internal static class ProxyHttpRequestLineSelfTests
                 timeout.Token);
             await AssertBadRequestAsync(port,
                 "GET http://example.test/path HTTP/2.0\r\nHost: example.test\r\n\r\n",
+                timeout.Token);
+            await AssertBadRequestAsync(port,
+                "GET  http://example.test/path HTTP/1.1\r\nHost: example.test\r\n\r\n",
+                timeout.Token);
+            await AssertBadRequestAsync(port,
+                "GET\thttp://example.test/path\tHTTP/1.1\r\nHost: example.test\r\n\r\n",
+                timeout.Token);
+            await AssertBadRequestAsync(port,
+                "CONNECT  example.test:443 HTTP/1.1\r\n\r\n",
                 timeout.Token);
 
             if (factory.ConnectCount != 0)

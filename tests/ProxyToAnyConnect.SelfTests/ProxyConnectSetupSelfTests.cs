@@ -65,7 +65,7 @@ internal static class ProxyConnectSetupSelfTests
     private static void ConnectParsingPreservesSemanticsAndValidation()
     {
         var raw = Encoding.Latin1.GetBytes(
-            "CONNECT   example.test:443   HTTP/1.1\r\n" +
+            "CONNECT example.test:443 HTTP/1.1\r\n" +
             "Host: example.test:443\r\n" +
             "Proxy-Authorization: Basic ignored-by-tunnel-setup\r\n" +
             "X-Test: caf\u00e9\r\n\r\n");
@@ -206,18 +206,28 @@ internal static class ProxyConnectSetupSelfTests
         }
 
         var requestLine = text.AsSpan(0, requestLineEnd);
-        Span<Range> requestParts = stackalloc Range[3];
-        var requestPartCount = requestLine.Split(
-            requestParts,
-            ' ',
-            StringSplitOptions.RemoveEmptyEntries);
-        if (requestPartCount != 3)
+        var firstSpace = requestLine.IndexOf(' ');
+        if (firstSpace <= 0 || firstSpace >= requestLine.Length - 1)
         {
             throw new InvalidDataException("Invalid HTTP proxy request line.");
         }
 
-        var methodSpan = requestLine[requestParts[0]];
-        var versionSpan = requestLine[requestParts[2]];
+        var afterFirstSpace = requestLine[(firstSpace + 1)..];
+        var secondSpaceOffset = afterFirstSpace.IndexOf(' ');
+        if (secondSpaceOffset <= 0)
+        {
+            throw new InvalidDataException("Invalid HTTP proxy request line.");
+        }
+
+        var secondSpace = firstSpace + 1 + secondSpaceOffset;
+        var versionSpan = requestLine[(secondSpace + 1)..];
+        if (versionSpan.IsEmpty || versionSpan.IndexOf(' ') >= 0)
+        {
+            throw new InvalidDataException("Invalid HTTP proxy request line.");
+        }
+
+        var methodSpan = requestLine[..firstSpace];
+        var targetSpan = requestLine[(firstSpace + 1)..secondSpace];
         if (!IsValidBaselineHeaderName(methodSpan))
         {
             throw new InvalidDataException("Invalid HTTP method token.");
@@ -230,7 +240,7 @@ internal static class ProxyConnectSetupSelfTests
         }
 
         var method = methodSpan.ToString();
-        var target = requestLine[requestParts[1]].ToString();
+        var target = targetSpan.ToString();
         var version = versionSpan.ToString();
         var headers = new List<BaselineHeaderLine>();
         var offset = requestLineEnd + 2;
