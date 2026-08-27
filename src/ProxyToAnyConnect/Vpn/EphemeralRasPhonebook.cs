@@ -46,22 +46,31 @@ internal sealed class EphemeralRasPhonebook : IDisposable
 
         var rasRoot = SessionRootDirectory;
         Directory.CreateDirectory(rasRoot);
+        var sanitizedId = SanitizeId(options.Id);
         var sessionRoot = Path.Combine(
             rasRoot,
-            $"{SanitizeId(options.Id)}-{Guid.NewGuid():N}");
+            $"{sanitizedId}-{Guid.NewGuid():N}");
         Directory.CreateDirectory(sessionRoot);
+
+        var entryName = $"ProxyToAnyConnect-{sanitizedId}";
+        if (entryName.Length > RasNative.RasMaxEntryName)
+        {
+            entryName = entryName[..RasNative.RasMaxEntryName];
+        }
 
         FileStream? ownershipLock = null;
         EphemeralRasPhonebook? resource = null;
         try
         {
             // The persistent marker prevents a new version from treating legacy
-            // unmarked directories as abandoned sessions. The owner lock is held
-            // exclusively for the runtime lifetime and is deleted automatically if
-            // the process terminates without running Dispose.
+            // unmarked directories as abandoned sessions. Store the exact private
+            // entry name as recovery metadata so a later process can best-effort
+            // remove RAS entry-associated credentials before deleting an orphaned
+            // private phonebook. The owner lock is held exclusively for the runtime
+            // lifetime and is deleted automatically if this process terminates.
             File.WriteAllText(
                 Path.Combine(sessionRoot, OwnershipMarkerFileName),
-                "ProxyToAnyConnect managed RAS session v1");
+                entryName);
             ownershipLock = new FileStream(
                 Path.Combine(sessionRoot, OwnershipLockFileName),
                 FileMode.CreateNew,
@@ -71,12 +80,6 @@ internal sealed class EphemeralRasPhonebook : IDisposable
                 FileOptions.DeleteOnClose);
 
             var phoneBookPath = Path.Combine(sessionRoot, "session.pbk");
-            var entryName = $"ProxyToAnyConnect-{SanitizeId(options.Id)}";
-            if (entryName.Length > RasNative.RasMaxEntryName)
-            {
-                entryName = entryName[..RasNative.RasMaxEntryName];
-            }
-
             resource = new EphemeralRasPhonebook(
                 sessionRoot,
                 phoneBookPath,
@@ -177,7 +180,33 @@ internal sealed class EphemeralRasPhonebook : IDisposable
                 continue;
             }
 
+            TryDeleteRecoveredRasEntry(sessionDirectory, markerPath);
             TryDeleteSessionDirectory(sessionDirectory);
+        }
+    }
+
+    private static void TryDeleteRecoveredRasEntry(string sessionDirectory, string markerPath)
+    {
+        try
+        {
+            var entryName = File.ReadAllText(markerPath).Trim();
+            if (!entryName.StartsWith("ProxyToAnyConnect-", StringComparison.Ordinal) ||
+                entryName.Length > RasNative.RasMaxEntryName)
+            {
+                return;
+            }
+
+            var phoneBookPath = Path.Combine(sessionDirectory, "session.pbk");
+            if (File.Exists(phoneBookPath))
+            {
+                _ = RasNative.RasDeleteEntryW(phoneBookPath, entryName);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The directory deletion below is still safe after ownership was proven
+            // stale. Failure to read the recovery metadata must not turn startup
+            // cleanup into a fatal path.
         }
     }
 
@@ -348,15 +377,26 @@ internal sealed class EphemeralRasPhonebook : IDisposable
             SzPassword = psk
         };
 
-        var result = RasNative.RasSetCredentialsW(
-            phoneBookPath,
-            entryName,
-            credentials,
-            clearCredentials: false);
-        if (result != RasNative.ErrorSuccess)
+        try
         {
-            throw new InvalidOperationException(
-                $"Unable to set the L2TP/IPsec pre-shared key in the private RAS phonebook: {RasNative.DescribeError(result)}");
+            var result = RasNative.RasSetCredentialsW(
+                phoneBookPath,
+                entryName,
+                credentials,
+                clearCredentials: false);
+            if (result != RasNative.ErrorSuccess)
+            {
+                throw new InvalidOperationException(
+                    $"Unable to set the L2TP/IPsec pre-shared key in the private RAS phonebook: {RasNative.DescribeError(result)}");
+            }
+        }
+        finally
+        {
+            // P/Invoke has completed synchronously; the native API no longer needs
+            // this managed carrier. Drop both managed references immediately rather
+            // than retaining plaintext PSK on a RASCREDENTIALS instance until GC.
+            credentials.SzPassword = string.Empty;
+            psk = string.Empty;
         }
     }
 
