@@ -136,8 +136,14 @@ internal sealed class WindowsVpnProfileInspector
     internal static async Task<string> ExecutePowerShellAsync(
         string script,
         string operation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? operationTimeout = null)
     {
+        var effectiveOperationTimeout = operationTimeout ?? InspectionTimeout;
+        if (effectiveOperationTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(operationTimeout));
+        }
         var encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
         var powershellPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.System),
@@ -178,7 +184,7 @@ internal sealed class WindowsVpnProfileInspector
         var stderrTask = process.StandardError.ReadToEndAsync();
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(InspectionTimeout);
+        timeout.CancelAfter(effectiveOperationTimeout);
 
         try
         {

@@ -6,6 +6,7 @@ namespace ProxyToAnyConnect.SelfTests;
 internal static class WindowsVpnProfileInspectorLifetimeSelfTests
 {
     private static readonly TimeSpan HelperStartupObservationTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan HelperExecutionTimeout = TimeSpan.FromSeconds(30);
 
     public static async Task<int> RunAsync()
     {
@@ -55,7 +56,8 @@ internal static class WindowsVpnProfileInspectorLifetimeSelfTests
             var inspection = WindowsVpnProfileInspector.ExecutePowerShellAsync(
                 script,
                 "exercise cancellation ownership",
-                cancellation.Token);
+                cancellation.Token,
+            HelperExecutionTimeout);
 
             // Hosted Windows images can have highly variable cold PowerShell/process
             // startup latency. Give startup observation its own generous deadline, but
