@@ -1,0 +1,256 @@
+name: dev-issue30
+
+on:
+  push:
+    branches: [ dev/issue30-routing-ipv4 ]
+    paths:
+      - '.github/workflows/dev-issue30.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply shared routing-host canonicalization
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          from pathlib import Path
+
+          proxy = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = proxy.read_text(encoding='utf-8')
+          start_marker = '    internal static (string Host, int Port) ParseAuthority(string authority, int defaultPort)\n'
+          end_marker = '''    internal static string BuildHttpHostAuthority(Uri uri) =>
+                  CanonicalizeHttpUri(uri).Authority;
+          '''
+          start = text.find(start_marker)
+          end_start = text.find(end_marker, start)
+          if start < 0 or end_start < 0:
+              raise SystemExit('routing-host method block markers not found')
+          end = end_start + len(end_marker)
+
+          replacement = '''    internal static (string Host, int Port) ParseAuthority(string authority, int defaultPort)
+              {
+                  if (string.IsNullOrWhiteSpace(authority))
+                  {
+                      throw new InvalidDataException("CONNECT target is empty.");
+                  }
+
+                  if (authority.StartsWith("[", StringComparison.Ordinal))
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  var separator = authority.IndexOf(':');
+                  if (separator >= 0 && authority.IndexOf(':', separator + 1) >= 0)
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  var host = separator < 0 ? authority : authority[..separator];
+                  var port = defaultPort;
+                  if (separator >= 0 &&
+                      (!int.TryParse(authority[(separator + 1)..], out port) || port is < 1 or > 65535))
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                  }
+
+                  if (host.Length == 0)
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                  }
+
+                  foreach (var character in host)
+                  {
+                      if (character <= 0x20 || character == 0x7F ||
+                          character is '@' or '/' or '?' or '#' or '\\\\' or ':')
+                      {
+                          throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                      }
+                  }
+
+                  return (NormalizeRoutingHost(host), port);
+              }
+
+              internal static string NormalizeRoutingHost(string host)
+              {
+                  if (string.IsNullOrWhiteSpace(host))
+                  {
+                      throw new InvalidDataException("Routing host is empty.");
+                  }
+
+                  foreach (var character in host)
+                  {
+                      if (character <= 0x20 || character == 0x7F ||
+                          character is '@' or '/' or '?' or '#' or '\\\\' or ':' or '[' or ']')
+                      {
+                          throw new InvalidDataException($"Invalid routing host '{host}'.");
+                      }
+                  }
+
+                  if (host.EndsWith('.', StringComparison.Ordinal))
+                  {
+                      var withoutRootDot = host[..^1];
+                      if (IPAddress.TryParse(withoutRootDot, out var rootDotLiteral) &&
+                          rootDotLiteral.AddressFamily == AddressFamily.InterNetwork)
+                      {
+                          throw new InvalidDataException(
+                              $"IPv4 routing host '{host}' must use canonical dotted-decimal without a DNS root dot.");
+                      }
+                  }
+
+                  if (IPAddress.TryParse(host, out var literal))
+                  {
+                      if (literal.AddressFamily != AddressFamily.InterNetwork)
+                      {
+                          throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                      }
+
+                      var canonical = literal.ToString();
+                      if (!host.Equals(canonical, StringComparison.Ordinal))
+                      {
+                          throw new InvalidDataException(
+                              $"IPv4 routing host '{host}' is not canonical dotted-decimal ('{canonical}').");
+                      }
+
+                      return canonical;
+                  }
+
+                  try
+                  {
+                      return L2tpDnsResolver.NormalizeDnsHostStrict(host);
+                  }
+                  catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+                  {
+                      throw new InvalidDataException($"Invalid routing host '{host}'.", ex);
+                  }
+              }
+
+              private static Uri ParseAbsoluteHttpUri(string target)
+              {
+                  if (!Uri.TryCreate(target, UriKind.Absolute, out var uri) ||
+                      !uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+                      string.IsNullOrWhiteSpace(uri.Host) ||
+                      !string.IsNullOrEmpty(uri.Fragment) ||
+                      !string.IsNullOrEmpty(uri.UserInfo))
+                  {
+                      throw new InvalidDataException("Plain HTTP proxy requests must use an absolute http:// URI.");
+                  }
+
+                  return uri;
+              }
+
+              private static string ExtractRawHttpHost(string target)
+              {
+                  var schemeSeparator = target.IndexOf("://", StringComparison.Ordinal);
+                  if (schemeSeparator < 0)
+                  {
+                      throw new InvalidDataException("Plain HTTP proxy requests must use an absolute http:// URI.");
+                  }
+
+                  var authorityStart = schemeSeparator + 3;
+                  var tail = target.AsSpan(authorityStart);
+                  var authorityLength = tail.Length;
+                  foreach (var delimiter in new[] { '/', '?', '#' })
+                  {
+                      var index = tail.IndexOf(delimiter);
+                      if (index >= 0 && index < authorityLength)
+                      {
+                          authorityLength = index;
+                      }
+                  }
+
+                  var authority = tail[..authorityLength];
+                  if (authority.IsEmpty || authority.IndexOf('@') >= 0)
+                  {
+                      throw new InvalidDataException("Plain HTTP target contains an invalid authority.");
+                  }
+
+                  if (authority[0] == '[')
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  var separator = authority.IndexOf(':');
+                  if (separator >= 0 && authority[(separator + 1)..].IndexOf(':') >= 0)
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  var rawHost = separator < 0 ? authority : authority[..separator];
+                  if (rawHost.IsEmpty)
+                  {
+                      throw new InvalidDataException("Plain HTTP target host is empty.");
+                  }
+
+                  return rawHost.ToString();
+              }
+
+              internal static (string Host, int Port, string Authority, string PathAndQuery) ParseHttpTarget(string target)
+              {
+                  var uri = ParseAbsoluteHttpUri(target);
+                  var rawHost = ExtractRawHttpHost(target);
+                  var (host, port, authority) = CanonicalizeHttpUri(uri, rawHost);
+                  var pathAndQuery = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+                  return (host, port, authority, pathAndQuery);
+              }
+
+              private static (string Host, int Port, string Authority) CanonicalizeHttpUri(
+                  Uri uri,
+                  string? rawHost = null)
+              {
+                  ArgumentNullException.ThrowIfNull(uri);
+                  if (!uri.IsAbsoluteUri ||
+                      !uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+                      string.IsNullOrWhiteSpace(uri.Host))
+                  {
+                      throw new InvalidDataException("A valid absolute HTTP URI is required to generate Host.");
+                  }
+
+                  if (uri.HostNameType == UriHostNameType.IPv6)
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  var host = NormalizeRoutingHost(rawHost ?? uri.IdnHost);
+                  var uriHost = NormalizeRoutingHost(uri.IdnHost);
+                  if (!host.Equals(uriHost, StringComparison.Ordinal))
+                  {
+                      throw new InvalidDataException(
+                          $"Plain HTTP target host '{rawHost}' does not match URI canonical host '{uri.IdnHost}'.");
+                  }
+
+                  var port = uri.IsDefaultPort ? 80 : uri.Port;
+                  var authority = port == 80 ? host : $"{host}:{port}";
+                  return (host, port, authority);
+              }
+
+              internal static string BuildHttpHostAuthority(Uri uri) =>
+                  CanonicalizeHttpUri(uri).Authority;
+          '''
+          proxy.write_text(text[:start] + replacement + text[end:], encoding='utf-8', newline='')
+
+          runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
+          runner_text = runner.read_text(encoding='utf-8')
+          anchor = '        await RunAsync(nameof(ProxyHttpCanonicalHostSelfTests), ProxyHttpCanonicalHostSelfTests.RunAsync);\n'
+          addition = anchor + '        await RunAsync(nameof(ProxyRoutingHostCanonicalizationSelfTests), ProxyRoutingHostCanonicalizationSelfTests.RunAsync);\n'
+          if runner_text.count(anchor) != 1:
+              raise SystemExit(f'expected one canonical-host runner anchor, got {runner_text.count(anchor)}')
+          runner.write_text(runner_text.replace(anchor, addition), encoding='utf-8', newline='')
+          '@ | python -
+          git diff --check
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs
+          git commit -m 'proxy: reject non-canonical routing IPv4 forms'
+          git push origin HEAD:refs/heads/dev/issue30-routing-ipv4
