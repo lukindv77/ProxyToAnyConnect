@@ -1,0 +1,316 @@
+name: dev-issue29-cumulative
+
+on:
+  push:
+    branches: [ dev/issue29-paired-ratios ]
+    paths:
+      - '.github/workflows/dev-issue29-cumulative.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply cumulative test contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          from pathlib import Path
+          import math
+          import re
+
+          # Stage the independently validated #31 test seam in the worktree only.
+          production = Path('src/ProxyToAnyConnect/Vpn/WindowsVpnProfileInspector.cs')
+          text = production.read_text(encoding='utf-8')
+          signature = '''    internal static async Task<string> ExecutePowerShellAsync(
+                  string script,
+                  string operation,
+                  CancellationToken cancellationToken)
+              {'''
+          replacement = '''    internal static async Task<string> ExecutePowerShellAsync(
+                  string script,
+                  string operation,
+                  CancellationToken cancellationToken,
+                  TimeSpan? operationTimeout = null)
+              {
+                  var effectiveOperationTimeout = operationTimeout ?? InspectionTimeout;
+                  if (effectiveOperationTimeout <= TimeSpan.Zero)
+                  {
+                      throw new ArgumentOutOfRangeException(nameof(operationTimeout));
+                  }'''
+          if text.count(signature) != 1:
+              raise SystemExit('unexpected #31 production signature')
+          text = text.replace(signature, replacement)
+          arm = '        timeout.CancelAfter(InspectionTimeout);'
+          if text.count(arm) != 1:
+              raise SystemExit('unexpected #31 timeout arm')
+          production.write_text(
+              text.replace(arm, '        timeout.CancelAfter(effectiveOperationTimeout);'),
+              encoding='utf-8', newline='')
+
+          lifetime = Path('tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs')
+          text = lifetime.read_text(encoding='utf-8')
+          startup = '    private static readonly TimeSpan HelperStartupObservationTimeout = TimeSpan.FromSeconds(15);\n'
+          if text.count(startup) != 1:
+              raise SystemExit('unexpected #31 startup timeout anchor')
+          text = text.replace(
+              startup,
+              startup + '    private static readonly TimeSpan HelperExecutionTimeout = TimeSpan.FromSeconds(30);\n')
+          call_tail = '''                cancellation.Token);
+
+                      // Hosted Windows images can have highly variable cold PowerShell/process'''
+          new_tail = '''                cancellation.Token,
+                      HelperExecutionTimeout);
+
+                      // Hosted Windows images can have highly variable cold PowerShell/process'''
+          if text.count(call_tail) != 1:
+              raise SystemExit('unexpected #31 lifetime call tail')
+          lifetime.write_text(text.replace(call_tail, new_tail), encoding='utf-8', newline='')
+
+          # Apply #29: paired ratios + minimum warmup/sample stability, thresholds unchanged.
+          WARMUP_FLOOR = 4096
+          ROUND_FLOOR = 15
+          OPERATIONS_FLOOR = 16384
+          old_pair = '''        var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(
+                      optimizedMedian,
+                      predecessorMedian,
+                      optimizedMedian / predecessorMedian);'''
+          new_pair = '''        var pairedRatios = new double[TimingRounds];
+                  for (var round = 0; round < TimingRounds; round++)
+                  {
+                      pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
+                  }
+
+                  var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(
+                      optimizedMedian,
+                      predecessorMedian,
+                      Median(pairedRatios));'''
+          patterns = {
+              'warmup': re.compile(r'private const int WarmupIterations = (\d+);'),
+              'rounds': re.compile(r'private const int TimingRounds = (\d+);'),
+              'iterations': re.compile(r'private const int IterationsPerRound = (\d+);'),
+              'pairs': re.compile(r'private const int PairSamplesPerRound = (\d+);'),
+              'batch': re.compile(r'private const int IterationsPerBatch = (\d+);'),
+          }
+          changed = set()
+          paired_count = 0
+          floor_count = 0
+          missing = []
+
+          for path in sorted(Path('tests').rglob('*.cs')):
+              source = path.read_text(encoding='utf-8')
+              original = source
+              display = str(path).replace(chr(92), '/')
+
+              if old_pair in source:
+                  if source.count(old_pair) != 1 or 'double Ratio);' not in source or '.Ratio' not in source:
+                      raise SystemExit(f'unexpected paired helper contract in {display}')
+                  source = source.replace(old_pair, new_pair)
+                  source = source.replace('double Ratio);', 'double PairedRatioMedian);')
+                  source = source.replace('.Ratio', '.PairedRatioMedian')
+                  paired_count += 1
+
+              if 'MaxMedianSlowdownRatio' in source:
+                  absent = []
+                  match = patterns['warmup'].search(source)
+                  if match is None:
+                      absent.append('warmup')
+                  elif int(match.group(1)) < WARMUP_FLOOR:
+                      before = int(match.group(1))
+                      source = source[:match.start(1)] + str(WARMUP_FLOOR) + source[match.end(1):]
+                      floor_count += 1
+
+                  match = patterns['rounds'].search(source)
+                  if match is None:
+                      absent.append('rounds')
+                  elif int(match.group(1)) < ROUND_FLOOR:
+                      source = source[:match.start(1)] + str(ROUND_FLOOR) + source[match.end(1):]
+                      floor_count += 1
+
+                  match = patterns['iterations'].search(source)
+                  if match is not None:
+                      if int(match.group(1)) < OPERATIONS_FLOOR:
+                          source = source[:match.start(1)] + str(OPERATIONS_FLOOR) + source[match.end(1):]
+                          floor_count += 1
+                  else:
+                      pairs = patterns['pairs'].search(source)
+                      batch = patterns['batch'].search(source)
+                      if pairs is None or batch is None:
+                          absent.append('operations')
+                      else:
+                          pair_count = int(pairs.group(1))
+                          batch_count = int(batch.group(1))
+                          if pair_count * batch_count < OPERATIONS_FLOOR:
+                              new_batch = math.ceil(OPERATIONS_FLOOR / pair_count)
+                              source = source[:batch.start(1)] + str(new_batch) + source[batch.end(1):]
+                              floor_count += 1
+
+                  if absent:
+                      missing.append(f'{display}:{",".join(absent)}')
+
+              if source != original:
+                  path.write_text(source, encoding='utf-8', newline='')
+                  changed.add(display)
+
+          # Never include the #31 lifetime-test staging diff in the #29 commit set.
+          changed.discard('tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs')
+          if paired_count != 11:
+              raise SystemExit(f'expected 11 paired-helper migrations, got {paired_count}')
+          if floor_count < 20:
+              raise SystemExit(f'expected broad sampling-floor migration, got {floor_count}')
+          if missing:
+              raise SystemExit('relative gates missing sampling constants: ' + '; '.join(missing))
+          if len(changed) < 10:
+              raise SystemExit(f'expected broad #29 file set, got {len(changed)}')
+          Path('.issue29-files.txt').write_text('\n'.join(sorted(changed)) + '\n', encoding='utf-8')
+          print(f'#29 files={len(changed)} paired={paired_count} floors={floor_count}')
+          '@ | python -
+          git diff --check
+          Get-Content .issue29-files.txt | Write-Host
+      - name: Run full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+  publish:
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Materialize #29 test-infra commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          from pathlib import Path
+          import math
+          import re
+
+          # Same #31 worktree-only seam used by validation.
+          production = Path('src/ProxyToAnyConnect/Vpn/WindowsVpnProfileInspector.cs')
+          text = production.read_text(encoding='utf-8')
+          signature = '''    internal static async Task<string> ExecutePowerShellAsync(
+                  string script,
+                  string operation,
+                  CancellationToken cancellationToken)
+              {'''
+          replacement = '''    internal static async Task<string> ExecutePowerShellAsync(
+                  string script,
+                  string operation,
+                  CancellationToken cancellationToken,
+                  TimeSpan? operationTimeout = null)
+              {
+                  var effectiveOperationTimeout = operationTimeout ?? InspectionTimeout;
+                  if (effectiveOperationTimeout <= TimeSpan.Zero)
+                  {
+                      throw new ArgumentOutOfRangeException(nameof(operationTimeout));
+                  }'''
+          if text.count(signature) != 1:
+              raise SystemExit('unexpected #31 production signature')
+          text = text.replace(signature, replacement)
+          if text.count('        timeout.CancelAfter(InspectionTimeout);') != 1:
+              raise SystemExit('unexpected #31 timeout arm')
+          production.write_text(
+              text.replace('        timeout.CancelAfter(InspectionTimeout);', '        timeout.CancelAfter(effectiveOperationTimeout);'),
+              encoding='utf-8', newline='')
+          lifetime = Path('tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs')
+          text = lifetime.read_text(encoding='utf-8')
+          startup = '    private static readonly TimeSpan HelperStartupObservationTimeout = TimeSpan.FromSeconds(15);\n'
+          if text.count(startup) != 1:
+              raise SystemExit('unexpected #31 startup timeout anchor')
+          text = text.replace(startup, startup + '    private static readonly TimeSpan HelperExecutionTimeout = TimeSpan.FromSeconds(30);\n')
+          tail = '''                cancellation.Token);
+
+                      // Hosted Windows images can have highly variable cold PowerShell/process'''
+          if text.count(tail) != 1:
+              raise SystemExit('unexpected #31 call tail')
+          text = text.replace(
+              tail,
+              '''                cancellation.Token,
+                      HelperExecutionTimeout);
+
+                      // Hosted Windows images can have highly variable cold PowerShell/process''')
+          lifetime.write_text(text, encoding='utf-8', newline='')
+
+          WARMUP_FLOOR = 4096
+          ROUND_FLOOR = 15
+          OPERATIONS_FLOOR = 16384
+          old_pair = '''        var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(
+                      optimizedMedian,
+                      predecessorMedian,
+                      optimizedMedian / predecessorMedian);'''
+          new_pair = '''        var pairedRatios = new double[TimingRounds];
+                  for (var round = 0; round < TimingRounds; round++)
+                  {
+                      pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
+                  }
+                  var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(optimizedMedian, predecessorMedian, Median(pairedRatios));'''
+          warmup = re.compile(r'private const int WarmupIterations = (\d+);')
+          rounds = re.compile(r'private const int TimingRounds = (\d+);')
+          iterations = re.compile(r'private const int IterationsPerRound = (\d+);')
+          pairs = re.compile(r'private const int PairSamplesPerRound = (\d+);')
+          batch = re.compile(r'private const int IterationsPerBatch = (\d+);')
+          changed = set()
+          for path in sorted(Path('tests').rglob('*.cs')):
+              source = path.read_text(encoding='utf-8')
+              original = source
+              if old_pair in source:
+                  source = source.replace(old_pair, new_pair)
+                  source = source.replace('double Ratio);', 'double PairedRatioMedian);')
+                  source = source.replace('.Ratio', '.PairedRatioMedian')
+              if 'MaxMedianSlowdownRatio' in source:
+                  m = warmup.search(source)
+                  if m and int(m.group(1)) < WARMUP_FLOOR:
+                      source = source[:m.start(1)] + str(WARMUP_FLOOR) + source[m.end(1):]
+                  m = rounds.search(source)
+                  if m and int(m.group(1)) < ROUND_FLOOR:
+                      source = source[:m.start(1)] + str(ROUND_FLOOR) + source[m.end(1):]
+                  m = iterations.search(source)
+                  if m:
+                      if int(m.group(1)) < OPERATIONS_FLOOR:
+                          source = source[:m.start(1)] + str(OPERATIONS_FLOOR) + source[m.end(1):]
+                  else:
+                      p = pairs.search(source); b = batch.search(source)
+                      if p and b and int(p.group(1)) * int(b.group(1)) < OPERATIONS_FLOOR:
+                          value = math.ceil(OPERATIONS_FLOOR / int(p.group(1)))
+                          source = source[:b.start(1)] + str(value) + source[b.end(1):]
+              if source != original:
+                  path.write_text(source, encoding='utf-8', newline='')
+                  changed.add(str(path).replace(chr(92), '/'))
+          changed.discard('tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs')
+          Path('.issue29-files.txt').write_text('\n'.join(sorted(changed)) + '\n', encoding='utf-8')
+          '@ | python -
+          git diff --check
+          $files = @(Get-Content .issue29-files.txt | Where-Object { $_ })
+          if ($files.Count -lt 10) { throw "Unexpected #29 file count: $($files.Count)" }
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add -- $files
+          git commit -m 'test: stabilize relative performance gates'
+          git push origin HEAD:refs/heads/dev/issue29-paired-ratios
