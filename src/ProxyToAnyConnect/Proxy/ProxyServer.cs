@@ -531,21 +531,52 @@ internal sealed class ProxyServer
             throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
         }
 
-        var separator = authority.LastIndexOf(':');
-        if (separator < 0)
+        var separator = authority.IndexOf(':');
+        if (separator >= 0 && authority.IndexOf(':', separator + 1) >= 0)
         {
-            return (authority, defaultPort);
+            throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
         }
 
-        var host = authority[..separator];
-        if (string.IsNullOrWhiteSpace(host) ||
-            !int.TryParse(authority[(separator + 1)..], out var port) ||
-            port is < 1 or > 65535)
+        var host = separator < 0 ? authority : authority[..separator];
+        var port = defaultPort;
+        if (separator >= 0 &&
+            (!int.TryParse(authority[(separator + 1)..], out port) || port is < 1 or > 65535))
         {
             throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
         }
 
-        return (host, port);
+        if (host.Length == 0)
+        {
+            throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+        }
+
+        foreach (var character in host)
+        {
+            if (character <= 0x20 || character == 0x7F ||
+                character is '@' or '/' or '?' or '#' or '\' or ':')
+            {
+                throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+            }
+        }
+
+        if (IPAddress.TryParse(host, out var literal))
+        {
+            if (literal.AddressFamily != AddressFamily.InterNetwork)
+            {
+                throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+            }
+
+            return (literal.ToString(), port);
+        }
+
+        try
+        {
+            return (L2tpDnsResolver.NormalizeDnsHostStrict(host), port);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            throw new InvalidDataException($"Invalid CONNECT target '{authority}'.", ex);
+        }
     }
 
     private static Uri ParseAbsoluteHttpUri(string target)
