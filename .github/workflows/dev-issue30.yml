@@ -96,7 +96,7 @@ jobs:
                       }
                   }
 
-                  if (host.EndsWith('.', StringComparison.Ordinal))
+                  if (host[^1] == '.')
                   {
                       var withoutRootDot = host[..^1];
                       if (IPAddress.TryParse(withoutRootDot, out var rootDotLiteral) &&
