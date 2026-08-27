@@ -49,9 +49,9 @@ internal static class DnsQuerySetupSelfTests
             if (timing.Ratio > MaxMedianSlowdownRatio)
             {
                 throw new InvalidOperationException(
-                    $"Exact-size DNS query builder median was {timing.OptimizedMedianNs:F0} ns/op versus " +
-                    $"{timing.PredecessorMedianNs:F0} ns/op for MemoryStream/Split " +
-                    $"({timing.Ratio:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
+                    $"Exact-size DNS query builder paired median ratio was {timing.Ratio:F2}x " +
+                    $"(representative medians {timing.OptimizedMedianNs:F0} vs " +
+                    $"{timing.PredecessorMedianNs:F0} ns/op, limit {MaxMedianSlowdownRatio:F2}x).");
             }
 
             Console.WriteLine(
@@ -59,7 +59,7 @@ internal static class DnsQuerySetupSelfTests
                 $"(alloc {optimizedBytes / (double)AllocationIterations:F0} vs " +
                 $"{predecessorBytes / (double)AllocationIterations:F0} bytes/query; " +
                 $"timing {timing.OptimizedMedianNs:F0} vs {timing.PredecessorMedianNs:F0} ns/op, " +
-                $"{timing.Ratio:F2}x)");
+                $"paired {timing.Ratio:F2}x)");
             return 0;
         }
         catch (Exception ex)
@@ -135,6 +135,7 @@ internal static class DnsQuerySetupSelfTests
     {
         var optimizedRounds = new double[TimingRounds];
         var predecessorRounds = new double[TimingRounds];
+        var ratioRounds = new double[TimingRounds];
         for (var round = 0; round < TimingRounds; round++)
         {
             if ((round & 1) == 0)
@@ -147,14 +148,18 @@ internal static class DnsQuerySetupSelfTests
                 predecessorRounds[round] = MeasureNanosecondsPerOperation(predecessor);
                 optimizedRounds[round] = MeasureNanosecondsPerOperation(optimized);
             }
+
+            // Compare measurements made in the same round so CPU frequency and
+            // scheduler drift cannot be combined from unrelated rounds by dividing
+            // two independently selected medians. The acceptance threshold itself
+            // remains unchanged: a sustained >1.25x slowdown still fails.
+            ratioRounds[round] = optimizedRounds[round] / predecessorRounds[round];
         }
 
-        var optimizedMedian = Median(optimizedRounds);
-        var predecessorMedian = Median(predecessorRounds);
         return new TimingResult(
-            optimizedMedian,
-            predecessorMedian,
-            optimizedMedian / predecessorMedian);
+            Median(optimizedRounds),
+            Median(predecessorRounds),
+            Median(ratioRounds));
     }
 
     private static double MeasureNanosecondsPerOperation(Action action)
