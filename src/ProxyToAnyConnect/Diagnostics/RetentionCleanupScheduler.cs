@@ -5,6 +5,7 @@ internal sealed class RetentionCleanupScheduler : IDisposable
     private readonly object _gate = new();
     private readonly Action<DateOnly, CancellationToken> _cleanup;
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly CancellationToken _lifetimeToken;
 
     private Task? _workerTask;
     private DateOnly? _runningDate;
@@ -13,11 +14,13 @@ internal sealed class RetentionCleanupScheduler : IDisposable
     private int _maxConcurrentWorkers;
     private int _workerStarts;
     private int _disposed;
+    private int _lifetimeDisposed;
 
     public RetentionCleanupScheduler(Action<DateOnly, CancellationToken> cleanup)
     {
         ArgumentNullException.ThrowIfNull(cleanup);
         _cleanup = cleanup;
+        _lifetimeToken = _lifetime.Token;
     }
 
     public Task Schedule(DateOnly date)
@@ -76,9 +79,9 @@ internal sealed class RetentionCleanupScheduler : IDisposable
 
                 try
                 {
-                    _cleanup(date, _lifetime.Token);
+                    _cleanup(date, _lifetimeToken);
                 }
-                catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+                catch (OperationCanceledException) when (_lifetimeToken.IsCancellationRequested)
                 {
                     lock (_gate)
                     {
@@ -110,7 +113,11 @@ internal sealed class RetentionCleanupScheduler : IDisposable
         }
         finally
         {
-            Interlocked.Decrement(ref _activeWorkers);
+            var remainingWorkers = Interlocked.Decrement(ref _activeWorkers);
+            if (remainingWorkers == 0 && Volatile.Read(ref _disposed) != 0)
+            {
+                DisposeLifetimeOnce();
+            }
         }
     }
 
@@ -138,10 +145,39 @@ internal sealed class RetentionCleanupScheduler : IDisposable
             return;
         }
 
-        _lifetime.Cancel();
+        try
+        {
+            _lifetime.Cancel();
+        }
+        catch (Exception ex)
+        {
+            // Retention is optional diagnostics. A cancellation callback defect must
+            // not escape AppLog.Configure/Shutdown or skip scheduler ownership release.
+            System.Diagnostics.Debug.WriteLine(
+                $"Log retention cancellation callback failed: {ex.Message}");
+        }
+
         lock (_gate)
         {
             _pendingDate = null;
         }
+
+        // Never close a token wait handle underneath an active cleanup callback.
+        // The last worker owns final CTS disposal; when no worker has started/runs,
+        // Dispose can release it immediately without synchronously waiting.
+        if (Volatile.Read(ref _activeWorkers) == 0)
+        {
+            DisposeLifetimeOnce();
+        }
+    }
+
+    private void DisposeLifetimeOnce()
+    {
+        if (Interlocked.Exchange(ref _lifetimeDisposed, 1) != 0)
+        {
+            return;
+        }
+
+        _lifetime.Dispose();
     }
 }
