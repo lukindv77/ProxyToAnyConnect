@@ -1,0 +1,191 @@
+name: dev-issue25-final
+
+on:
+  push:
+    branches: [ dev/issue25-final ]
+    paths:
+      - '.github/workflows/dev-issue25-final.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Integrate strict CONNECT authority grammar and run aggregate tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = @{
+            'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs' = 'ccc24132c294c9896a2969b54b36db7be95572db'
+            'src/ProxyToAnyConnect/Proxy/ProxyServer.cs' = 'a38656c5469b7ac3d0202fb536b7ef04114e479b'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs' = 'c5ffd7cd47534124727acf34aa6ac653b7872df7'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyConnectAuthoritySelfTests.cs' = '1784b680f5824ecb8a1bc9628861e37acc5f4d2a'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs' = '7d881fb38d3f699b28827140c740ac7375ff3693'
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            if ((git rev-parse "HEAD:$($entry.Key)").Trim() -ne $entry.Value) {
+              throw "Unexpected blob for $($entry.Key)."
+            }
+          }
+
+          @'
+          from pathlib import Path
+
+          dns = Path('src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs')
+          text = dns.read_text(encoding='utf-8')
+          old = '''    private static string NormalizeDnsName(string host) =>
+                  NormalizeDnsHostStrict(host.Trim().TrimEnd('.'));'''
+          new = '''    private static string NormalizeDnsName(string host) =>
+                  NormalizeDnsHostStrict(host.Trim());'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one DNS normalize entrypoint, got {text.count(old)}')
+          text = text.replace(old, new)
+          anchor = '''        if (string.IsNullOrEmpty(host))
+                  {
+                      throw new InvalidOperationException("DNS host is empty.");
+                  }
+
+                  var asciiHost = IdnMapping.GetAscii(host).ToLowerInvariant();'''
+          replacement = '''        if (string.IsNullOrEmpty(host))
+                  {
+                      throw new InvalidOperationException("DNS host is empty.");
+                  }
+
+                  if (host.EndsWith(".", StringComparison.Ordinal))
+                  {
+                      host = host[..^1];
+                      if (host.Length == 0 || host.EndsWith(".", StringComparison.Ordinal))
+                      {
+                          throw new InvalidOperationException("DNS host has an invalid terminal root label.");
+                      }
+                  }
+
+                  var asciiHost = IdnMapping.GetAscii(host).ToLowerInvariant();'''
+          if text.count(anchor) != 1:
+              raise SystemExit(f'expected one DNS strict-host anchor, got {text.count(anchor)}')
+          dns.write_text(text.replace(anchor, replacement), encoding='utf-8', newline='')
+
+          proxy = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = proxy.read_text(encoding='utf-8')
+          old = '''        var separator = authority.LastIndexOf(':');
+                  if (separator < 0)
+                  {
+                      return (authority, defaultPort);
+                  }
+
+                  var host = authority[..separator];
+                  if (string.IsNullOrWhiteSpace(host) ||
+                      !int.TryParse(authority[(separator + 1)..], out var port) ||
+                      port is < 1 or > 65535)
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                  }
+
+                  return (host, port);'''
+          new = '''        var separator = authority.IndexOf(':');
+                  if (separator >= 0 && authority.IndexOf(':', separator + 1) >= 0)
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  var host = separator < 0 ? authority : authority[..separator];
+                  var port = defaultPort;
+                  if (separator >= 0 &&
+                      (!int.TryParse(authority[(separator + 1)..], out port) || port is < 1 or > 65535))
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                  }
+
+                  if (host.Length == 0)
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                  }
+
+                  foreach (var character in host)
+                  {
+                      if (character <= 0x20 || character == 0x7F ||
+                          character is '@' or '/' or '?' or '#' or '\\' or ':')
+                      {
+                          throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                      }
+                  }
+
+                  if (IPAddress.TryParse(host, out var literal))
+                  {
+                      if (literal.AddressFamily != AddressFamily.InterNetwork)
+                      {
+                          throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                      }
+
+                      return (literal.ToString(), port);
+                  }
+
+                  try
+                  {
+                      return (L2tpDnsResolver.NormalizeDnsHostStrict(host), port);
+                  }
+                  catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.", ex);
+                  }'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one CONNECT authority parser body, got {text.count(old)}')
+          proxy.write_text(text.replace(old, new), encoding='utf-8', newline='')
+
+          runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
+          text = runner.read_text(encoding='utf-8')
+          anchor = '        Run(nameof(ProxyConnectSetupSelfTests), ProxyConnectSetupSelfTests.Run);\n'
+          addition = anchor + '        await RunAsync(nameof(ProxyConnectAuthoritySelfTests), ProxyConnectAuthoritySelfTests.RunAsync);\n'
+          if text.count(anchor) != 1:
+              raise SystemExit(f'expected one CONNECT setup runner anchor, got {text.count(anchor)}')
+          runner.write_text(text.replace(anchor, addition), encoding='utf-8', newline='')
+
+          authority = Path('tests/ProxyToAnyConnect.SelfTests/ProxyConnectAuthoritySelfTests.cs')
+          text = authority.read_text(encoding='utf-8')
+          anchor = '''        AssertAuthority("example.test", "example.test", 443);
+                  AssertAuthority("EXAMPLE.TEST:8443", "example.test", 8443);
+                  AssertAuthority("127.0.0.1:9443", "127.0.0.1", 9443);
+                  AssertAuthority("münich.example:443", "xn--mnich-kva.example", 443);'''
+          replacement = '''        AssertAuthority("example.test", "example.test", 443);
+                  AssertAuthority("example.test.", "example.test", 443);
+                  AssertAuthority("EXAMPLE.TEST:8443", "example.test", 8443);
+                  AssertAuthority("127.0.0.1:9443", "127.0.0.1", 9443);
+                  AssertAuthority("münich.example:443", "xn--mnich-kva.example", 443);
+                  AssertAuthority("münich.example.:443", "xn--mnich-kva.example", 443);'''
+          if text.count(anchor) != 1:
+              raise SystemExit(f'expected one accepted-authority block, got {text.count(anchor)}')
+          text = text.replace(anchor, replacement)
+          if text.count('            "example.test.:443",') != 1:
+              raise SystemExit('expected old single-root-dot rejection exactly once')
+          text = text.replace('            "example.test.:443",', '            "example.test..:443",')
+          live_anchor = '                "example..test:443",\n'
+          if text.count(live_anchor) != 1:
+              raise SystemExit(f'expected one live malformed authority anchor, got {text.count(live_anchor)}')
+          text = text.replace(live_anchor, live_anchor + '                "example.test..:443",\n')
+          authority.write_text(text, encoding='utf-8', newline='')
+
+          alloc = Path('tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs')
+          text = alloc.read_text(encoding='utf-8')
+          old = '            "GET http://example.test/a HTTP/1.1 extra-data"'
+          new = '            "GET http://example.test/a HTTP/1.0"'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one obsolete request-line allocation fixture, got {text.count(old)}')
+          alloc.write_text(text.replace(old, new), encoding='utf-8', newline='')
+          '@ | python -
+
+          git diff --check
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs tests/ProxyToAnyConnect.SelfTests/ProxyConnectAuthoritySelfTests.cs tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs
+          git commit -m 'proxy: enforce strict CONNECT authority grammar'
+          git push origin HEAD:refs/heads/dev/issue25-final
