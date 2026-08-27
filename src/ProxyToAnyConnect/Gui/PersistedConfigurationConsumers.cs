@@ -16,35 +16,51 @@ internal static class PersistedConfigurationConsumers
         ArgumentNullException.ThrowIfNull(applyRuntimeAsync);
         cancellationToken.ThrowIfCancellationRequested();
 
-        Exception? primaryFailure = null;
+        Exception? loggingFailure = null;
         try
         {
             configureLogging(desired.Logging);
         }
         catch (Exception ex)
         {
-            primaryFailure = ex;
+            loggingFailure = ex;
         }
 
+        Exception? runtimeFailure = null;
         try
         {
             await applyRuntimeAsync(desired, cancellationToken);
         }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            // Application Exit / queue cancellation is lifecycle control flow and must
+            // remain primary even if the independent logging consumer had a defect.
+            // Keep that earlier consumer defect as diagnostic secondary information.
+            if (loggingFailure is not null)
+            {
+                ex.Data["PersistedConfigurationConsumer:logging"] = loggingFailure;
+            }
+
+            ExceptionDispatchInfo.Capture(ex).Throw();
+        }
         catch (Exception ex)
         {
-            if (primaryFailure is null)
-            {
-                primaryFailure = ex;
-            }
-            else
-            {
-                primaryFailure.Data["PersistedConfigurationConsumer:runtime"] = ex;
-            }
+            runtimeFailure = ex;
         }
 
-        if (primaryFailure is not null)
+        if (loggingFailure is not null)
         {
-            ExceptionDispatchInfo.Capture(primaryFailure).Throw();
+            if (runtimeFailure is not null)
+            {
+                loggingFailure.Data["PersistedConfigurationConsumer:runtime"] = runtimeFailure;
+            }
+
+            ExceptionDispatchInfo.Capture(loggingFailure).Throw();
+        }
+
+        if (runtimeFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(runtimeFailure).Throw();
         }
     }
 }
