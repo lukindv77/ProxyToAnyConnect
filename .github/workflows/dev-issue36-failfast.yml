@@ -1,0 +1,58 @@
+name: dev-issue36-failfast
+
+on:
+  push:
+    branches: [ dev/issue36-failfast ]
+    paths:
+      - '.github/workflows/dev-issue36-failfast.yml'
+      - '.github/scripts/dev-issue36.py'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply retained workflow fail-fast hardening
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python .github/scripts/dev-issue36.py
+          git diff --check
+          $changed = @(git diff --name-only)
+          $expected = @('.github/workflows/build.yml', '.github/workflows/handoff.yml')
+          if ($changed.Count -ne 2) {
+            throw "Unexpected #36 patch surface: $($changed -join ', ')"
+          }
+          foreach ($path in $expected) {
+            if ($changed -notcontains $path) { throw "#36 omitted expected path: $path" }
+          }
+      - name: Validate hardened workflow contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Get-Content -LiteralPath '.github/workflows/build.yml' -Raw
+          $handoff = Get-Content -LiteralPath '.github/workflows/handoff.yml' -Raw
+          if ($build -notmatch 'native_failure_sentinel' -or
+              $build -notmatch 'continue-on-error: true' -or
+              $build -notmatch 'PSNativeCommandUseErrorActionPreference') {
+            throw 'Build workflow does not contain the native failure sentinel contract.'
+          }
+          if ($handoff -notmatch 'PSNativeCommandUseErrorActionPreference = \$true') {
+            throw 'Handoff workflow did not enable native fail-fast behavior.'
+          }
+      - name: Publish validated retained workflows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add .github/workflows/build.yml .github/workflows/handoff.yml
+          git commit -m 'ci: fail closed on native command errors'
+          git push origin HEAD:refs/heads/dev/issue36-failfast
