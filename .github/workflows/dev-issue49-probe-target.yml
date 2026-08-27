@@ -1,0 +1,72 @@
+name: dev-issue49-probe-target
+
+on:
+  push:
+    branches:
+      - dev/issue49-probe-target
+    paths:
+      - .github/workflows/dev-issue49-probe-target.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 49 patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '2e56f8f76efda9047ec83f3cd0e58aee395de322'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          if ((git rev-parse HEAD:.github/validation/issue49.patch).Trim() -ne 'd3f446cbcc424d88c3025387cb33420aa3280c1a') {
+            throw 'Unexpected issue49 patch blob.'
+          }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Configuration/AppOptions.cs' = '961ed66e041be8a25aed146a287ae965585ff775'
+            'src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs' = '6f92dc81a29b1cefe38f37ad1af0bf8b9f620a4d'
+            'tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs' = '1e836fbd07361cedae256afca9ba74e5584f7ecf'
+            'tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs' = '5e659b38f7e30e87ae1b28736d92e47e837a2709'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) { throw "Unexpected base blob for $($entry.Key): $actual" }
+          }
+
+          Write-Host "UNICODE_DNS_CLASSIFICATION=$([Uri]::CheckHostName('münich.example'))"
+
+          git apply --recount --check .github/validation/issue49.patch
+          git apply --recount .github/validation/issue49.patch
+          $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #49 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 49 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'verification: reject unsafe or lossy probe targets'
+          git push origin HEAD:dev/issue49-probe-target
