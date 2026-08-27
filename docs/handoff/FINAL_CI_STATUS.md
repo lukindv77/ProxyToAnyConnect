@@ -1,29 +1,35 @@
-# Final CI status at handoff — 2026-08-26
+# Final CI status at handoff — 2026-08-27
 
-This file exists because hosted-runner results exposed two independent issues across docs-only commits with unchanged production code.
+Live protected `main` is authoritative. A source block is called accepted only after an exact-head Windows build has completed successfully.
 
-## Build #272 — `b3fbe1f96c0ffa7d031cb72b81793ec6ea9c2858`
+## Authoritative accepted checkpoint before the current runtime-independence block
 
-- compile: success, 0 warnings/errors;
-- paired proxy setup timing guard: PASS;
-  - parser 1999 vs 2042 ns/op = 0.98x;
-  - origin 973 vs 1222 ns/op = 0.80x;
-- suite reached `ProxyHttpFramingSelfTests`;
-- `ExactContentLengthBoundsClientToOriginBytesAsync` failed because response `ReadToEndAsync` received IOException with inner Windows SocketException 10054 / connection reset by remote host.
+Commit `03c372e90cd39b52cb261acd59e608e4caef19e5` — `test: prove caller cancellation wins persisted consumer faults`.
 
-## Build #273 — `b304a4331b8527b8280396047d3c649cfaed80f3`
+Windows build #511, run `33047798858`, completed successfully:
 
-- compile: success, 0 warnings/errors;
-- same production/parser code and same timing-test source as #272;
-- paired timing guard: FAIL;
-  - parser 5218 vs 2917 ns/op = 1.79x;
-  - limit 1.25x;
-- suite stopped before the framing test.
+- integration/evidence PowerShell smoke: PASS;
+- exact executable/process identity and soak-tool smoke: PASS;
+- restore/build: PASS;
+- aggregate self-tests: PASS;
+- self-contained win-x64 publish: PASS;
+- binary identity/ZIP/artifact upload: PASS.
 
-## Interpretation for the next chat
+Artifact `9636363559`, `ProxyToAnyConnect-win-x64`, digest:
+`sha256:a604c88db7c8c1e2a5ad168571d6016f45af7eb1f16564f795be17779a108273`.
 
-The two results prove the current setup timing gate is not sufficiently reproducible on hosted runners. Do not simply widen the 1.25x policy. Audit measurement methodology/current-vs-predecessor equivalence and make the gate stable enough that docs-only commits cannot swing from 0.98x to 1.79x without a code change.
+This accepted checkpoint includes staged repair of invalid loaded configuration, unified persisted configuration consumers, caller-cancellation precedence across consumer faults, serialized GUI Start/Pause generations, L2TP dialog-owned profile-helper drain, streaming/self-validating Windows soak evidence correlation, bounded RAS hangup attempts and the previously accepted fail-closed/lifecycle work.
 
-After the gate is stable, the already-observed framing reset must be investigated. Preserve the strict invariant that no bytes after declared Content-Length reach the origin. Determine whether reset 10054 is caused by Windows close behavior with deliberately unread malicious trailing bytes, premature proxy close before full origin response, or an over-strict clean-EOF test.
+## Current development after #511
 
-Issue #14 remains open. Issue #15 remains the next confirmed lifecycle implementation after #14 validation.
+The following commits are intentionally newer than the accepted checkpoint and require a new exact-head Windows verdict before they are called accepted:
+
+- `c111de381280c48fb06c26d32625a78d5e7456a8` — process memory health now exposes live RAS callback-root count and drains its worker/CTS even when a cancellation callback faults;
+- `039ab936e0e88463992389df1bd342bbc355134a` — regression for process-memory cleanup fault ownership and RAS-root diagnostics;
+- coordinator independence work: dispose every independent owner inside one dependency phase concurrently while keeping proxy-before-VPN phase ordering and deterministic input-order error aggregation.
+
+The coordinator change is intended to remove N× teardown-timeout behavior when several dedicated L2TP groups are shutting down or being selectively replaced. One stuck RAS owner must not add its full drain timeout to every unrelated group.
+
+## Remaining release boundary
+
+Hosted CI is not a substitute for real Windows 11 + real L2TP acceptance. Issues #2/#4/#5/#6/#7 still require endpoint-backed verification. Issue #13 additionally requires a representative 12–24h exact-binary soak with matching `process.memory.*` logs and external soak-series correlation.
