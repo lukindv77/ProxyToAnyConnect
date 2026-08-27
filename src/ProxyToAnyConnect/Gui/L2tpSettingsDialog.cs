@@ -26,6 +26,9 @@ internal sealed class L2tpSettingsDialog : Form
     private readonly NumericUpDown _probePort = Numeric(1, 65535);
     private readonly TextBox _probePath = new() { Dock = DockStyle.Fill };
     private readonly NumericUpDown _verificationTimeout = Numeric(1, 60);
+    private readonly NumericUpDown _verificationMaxResponse = Numeric(
+        VerificationOptions.MinimumResponseLimitBytes,
+        VerificationOptions.MaximumResponseLimitBytes);
 
     private readonly ComboBox _keepaliveMode = EnumCombo<L2tpKeepaliveMode>();
     private readonly TextBox _keepaliveCustomIPv4 = new() { Dock = DockStyle.Fill };
@@ -153,14 +156,19 @@ internal sealed class L2tpSettingsDialog : Form
         get
         {
             var mode = SelectedEnum<L2tpConnectionMode>(_mode);
+            var ipsecAuth = SelectedEnum<L2tpIpsecAuthentication>(_ipsecAuth);
+            var useWindowsCredentials = _useWindowsCredentials.Checked;
             var existingProtectedPassword = _existing?.Custom.ProtectedPassword ?? string.Empty;
             var existingProtectedPsk = _existing?.Custom.ProtectedPreSharedKey ?? string.Empty;
-            var protectedPassword = string.IsNullOrEmpty(_password.Text)
-                ? existingProtectedPassword
-                : WindowsSecretProtector.Protect(_password.Text);
-            var protectedPsk = string.IsNullOrEmpty(_preSharedKey.Text)
-                ? existingProtectedPsk
-                : WindowsSecretProtector.Protect(_preSharedKey.Text);
+            var protectedPassword = ResolveProtectedSecret(
+                credentialRequired: mode == L2tpConnectionMode.CustomEphemeral && !useWindowsCredentials,
+                enteredPlaintext: _password.Text,
+                existingProtected: existingProtectedPassword);
+            var protectedPsk = ResolveProtectedSecret(
+                credentialRequired: mode == L2tpConnectionMode.CustomEphemeral &&
+                                    ipsecAuth == L2tpIpsecAuthentication.PreSharedKey,
+                enteredPlaintext: _preSharedKey.Text,
+                existingProtected: existingProtectedPsk);
 
             var entryName = mode == L2tpConnectionMode.ExistingWindowsProfile
                 ? (_windowsProfile.SelectedItem as ProfileItem)?.Profile.Name ?? string.Empty
@@ -183,7 +191,7 @@ internal sealed class L2tpSettingsDialog : Form
                     ProbePort = decimal.ToInt32(_probePort.Value),
                     ProbePath = _probePath.Text.Trim(),
                     TimeoutSeconds = decimal.ToInt32(_verificationTimeout.Value),
-                    MaxResponseBytes = _existing?.Verification.MaxResponseBytes ?? 65536
+                    MaxResponseBytes = decimal.ToInt32(_verificationMaxResponse.Value)
                 },
                 Keepalive = new KeepaliveOptions
                 {
@@ -198,9 +206,9 @@ internal sealed class L2tpSettingsDialog : Form
                     ServerAddress = _serverAddress.Text.Trim(),
                     UserName = _userName.Text.Trim(),
                     Domain = _domain.Text.Trim(),
-                    UseCurrentWindowsCredentials = _useWindowsCredentials.Checked,
+                    UseCurrentWindowsCredentials = useWindowsCredentials,
                     ProtectedPassword = protectedPassword,
-                    IpsecAuthentication = SelectedEnum<L2tpIpsecAuthentication>(_ipsecAuth),
+                    IpsecAuthentication = ipsecAuth,
                     ProtectedPreSharedKey = protectedPsk,
                     Encryption = SelectedEnum<L2tpEncryptionMode>(_encryption),
                     AllowPap = _allowPap.Checked,
@@ -209,6 +217,21 @@ internal sealed class L2tpSettingsDialog : Form
                 }
             };
         }
+    }
+
+    internal static string ResolveProtectedSecret(
+        bool credentialRequired,
+        string enteredPlaintext,
+        string existingProtected)
+    {
+        if (!credentialRequired)
+        {
+            return string.Empty;
+        }
+
+        return string.IsNullOrEmpty(enteredPlaintext)
+            ? existingProtected
+            : WindowsSecretProtector.Protect(enteredPlaintext);
     }
 
     private void BuildExistingGroup()
@@ -234,7 +257,7 @@ internal sealed class L2tpSettingsDialog : Form
         AddRow(layout, 4, "Пароль:", _password);
         layout.Controls.Add(new Label
         {
-            Text = "Пустое поле сохраняет ранее заданный пароль.",
+            Text = "Пустое поле сохраняет ранее заданный пароль, пока выбран этот способ входа.",
             AutoSize = true,
             ForeColor = SystemColors.GrayText
         }, 1, 5);
@@ -242,7 +265,7 @@ internal sealed class L2tpSettingsDialog : Form
         AddRow(layout, 7, "Pre-shared key:", _preSharedKey);
         layout.Controls.Add(new Label
         {
-            Text = "Пустое поле сохраняет ранее заданный PSK.",
+            Text = "Пустое поле сохраняет ранее заданный PSK только в режиме PreSharedKey.",
             AutoSize = true,
             ForeColor = SystemColors.GrayText
         }, 1, 8);
@@ -276,6 +299,7 @@ internal sealed class L2tpSettingsDialog : Form
         AddRow(layout, 2, "Probe port:", _probePort);
         AddRow(layout, 3, "Probe path:", _probePath);
         AddRow(layout, 4, "Timeout, sec:", _verificationTimeout);
+        AddRow(layout, 5, "Max response, bytes:", _verificationMaxResponse);
         group.Controls.Add(layout);
         return group;
     }
@@ -308,6 +332,8 @@ internal sealed class L2tpSettingsDialog : Form
         _probePort.Value = existing?.Verification.ProbePort ?? 443;
         _probePath.Text = existing?.Verification.ProbePath ?? "/";
         _verificationTimeout.Value = existing?.Verification.TimeoutSeconds ?? 10;
+        _verificationMaxResponse.Value = existing?.Verification.MaxResponseBytes
+            ?? VerificationOptions.DefaultResponseLimitBytes;
 
         SelectEnum(_keepaliveMode, existing?.Keepalive.Mode ?? L2tpKeepaliveMode.Off);
         _keepaliveCustomIPv4.Text = existing?.Keepalive.CustomIPv4 ?? string.Empty;
@@ -417,9 +443,11 @@ internal sealed class L2tpSettingsDialog : Form
 
         if (mode == L2tpConnectionMode.CustomEphemeral)
         {
-            if (string.IsNullOrWhiteSpace(_serverAddress.Text))
+            var serverAddress = _serverAddress.Text.Trim();
+            if (string.IsNullOrWhiteSpace(serverAddress) ||
+                (!IPAddress.TryParse(serverAddress, out _) && Uri.CheckHostName(serverAddress) != UriHostNameType.Dns))
             {
-                throw new InvalidOperationException("Укажите адрес custom L2TP сервера.");
+                throw new InvalidOperationException("Адрес custom L2TP сервера должен быть IP адресом или DNS именем.");
             }
 
             if (!_useWindowsCredentials.Checked && string.IsNullOrWhiteSpace(_userName.Text))
@@ -440,11 +468,31 @@ internal sealed class L2tpSettingsDialog : Form
             {
                 throw new InvalidOperationException("Укажите IPsec pre-shared key.");
             }
+
+            if (!_allowPap.Checked && !_allowChap.Checked && !_allowMsChapV2.Checked)
+            {
+                throw new InvalidOperationException("Включите хотя бы один PPP authentication protocol.");
+            }
         }
 
-        if (string.IsNullOrWhiteSpace(_publicAddress.Text))
+        var publicAddress = _publicAddress.Text.Trim();
+        if (string.IsNullOrWhiteSpace(publicAddress) ||
+            (IPAddress.TryParse(publicAddress, out var publicIp)
+                ? publicIp.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork
+                : Uri.CheckHostName(publicAddress) != UriHostNameType.Dns))
         {
-            throw new InvalidOperationException("Укажите public IP или DNS для verification.");
+            throw new InvalidOperationException("Public address для verification должен быть IPv4 адресом или DNS именем.");
+        }
+
+        if (Uri.CheckHostName(_probeHost.Text.Trim()) != UriHostNameType.Dns)
+        {
+            throw new InvalidOperationException("Probe host для verification должен быть DNS именем.");
+        }
+
+        if (string.IsNullOrWhiteSpace(_probePath.Text) ||
+            !_probePath.Text.Trim().StartsWith("/", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Probe path для verification должен начинаться с '/'.");
         }
 
         if (SelectedEnum<L2tpKeepaliveMode>(_keepaliveMode) == L2tpKeepaliveMode.CustomIPv4 &&
