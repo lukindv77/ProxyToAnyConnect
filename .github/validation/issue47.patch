@@ -1,0 +1,157 @@
+diff --git a/tools/Test-WindowsSoakEvidence.ps1 b/tools/Test-WindowsSoakEvidence.ps1
+--- a/tools/Test-WindowsSoakEvidence.ps1
++++ b/tools/Test-WindowsSoakEvidence.ps1
+@@ -29,4 +29,58 @@ function Read-JsonFile {
+     return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+ }
+ 
++function Get-RequiredJsonStringProperty {
++    param(
++        [Parameter(Mandatory = $true)]
++        [string]$Json,
++        [Parameter(Mandatory = $true)]
++        [string]$PropertyName,
++        [Parameter(Mandatory = $true)]
++        [string]$Context
++    )
++
++    $document = $null
++    try {
++        $document = [System.Text.Json.JsonDocument]::Parse($Json)
++        $property = $document.RootElement.GetProperty($PropertyName)
++        if ($property.ValueKind -ne [System.Text.Json.JsonValueKind]::String) {
++            throw "'$PropertyName' is not a JSON string."
++        }
++
++        $value = $property.GetString()
++        if ([string]::IsNullOrWhiteSpace($value)) {
++            throw "'$PropertyName' is empty."
++        }
++
++        return $value
++    }
++    catch {
++        throw "Invalid $Context '$PropertyName': $($_.Exception.Message)"
++    }
++    finally {
++        if ($null -ne $document) {
++            $document.Dispose()
++        }
++    }
++}
++
++function ConvertFrom-RoundTripTimestamp {
++    param(
++        [Parameter(Mandatory = $true)]
++        [string]$Value,
++        [Parameter(Mandatory = $true)]
++        [string]$Context
++    )
++
++    try {
++        return [DateTimeOffset]::ParseExact(
++            $Value,
++            'O',
++            [Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
++    }
++    catch {
++        throw "Invalid $Context timestamp '$Value': $($_.Exception.Message)"
++    }
++}
++
+ $expectedHash = $ExpectedExecutableSha256.Trim().ToLowerInvariant()
+@@ -47,4 +101,9 @@ $manifestPath = Join-Path $outputPath 'manifest.json'
+ 
+ $metadata = Read-JsonFile -Path $metadataPath
++$metadataJson = Get-Content -LiteralPath $metadataPath -Raw
++$metadataProcessStartTimeUtc = Get-RequiredJsonStringProperty `
++    -Json $metadataJson `
++    -PropertyName 'processStartTimeUtc' `
++    -Context 'soak metadata'
+ $summary = Read-JsonFile -Path $summaryPath
+ $resultFile = Read-JsonFile -Path $resultPath
+@@ -129,7 +188,18 @@ foreach ($line in Get-Content -LiteralPath $samplesPath) {
+     if ($sample.schemaVersion -ne 1 -or [int]$sample.index -ne $sampleCount) {
+         throw "Soak sample index/schema mismatch at position $sampleCount."
+     }
++
++    $sampleProcessStartTimeUtc = Get-RequiredJsonStringProperty `
++        -Json $line `
++        -PropertyName 'processStartTimeUtc' `
++        -Context "soak sample $sampleCount"
++    $sampleTimestampUtc = Get-RequiredJsonStringProperty `
++        -Json $line `
++        -PropertyName 'timestampUtc' `
++        -Context "soak sample $sampleCount"
++
+     if ([int]$sample.processId -ne [int]$metadata.processId -or
+         -not ([string]$sample.processName).Equals(([string]$metadata.processName), [StringComparison]::OrdinalIgnoreCase) -or
+-        -not ([string]$sample.processStartTimeUtc).Equals(([string]$metadata.processStartTimeUtc), [StringComparison]::Ordinal)) {
++        -not $sampleProcessStartTimeUtc.Equals($metadataProcessStartTimeUtc, [StringComparison]::Ordinal)) {
+         throw "Soak process identity drift detected at sample $sampleCount."
+     }
+@@ -143,3 +213,5 @@ foreach ($line in Get-Content -LiteralPath $samplesPath) {
+     }
+ 
+-    $timestamp = [DateTimeOffset]::Parse([string]$sample.timestampUtc).ToUniversalTime()
++    $timestamp = ConvertFrom-RoundTripTimestamp `
++        -Value $sampleTimestampUtc `
++        -Context "soak sample $sampleCount"
+     if ($null -ne $previousTimestamp -and $timestamp -lt $previousTimestamp) {
+@@ -186,3 +258,3 @@ $result = [ordered]@{
+     processId = [int]$metadata.processId
+     processName = [string]$metadata.processName
+-    processStartTimeUtc = [string]$metadata.processStartTimeUtc
++    processStartTimeUtc = $metadataProcessStartTimeUtc
+     executableSha256 = [string]$metadata.executableSha256
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -342,6 +342,54 @@ jobs:
+           }
+           $soakValidation | ConvertTo-Json -Depth 4 | Write-Host
+ 
++          # A manifest-consistent bundle whose summary/result duration no longer
++          # matches the serialized sample timestamp span must fail semantically.
++          $durationMismatchOutput = './artifacts/windows-soak-evidence-duration-mismatch'
++          Copy-Item -LiteralPath $output -Destination $durationMismatchOutput -Recurse
++          $durationSummaryPath = Join-Path $durationMismatchOutput 'summary.json'
++          $durationResultPath = Join-Path $durationMismatchOutput 'result.json'
++          $durationManifestPath = Join-Path $durationMismatchOutput 'manifest.json'
++          $durationSummary = Get-Content -LiteralPath $durationSummaryPath -Raw | ConvertFrom-Json
++          $durationResult = Get-Content -LiteralPath $durationResultPath -Raw | ConvertFrom-Json
++          $wrongDuration = [double]$durationSummary.observedDurationSeconds + 1.0
++          $durationSummary.observedDurationSeconds = $wrongDuration
++          $durationResult.observedDurationSeconds = $wrongDuration
++          $durationSummary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $durationSummaryPath -Encoding utf8
++          $durationResult | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $durationResultPath -Encoding utf8
++
++          $durationManifest = Get-Content -LiteralPath $durationManifestPath -Raw | ConvertFrom-Json
++          foreach ($fileName in @('summary.json', 'result.json')) {
++            $entry = @($durationManifest.files | Where-Object { $_.path -eq $fileName })
++            if ($entry.Count -ne 1) {
++              throw "Duration mismatch fixture could not find exactly one manifest entry for $fileName."
++            }
++            $filePath = Join-Path $durationMismatchOutput $fileName
++            $entry[0].length = [long](Get-Item -LiteralPath $filePath).Length
++            $entry[0].sha256 = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
++          }
++          $durationManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $durationManifestPath -Encoding utf8
++
++          $durationMismatchRejected = $false
++          try {
++            ./tools/Test-WindowsSoakEvidence.ps1 `
++              -OutputDirectory $durationMismatchOutput `
++              -ExpectedExecutableSha256 $hash `
++              -MinimumSamples 2 `
++              -MinimumObservedDurationSeconds 1 | Out-Null
++          }
++          catch {
++            $durationMismatchRejected = $true
++            Write-Host "PASS: manifest-consistent soak duration mismatch rejected: $($_.Exception.Message)"
++          }
++          if (-not $durationMismatchRejected) {
++            throw 'Soak evidence validator accepted duration metadata inconsistent with serialized samples.'
++          }
++
+           # Prove the manifest covers result.json too. A copied bundle remains valid
