@@ -162,7 +162,8 @@ internal static class ProxyTransactionalShutdownSelfTests
 
     private sealed class SingleAttemptFactory : IProxyInstanceStartFactory
     {
-        private ProxyStartAttempt? _attempt;
+        private readonly ProxyStartAttempt _attempt;
+        private int _attemptTaken;
 
         public SingleAttemptFactory(FakeLease lease, BlockingDrainServer server)
         {
@@ -175,9 +176,12 @@ internal static class ProxyTransactionalShutdownSelfTests
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var attempt = Interlocked.Exchange(ref _attempt, null)
-                ?? throw new InvalidOperationException("Synthetic start attempt was already consumed.");
-            return Task.FromResult(attempt);
+            if (Interlocked.Exchange(ref _attemptTaken, 1) != 0)
+            {
+                throw new InvalidOperationException("Synthetic start attempt was already consumed.");
+            }
+
+            return Task.FromResult(_attempt);
         }
     }
 
