@@ -328,6 +328,13 @@ internal sealed class AppOptions
         {
             throw new InvalidOperationException($"L2TP '{name}' verification.timeoutSeconds must be between 1 and 60.");
         }
+
+        if (verification.MaxResponseBytes is < VerificationOptions.MinimumResponseLimitBytes or > VerificationOptions.MaximumResponseLimitBytes)
+        {
+            throw new InvalidOperationException(
+                $"L2TP '{name}' verification.maxResponseBytes must be between " +
+                $"{VerificationOptions.MinimumResponseLimitBytes} and {VerificationOptions.MaximumResponseLimitBytes}.");
+        }
     }
 
     private static void ValidateKeepalive(string name, KeepaliveOptions keepalive)
@@ -545,6 +552,10 @@ internal sealed class CustomL2tpOptions
 
 internal sealed class VerificationOptions
 {
+    internal const int MinimumResponseLimitBytes = 1024;
+    internal const int MaximumResponseLimitBytes = 1024 * 1024;
+    internal const int DefaultResponseLimitBytes = 64 * 1024;
+
     [JsonPropertyName("publicAddress")]
     public string PublicAddress { get; init; } = string.Empty;
 
@@ -561,7 +572,7 @@ internal sealed class VerificationOptions
     public int TimeoutSeconds { get; init; } = 10;
 
     [JsonPropertyName("maxResponseBytes")]
-    public int MaxResponseBytes { get; init; } = 65536;
+    public int MaxResponseBytes { get; init; } = DefaultResponseLimitBytes;
 }
 
 internal sealed class LoggingOptions
