@@ -8,14 +8,54 @@ on:
       - .github/workflows/dev-issue47-soak-duration.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
+  validate:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Diagnose serialized soak timestamp span
+        with:
+          fetch-depth: 0
+      - name: Apply and verify issue 47 patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = 'e4b9d53177c80639ed142c53a94e45fb6e54f2cf'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          $expectedBlobs = [ordered]@{
+            'tools/Test-WindowsSoakEvidence.ps1' = 'b78b102158176c941a6f579f28d5a9fe0c9b55b4'
+            '.github/workflows/build.yml' = '84506ec43ac3ca27b791e0c00d44b5289a411551'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) { throw "Unexpected base blob for $($entry.Key): $actual" }
+          }
+
+          git apply --recount --check .github/validation/issue47.patch
+          git apply --recount .github/validation/issue47.patch
+          $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #47 staged surface: $($staged -join ', ')"
+          }
+
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path './tools/Test-WindowsSoakEvidence.ps1'),
+            [ref]$tokens,
+            [ref]$errors) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            throw 'Patched soak validator has PowerShell parse errors.'
+          }
+      - name: Validate fresh and semantic-mismatch soak bundles
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -23,54 +63,68 @@ jobs:
           $process = Get-Process -Id $PID
           $process.Refresh()
           $hash = (Get-FileHash -LiteralPath $process.Path -Algorithm SHA256).Hash.ToLowerInvariant()
-          $output = './artifacts/issue47-diagnostic'
-          ./tools/Invoke-WindowsSoakEvidence.ps1 `
-            -ProcessId $PID `
-            -ExpectedProcessName $process.ProcessName `
-            -ExpectedExecutableSha256 $hash `
-            -DurationSeconds 2 `
-            -SampleIntervalSeconds 1 `
-            -OutputDirectory $output | Out-Null
 
-          $summary = Get-Content -LiteralPath (Join-Path $output 'summary.json') -Raw | ConvertFrom-Json
-          $lines = @(Get-Content -LiteralPath (Join-Path $output 'process-samples.jsonl'))
-          $first = $lines[0] | ConvertFrom-Json
-          $last = $lines[-1] | ConvertFrom-Json
-          Write-Host "SUMMARY=$($summary.observedDurationSeconds)"
-          Write-Host "FIRST_RAW=$($lines[0])"
-          Write-Host "LAST_RAW=$($lines[-1])"
-          Write-Host "FIRST_TYPE=$($first.timestampUtc.GetType().FullName) VALUE=$($first.timestampUtc)"
-          Write-Host "LAST_TYPE=$($last.timestampUtc.GetType().FullName) VALUE=$($last.timestampUtc)"
-          $coercedSpan = ([DateTimeOffset]::Parse([string]$last.timestampUtc) - [DateTimeOffset]::Parse([string]$first.timestampUtc)).TotalSeconds
-          Write-Host "COERCED_SPAN=$coercedSpan"
-
-          $firstDoc = [System.Text.Json.JsonDocument]::Parse($lines[0])
-          $lastDoc = [System.Text.Json.JsonDocument]::Parse($lines[-1])
-          try {
-            $firstRawTimestamp = $firstDoc.RootElement.GetProperty('timestampUtc').GetString()
-            $lastRawTimestamp = $lastDoc.RootElement.GetProperty('timestampUtc').GetString()
+          foreach ($attempt in 1..4) {
+            $output = "./artifacts/issue47-fresh-$attempt"
+            ./tools/Invoke-WindowsSoakEvidence.ps1 `
+              -ProcessId $PID `
+              -ExpectedProcessName $process.ProcessName `
+              -ExpectedExecutableSha256 $hash `
+              -DurationSeconds 2 `
+              -SampleIntervalSeconds 1 `
+              -OutputDirectory $output | Out-Null
+            $validation = ./tools/Test-WindowsSoakEvidence.ps1 `
+              -OutputDirectory $output `
+              -ExpectedExecutableSha256 $hash `
+              -MinimumSamples 2 `
+              -MinimumObservedDurationSeconds 1 | ConvertFrom-Json
+            if (-not $validation.validated -or $validation.validationMemoryModel -ne 'streaming-o1') {
+              throw "Fresh issue47 bundle $attempt did not validate with streaming O(1) semantics."
+            }
           }
-          finally {
-            $firstDoc.Dispose()
-            $lastDoc.Dispose()
-          }
-          $rawSpan = ([DateTimeOffset]::ParseExact($lastRawTimestamp, 'O', [Globalization.CultureInfo]::InvariantCulture) - [DateTimeOffset]::ParseExact($firstRawTimestamp, 'O', [Globalization.CultureInfo]::InvariantCulture)).TotalSeconds
-          Write-Host "RAW_FIRST=$firstRawTimestamp"
-          Write-Host "RAW_LAST=$lastRawTimestamp"
-          Write-Host "RAW_SPAN=$rawSpan"
 
-          $failedAsExpected = $false
+          $sourceOutput = './artifacts/issue47-fresh-4'
+          $mismatchOutput = './artifacts/issue47-duration-mismatch'
+          Copy-Item -LiteralPath $sourceOutput -Destination $mismatchOutput -Recurse
+          $summaryPath = Join-Path $mismatchOutput 'summary.json'
+          $resultPath = Join-Path $mismatchOutput 'result.json'
+          $manifestPath = Join-Path $mismatchOutput 'manifest.json'
+          $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+          $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+          $wrongDuration = [double]$summary.observedDurationSeconds + 1.0
+          $summary.observedDurationSeconds = $wrongDuration
+          $result.observedDurationSeconds = $wrongDuration
+          $summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryPath -Encoding utf8
+          $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resultPath -Encoding utf8
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          foreach ($fileName in @('summary.json', 'result.json')) {
+            $entry = @($manifest.files | Where-Object { $_.path -eq $fileName })
+            if ($entry.Count -ne 1) { throw "Missing manifest entry for $fileName." }
+            $filePath = Join-Path $mismatchOutput $fileName
+            $entry[0].length = [long](Get-Item -LiteralPath $filePath).Length
+            $entry[0].sha256 = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+
+          $rejected = $false
           try {
             ./tools/Test-WindowsSoakEvidence.ps1 `
-              -OutputDirectory $output `
+              -OutputDirectory $mismatchOutput `
               -ExpectedExecutableSha256 $hash `
               -MinimumSamples 2 `
               -MinimumObservedDurationSeconds 1 | Out-Null
           }
           catch {
-            $failedAsExpected = $true
-            Write-Host "CURRENT_VALIDATOR_FAILURE=$($_.Exception.Message)"
+            $rejected = $true
+            Write-Host "PASS: semantic duration mismatch rejected: $($_.Exception.Message)"
           }
-          if (-not $failedAsExpected) {
-            Write-Host 'CURRENT_VALIDATOR_ACCEPTED=true'
-          }
+          if (-not $rejected) { throw 'Manifest-consistent duration mismatch was accepted.' }
+      - name: Publish validated issue 47 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test: preserve serialized soak timestamp precision'
+          git push origin HEAD:dev/issue47-soak-duration
