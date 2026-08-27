@@ -7,10 +7,11 @@ namespace ProxyToAnyConnect.Runtime;
 
 internal sealed class VpnLeaseManager : IAsyncDisposable
 {
-    private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan DefaultMaintenanceInterval = TimeSpan.FromMilliseconds(500);
 
     private readonly L2tpOptions _options;
     private readonly IVpnConnectionController _connectionManager;
+    private readonly TimeSpan _maintenanceInterval;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly HashSet<string> _consumers = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _lifetime = new();
@@ -22,18 +23,33 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     private int _disposed;
 
     public VpnLeaseManager(L2tpOptions options)
-        : this(options, null)
+        : this(options, null, null)
     {
     }
 
     internal VpnLeaseManager(
         L2tpOptions options,
         IVpnConnectionController? connectionManager)
+        : this(options, connectionManager, null)
+    {
+    }
+
+    internal VpnLeaseManager(
+        L2tpOptions options,
+        IVpnConnectionController? connectionManager,
+        TimeSpan? maintenanceInterval)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         Metrics = new L2tpRuntimeMetrics();
         DnsCache = new L2tpDnsCache();
         _connectionManager = connectionManager ?? new RasConnectionManager(options, Metrics);
+        _maintenanceInterval = maintenanceInterval ?? DefaultMaintenanceInterval;
+        if (_maintenanceInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maintenanceInterval),
+                "VPN maintenance interval must be positive.");
+        }
         _lifetimeToken = _lifetime.Token;
     }
 
@@ -207,7 +223,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
 
     private async Task MaintainConnectionAsync(CancellationToken cancellationToken)
     {
-        using var timer = new PeriodicTimer(MaintenanceInterval);
+        using var timer = new PeriodicTimer(_maintenanceInterval);
 
         try
         {
