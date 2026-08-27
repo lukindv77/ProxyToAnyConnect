@@ -649,7 +649,7 @@ internal sealed class MainForm : Form
         CancellationToken cancellationToken) =>
         CommitConfigurationDraftAsync(
             newOptions,
-            (desired, operationToken) => _runtimeHost.ApplyOptionsAsync(desired, operationToken),
+            ApplyPersistedConfigurationAsync,
             "Настройки сохранены, runtime не применён",
             cancellationToken);
 
@@ -740,6 +740,15 @@ internal sealed class MainForm : Form
         RebuildVpnNameIndex();
     }
 
+    private Task ApplyPersistedConfigurationAsync(
+        AppOptions desired,
+        CancellationToken cancellationToken) =>
+        PersistedConfigurationConsumers.ApplyAsync(
+            desired,
+            logging => AppLog.Configure(logging),
+            (options, operationToken) => _runtimeHost.ApplyOptionsAsync(options, operationToken),
+            cancellationToken);
+
     private void BrowseLogDirectory(object? sender, EventArgs e)
     {
         using var dialog = new FolderBrowserDialog
@@ -761,25 +770,16 @@ internal sealed class MainForm : Form
         LoggingOptions newLogging,
         CancellationToken cancellationToken)
     {
-        // This method runs only inside the serialized configuration command queue.
-        // Merge the captured log request with the latest staged topology, not merely
-        // the last durable generation. This preserves earlier repairs when a legacy
-        // loaded config still contains another defect and cannot yet be persisted.
-        var newOptions = new AppOptions
-        {
-            Proxies = _options.Proxies,
-            VpnConnections = _options.VpnConnections,
-            Logging = newLogging
-        };
-
-        return CommitConfigurationDraftAsync(
-            newOptions,
-            (desired, _) =>
+        // Logging may be the final repair that makes a multi-error staged draft
+        // globally valid. Route it through the same full durable-generation path as
+        // topology edits so earlier staged proxy/VPN fixes are reconciled too.
+        return ApplyConfigurationAsync(
+            new AppOptions
             {
-                AppLog.Configure(desired.Logging);
-                return Task.CompletedTask;
+                Proxies = _options.Proxies,
+                VpnConnections = _options.VpnConnections,
+                Logging = newLogging
             },
-            "Настройки логов сохранены, но не применены",
             cancellationToken);
     }
 
