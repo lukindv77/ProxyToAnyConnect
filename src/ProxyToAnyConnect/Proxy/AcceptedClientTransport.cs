@@ -34,28 +34,53 @@ internal sealed class TcpListener
     }
 }
 
-internal sealed class TcpClient : System.Net.Sockets.TcpClient
+internal sealed class TcpClient : IDisposable
 {
     private const int MaxCloseDrainBytes = 64 * 1024;
-    private int _closePrepared;
+
+    private readonly Socket _socket;
+    private int _disposed;
 
     public TcpClient(Socket acceptedSocket)
-        : base(acceptedSocket.AddressFamily)
     {
-        // TcpClient has no public accepted-Socket constructor, but its Client property
-        // is explicitly settable for exactly this composition scenario.
-        Client.Dispose();
-        Client = acceptedSocket;
+        _socket = acceptedSocket ?? throw new ArgumentNullException(nameof(acceptedSocket));
     }
 
-    protected override void Dispose(bool disposing)
+    public Socket Client => _socket;
+
+    public bool Connected => Volatile.Read(ref _disposed) == 0 && _socket.Connected;
+
+    public bool NoDelay
     {
-        if (disposing && Interlocked.Exchange(ref _closePrepared, 1) == 0)
+        get => _socket.NoDelay;
+        set => _socket.NoDelay = value;
+    }
+
+    public NetworkStream GetStream()
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        // The accepted-client wrapper is the single owner of the socket. Individual
+        // request/error streams are scoped views only; disposing them must not bypass
+        // PrepareForClose by closing the socket before outer TcpClient.Dispose().
+        return new NetworkStream(_socket, ownsSocket: false);
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            PrepareForClose(Client);
+            return;
         }
 
-        base.Dispose(disposing);
+        try
+        {
+            PrepareForClose(_socket);
+        }
+        finally
+        {
+            _socket.Dispose();
+        }
     }
 
     private static void PrepareForClose(Socket socket)
