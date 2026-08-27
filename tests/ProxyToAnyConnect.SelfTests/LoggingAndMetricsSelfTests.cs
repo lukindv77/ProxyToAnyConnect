@@ -13,6 +13,9 @@ internal static class LoggingAndMetricsSelfTests
         failed += Run("Daily log path uses YYYY-MM folders", DailyLogPathUsesMonthlyFolder);
         failed += Run("Daily log appends without replacing file", DailyLogAppends);
         failed += Run("Log retention removes expired daily files", LogRetentionRemovesExpiredFiles);
+        failed += Run(
+            "Log configuration is fail-soft, transactional and explicitly releasable",
+            LogConfigurationFailureIsFailSoftAndRecoverable);
         await Task.CompletedTask;
         return failed;
     }
@@ -97,6 +100,60 @@ internal static class LoggingAndMetricsSelfTests
         finally
         {
             TryDeleteDirectory(root);
+        }
+    }
+
+    private static void LogConfigurationFailureIsFailSoftAndRecoverable()
+    {
+        var firstRoot = CreateTempDirectory();
+        var secondRoot = CreateTempDirectory();
+        try
+        {
+            AppLog.Shutdown();
+            AppLog.Configure(firstRoot, retentionDays: 30, consoleJson: false);
+            Assert(
+                string.Equals(AppLog.LogRootDirectory, Path.GetFullPath(firstRoot), StringComparison.OrdinalIgnoreCase),
+                "Initial valid logging configuration was not installed.");
+
+            AppLog.Info("selftest.logging.first", "first");
+            var firstFile = AppLog.CurrentLogFile
+                ?? throw new InvalidOperationException("Initial logging store did not append a record.");
+
+            AppLog.Configure("invalid\0log-root", retentionDays: 30, consoleJson: false);
+            Assert(
+                string.Equals(AppLog.LogRootDirectory, Path.GetFullPath(firstRoot), StringComparison.OrdinalIgnoreCase),
+                "Malformed replacement log path disabled or replaced the healthy store.");
+
+            AppLog.Configure(secondRoot, retentionDays: 0, consoleJson: false);
+            Assert(
+                string.Equals(AppLog.LogRootDirectory, Path.GetFullPath(firstRoot), StringComparison.OrdinalIgnoreCase),
+                "Invalid retention replaced the healthy logging store.");
+
+            AppLog.Info("selftest.logging.after_rejection", "still using first store");
+            Assert(
+                File.ReadAllLines(firstFile).Length >= 2,
+                "Healthy logging store stopped accepting records after rejected configuration.");
+
+            AppLog.Configure(secondRoot, retentionDays: 7, consoleJson: false);
+            Assert(
+                string.Equals(AppLog.LogRootDirectory, Path.GetFullPath(secondRoot), StringComparison.OrdinalIgnoreCase),
+                "Valid logging configuration did not recover after rejected replacements.");
+
+            AppLog.Info("selftest.logging.second", "second");
+            var secondFile = AppLog.CurrentLogFile
+                ?? throw new InvalidOperationException("Replacement logging store did not append a record.");
+            Assert(
+                secondFile.StartsWith(Path.GetFullPath(secondRoot), StringComparison.OrdinalIgnoreCase),
+                "Recovered logging record was not written under the replacement root.");
+
+            AppLog.Shutdown();
+            Assert(AppLog.LogRootDirectory is null, "AppLog.Shutdown retained the active store owner.");
+        }
+        finally
+        {
+            AppLog.Shutdown();
+            TryDeleteDirectory(firstRoot);
+            TryDeleteDirectory(secondRoot);
         }
     }
 
