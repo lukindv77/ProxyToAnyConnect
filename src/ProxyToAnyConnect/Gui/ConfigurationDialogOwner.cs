@@ -6,6 +6,16 @@ internal sealed class ConfigurationDialogOwner
     private Action? _cancelActive;
     private int _stopped;
 
+    public DialogResult Run(Form dialog, IWin32Window owner)
+    {
+        ArgumentNullException.ThrowIfNull(dialog);
+        ArgumentNullException.ThrowIfNull(owner);
+
+        return Run(
+            () => dialog.ShowDialog(owner),
+            () => RequestClose(dialog));
+    }
+
     public TResult Run<TResult>(
         Func<TResult> showDialog,
         Action cancelDialog)
@@ -60,5 +70,43 @@ internal sealed class ConfigurationDialogOwner
         // Closing a modal window pumps nested WinForms messages and can synchronously
         // unwind the exact Run() call that currently owns this callback.
         cancelActive?.Invoke();
+    }
+
+    private static void RequestClose(Form dialog)
+    {
+        if (dialog.IsDisposed || dialog.Disposing)
+        {
+            return;
+        }
+
+        void CloseCore()
+        {
+            if (dialog.IsDisposed || dialog.Disposing)
+            {
+                return;
+            }
+
+            dialog.DialogResult = DialogResult.Cancel;
+            dialog.Close();
+        }
+
+        if (!dialog.InvokeRequired)
+        {
+            CloseCore();
+            return;
+        }
+
+        try
+        {
+            dialog.BeginInvoke((Action)CloseCore);
+        }
+        catch (InvalidOperationException) when (dialog.IsDisposed || dialog.Disposing || !dialog.IsHandleCreated)
+        {
+            // The modal already lost its handle while Stop raced natural completion.
+        }
+        catch (ObjectDisposedException)
+        {
+            // The exact dialog completed between the ownership check and BeginInvoke.
+        }
     }
 }
