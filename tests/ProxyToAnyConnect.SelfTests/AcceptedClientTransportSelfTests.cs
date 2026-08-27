@@ -14,10 +14,11 @@ internal static class AcceptedClientTransportSelfTests
         try
         {
             await QueuedUnreadClientBytesDoNotDestroyWrittenResponseAsync();
+            await ScopedStreamDisposeDoesNotBypassOuterCloseAsync();
             await CloseDoesNotWaitForFutureClientBytesAsync();
 
             Console.WriteLine(
-                "PASS: accepted-client close preserves written response with bounded unread-tail cleanup");
+                "PASS: accepted-client socket ownership preserves written responses with bounded unread-tail cleanup");
             return 0;
         }
         catch (Exception ex)
@@ -65,6 +66,53 @@ internal static class AcceptedClientTransportSelfTests
         {
             throw new InvalidOperationException(
                 "Accepted-client close corrupted bytes that were written before disposal.");
+        }
+    }
+
+    private static async Task ScopedStreamDisposeDoesNotBypassOuterCloseAsync()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        using var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        using var client = new System.Net.Sockets.TcpClient { NoDelay = true };
+        var connectTask = client.ConnectAsync(IPAddress.Loopback, port, timeout.Token);
+        var acceptedSocketTask = listener.AcceptSocketAsync(timeout.Token);
+        await connectTask;
+        var acceptedSocket = await acceptedSocketTask;
+        acceptedSocket.NoDelay = true;
+
+        using var accepted = new ProxyToAnyConnect.Proxy.TcpClient(acceptedSocket);
+        await using var clientStream = client.GetStream();
+
+        var maliciousTail = "QUEUED-AFTER-BODY"u8.ToArray();
+        await clientStream.WriteAsync(maliciousTail, timeout.Token);
+        await WaitUntilQueuedAsync(acceptedSocket, maliciousTail.Length, timeout.Token);
+
+        var response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"u8.ToArray();
+        await using (var requestStream = accepted.GetStream())
+        {
+            await requestStream.WriteAsync(response, timeout.Token);
+            await requestStream.FlushAsync(timeout.Token);
+        }
+
+        // Disposing a scoped stream must not close the accepted socket. A fresh
+        // non-owning view can still be created, proving outer TcpClient.Dispose is
+        // the sole terminal owner and will execute the bounded unread-tail policy.
+        await using (var secondView = accepted.GetStream())
+        {
+            await secondView.FlushAsync(timeout.Token);
+        }
+
+        accepted.Dispose();
+
+        var received = new byte[response.Length];
+        await ReadExactlyBeforeCloseAsync(clientStream, received, timeout.Token);
+        if (!received.AsSpan().SequenceEqual(response))
+        {
+            throw new InvalidOperationException(
+                "Scoped stream disposal bypassed accepted-client close ownership.");
         }
     }
 
