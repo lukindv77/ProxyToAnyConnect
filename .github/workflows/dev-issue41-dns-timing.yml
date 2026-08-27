@@ -9,6 +9,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
@@ -17,12 +19,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $parent = (git rev-parse 'HEAD^').Trim()
-          if ($parent -ne '159e5797deca5455aa38ccbb177003a4184d832d') {
-            throw "Unexpected #41 base: $parent"
+          $expectedBase = '159e5797deca5455aa38ccbb177003a4184d832d'
+          $base = (git merge-base HEAD origin/main).Trim()
+          if ($base -ne $expectedBase) {
+            throw "Unexpected #41 merge base: $base"
           }
-          git -c core.whitespace=cr-at-eol diff HEAD^ --check
-          $changed = @(git diff --name-only HEAD^ HEAD)
+          git -c core.whitespace=cr-at-eol diff $expectedBase HEAD --check
+          $changed = @(git diff --name-only $expectedBase HEAD)
           $expected = @(
             '.github/workflows/dev-issue41-dns-timing.yml',
             'tests/ProxyToAnyConnect.SelfTests/DnsParsedResponseValueSelfTests.cs'
