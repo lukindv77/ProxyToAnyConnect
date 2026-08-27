@@ -95,6 +95,8 @@ internal sealed class WindowsRasDialNative : IRasDialNative
     internal static void ReleaseCallbackRoot(nint rasConnection) =>
         RasDialCallbackRoots.Remove(rasConnection);
 
+    internal static int ActiveCallbackRootCount => RasDialCallbackRoots.Count;
+
     [DllImport("rasapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "RasDialW")]
     private static extern uint RasDialWithCallbackW(
         nint rasDialExtensions,
@@ -109,34 +111,14 @@ internal sealed class WindowsRasDialNative : IRasDialNative
 
     private static class RasDialCallbackRoots
     {
-        private static readonly object Gate = new();
-        private static readonly Dictionary<nint, NativeRasDialFunc1> Roots = new();
+        private static readonly NativeCallbackRootRegistry<NativeRasDialFunc1> Registry = new();
 
-        public static void Add(nint handle, NativeRasDialFunc1 notifier)
-        {
-            if (handle == 0)
-            {
-                return;
-            }
+        public static int Count => Registry.Count;
 
-            lock (Gate)
-            {
-                Roots[handle] = notifier;
-            }
-        }
+        public static void Add(nint handle, NativeRasDialFunc1 notifier) =>
+            Registry.AddOrReplace(handle, notifier);
 
-        public static void Remove(nint handle)
-        {
-            if (handle == 0)
-            {
-                return;
-            }
-
-            lock (Gate)
-            {
-                Roots.Remove(handle);
-            }
-        }
+        public static void Remove(nint handle) => Registry.Remove(handle);
     }
 }
 
