@@ -320,6 +320,49 @@ jobs:
           }
           $soakValidation | ConvertTo-Json -Depth 4 | Write-Host
 
+          # A manifest-consistent bundle whose summary/result duration no longer
+          # matches the serialized sample timestamp span must fail semantically.
+          $durationMismatchOutput = './artifacts/windows-soak-evidence-duration-mismatch'
+          Copy-Item -LiteralPath $output -Destination $durationMismatchOutput -Recurse
+          $durationSummaryPath = Join-Path $durationMismatchOutput 'summary.json'
+          $durationResultPath = Join-Path $durationMismatchOutput 'result.json'
+          $durationManifestPath = Join-Path $durationMismatchOutput 'manifest.json'
+          $durationSummary = Get-Content -LiteralPath $durationSummaryPath -Raw | ConvertFrom-Json
+          $durationResult = Get-Content -LiteralPath $durationResultPath -Raw | ConvertFrom-Json
+          $wrongDuration = [double]$durationSummary.observedDurationSeconds + 1.0
+          $durationSummary.observedDurationSeconds = $wrongDuration
+          $durationResult.observedDurationSeconds = $wrongDuration
+          $durationSummary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $durationSummaryPath -Encoding utf8
+          $durationResult | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $durationResultPath -Encoding utf8
+
+          $durationManifest = Get-Content -LiteralPath $durationManifestPath -Raw | ConvertFrom-Json
+          foreach ($fileName in @('summary.json', 'result.json')) {
+            $entry = @($durationManifest.files | Where-Object { $_.path -eq $fileName })
+            if ($entry.Count -ne 1) {
+              throw "Duration mismatch fixture could not find exactly one manifest entry for $fileName."
+            }
+            $filePath = Join-Path $durationMismatchOutput $fileName
+            $entry[0].length = [long](Get-Item -LiteralPath $filePath).Length
+            $entry[0].sha256 = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $durationManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $durationManifestPath -Encoding utf8
+
+          $durationMismatchRejected = $false
+          try {
+            ./tools/Test-WindowsSoakEvidence.ps1 `
+              -OutputDirectory $durationMismatchOutput `
+              -ExpectedExecutableSha256 $hash `
+              -MinimumSamples 2 `
+              -MinimumObservedDurationSeconds 1 | Out-Null
+          }
+          catch {
+            $durationMismatchRejected = $true
+            Write-Host "PASS: manifest-consistent soak duration mismatch rejected: $($_.Exception.Message)"
+          }
+          if (-not $durationMismatchRejected) {
+            throw 'Soak evidence validator accepted duration metadata inconsistent with serialized samples.'
+          }
+
           # Prove the manifest covers result.json too. A copied bundle remains valid
           # until one manifested payload is altered, after which validation must fail.
           $tamperedOutput = './artifacts/windows-soak-evidence-tampered'
