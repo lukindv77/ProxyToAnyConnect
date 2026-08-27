@@ -13,9 +13,10 @@ internal static class RuntimeHostOperationLifetimeSelfTests
         try
         {
             await DisposeCancelsForegroundStartBeforeWaitingForHostGateAsync();
+            await DisposeContinuesAfterHostLifetimeCancellationCallbackFailureAsync();
 
             Console.WriteLine(
-                "PASS: runtime host shutdown cancels foreground lifecycle work before exact ownership drain");
+                "PASS: runtime host shutdown cancels foreground lifecycle work and releases exact ownership through cancellation callback faults");
             return 0;
         }
         catch (Exception ex)
@@ -87,6 +88,48 @@ internal static class RuntimeHostOperationLifetimeSelfTests
                 await host.DisposeAsync();
             }
         }
+    }
+
+    private static async Task DisposeContinuesAfterHostLifetimeCancellationCallbackFailureAsync()
+    {
+        var host = new ProxyRuntimeHost(CreateOptions());
+        var coordinator = host.Current
+            ?? throw new InvalidOperationException("Valid self-test options did not create a runtime coordinator.");
+        var hostLifetime = GetPrivateField<CancellationTokenSource>(host, "_lifetime");
+        var coordinatorLifetime = GetPrivateField<CancellationTokenSource>(coordinator, "_lifetime");
+        _ = hostLifetime.Token.Register(
+            static () => throw new SyntheticCleanupException("host lifetime cancellation callback failed"));
+
+        try
+        {
+            await host.DisposeAsync();
+            throw new InvalidOperationException(
+                "Throwing host lifetime cancellation callback was not surfaced from DisposeAsync.");
+        }
+        catch (AggregateException ex) when (
+            ex.InnerExceptions.Any(inner =>
+                inner is SyntheticCleanupException synthetic &&
+                synthetic.Message == "host lifetime cancellation callback failed"))
+        {
+        }
+
+        if (host.Current is not null)
+        {
+            throw new InvalidOperationException(
+                "Host lifetime cancellation callback fault prevented coordinator ownership release.");
+        }
+
+        if (!CancellationSourceWasDisposed(hostLifetime) ||
+            !CancellationSourceWasDisposed(coordinatorLifetime) ||
+            GetPrivateField<int>(coordinator, "_disposed") == 0)
+        {
+            throw new InvalidOperationException(
+                "Host lifetime cancellation callback fault prevented host/coordinator lifetime disposal.");
+        }
+
+        // The cleanup defect was already reported by the first call. Once exact
+        // ownership is gone, repeated host disposal is a harmless no-op.
+        await host.DisposeAsync();
     }
 
     private static async Task WaitForProxyStateAsync(
@@ -195,14 +238,42 @@ internal static class RuntimeHostOperationLifetimeSelfTests
                 $"Runtime field '{fieldName}' did not contain the expected dictionary type.");
     }
 
-    private static SemaphoreSlim GetPrivateGate(VpnLeaseManager manager)
+    private static T GetPrivateField<T>(object owner, string fieldName)
     {
-        var field = typeof(VpnLeaseManager).GetField(
-            "_gate",
+        var field = owner.GetType().GetField(
+            fieldName,
             BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new MissingFieldException(typeof(VpnLeaseManager).FullName, "_gate");
+            ?? throw new MissingFieldException(owner.GetType().FullName, fieldName);
+        var value = field.GetValue(owner);
+        if (value is null)
+        {
+            return default!;
+        }
 
-        return field.GetValue(manager) as SemaphoreSlim
-            ?? throw new InvalidOperationException("VPN manager gate was unavailable to the deterministic lifetime test.");
+        return (T)value;
+    }
+
+    private static SemaphoreSlim GetPrivateGate(VpnLeaseManager manager) =>
+        GetPrivateField<SemaphoreSlim>(manager, "_gate");
+
+    private static bool CancellationSourceWasDisposed(CancellationTokenSource source)
+    {
+        try
+        {
+            _ = source.Token;
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            return true;
+        }
+    }
+
+    private sealed class SyntheticCleanupException : Exception
+    {
+        public SyntheticCleanupException(string message)
+            : base(message)
+        {
+        }
     }
 }
