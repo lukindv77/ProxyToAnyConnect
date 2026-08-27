@@ -11,6 +11,7 @@ internal sealed class L2tpSettingsDialog : Form
     private readonly L2tpOptions? _existing;
     private readonly WindowsVpnProfileInspector _profileInspector = new();
     private CancellationTokenSource? _profileLoadCancellation;
+    private L2tpOptions? _acceptedResult;
 
     private readonly TextBox _name = new() { Dock = DockStyle.Fill };
     private readonly CheckBox _shared = new() { Text = "Общее L2TP для нескольких proxy", AutoSize = true };
@@ -121,7 +122,13 @@ internal sealed class L2tpSettingsDialog : Form
             try
             {
                 ValidateEditor();
-                _ = Result;
+
+                // Materialize the accepted immutable options exactly once. In
+                // CustomEphemeral mode this is also the one DPAPI protection boundary
+                // for newly entered password/PSK values; MainForm later reads the
+                // cached object rather than protecting the same plaintext again.
+                _acceptedResult = BuildResult();
+                ClearPlaintextSecrets();
             }
             catch (Exception ex)
             {
@@ -144,7 +151,11 @@ internal sealed class L2tpSettingsDialog : Form
         _useWindowsCredentials.CheckedChanged += (_, _) => RefreshCredentialVisibility();
         _refreshProfiles.Click += async (_, _) => await LoadWindowsProfilesAsync();
         Shown += async (_, _) => await LoadWindowsProfilesAsync();
-        FormClosed += (_, _) => CancelProfileLoad();
+        FormClosed += (_, _) =>
+        {
+            CancelProfileLoad();
+            ClearPlaintextSecrets();
+        };
 
         LoadExisting(existing);
         RefreshModeVisibility();
@@ -153,72 +164,71 @@ internal sealed class L2tpSettingsDialog : Form
         RefreshCredentialVisibility();
     }
 
-    public L2tpOptions Result
+    public L2tpOptions Result => _acceptedResult ?? BuildResult();
+
+    private L2tpOptions BuildResult()
     {
-        get
+        var mode = SelectedEnum<L2tpConnectionMode>(_mode);
+        var ipsecAuth = SelectedEnum<L2tpIpsecAuthentication>(_ipsecAuth);
+        var useWindowsCredentials = _useWindowsCredentials.Checked;
+        var existingProtectedPassword = _existing?.Custom.ProtectedPassword ?? string.Empty;
+        var existingProtectedPsk = _existing?.Custom.ProtectedPreSharedKey ?? string.Empty;
+        var protectedPassword = ResolveProtectedSecret(
+            credentialRequired: mode == L2tpConnectionMode.CustomEphemeral && !useWindowsCredentials,
+            enteredPlaintext: _password.Text,
+            existingProtected: existingProtectedPassword);
+        var protectedPsk = ResolveProtectedSecret(
+            credentialRequired: mode == L2tpConnectionMode.CustomEphemeral &&
+                                ipsecAuth == L2tpIpsecAuthentication.PreSharedKey,
+            enteredPlaintext: _preSharedKey.Text,
+            existingProtected: existingProtectedPsk);
+
+        var entryName = mode == L2tpConnectionMode.ExistingWindowsProfile
+            ? (_windowsProfile.SelectedItem as ProfileItem)?.Profile.Name ?? string.Empty
+            : $"ProxyToAnyConnect-{_id}";
+
+        return new L2tpOptions
         {
-            var mode = SelectedEnum<L2tpConnectionMode>(_mode);
-            var ipsecAuth = SelectedEnum<L2tpIpsecAuthentication>(_ipsecAuth);
-            var useWindowsCredentials = _useWindowsCredentials.Checked;
-            var existingProtectedPassword = _existing?.Custom.ProtectedPassword ?? string.Empty;
-            var existingProtectedPsk = _existing?.Custom.ProtectedPreSharedKey ?? string.Empty;
-            var protectedPassword = ResolveProtectedSecret(
-                credentialRequired: mode == L2tpConnectionMode.CustomEphemeral && !useWindowsCredentials,
-                enteredPlaintext: _password.Text,
-                existingProtected: existingProtectedPassword);
-            var protectedPsk = ResolveProtectedSecret(
-                credentialRequired: mode == L2tpConnectionMode.CustomEphemeral &&
-                                    ipsecAuth == L2tpIpsecAuthentication.PreSharedKey,
-                enteredPlaintext: _preSharedKey.Text,
-                existingProtected: existingProtectedPsk);
-
-            var entryName = mode == L2tpConnectionMode.ExistingWindowsProfile
-                ? (_windowsProfile.SelectedItem as ProfileItem)?.Profile.Name ?? string.Empty
-                : $"ProxyToAnyConnect-{_id}";
-
-            return new L2tpOptions
+            Id = _id,
+            Name = _name.Text.Trim(),
+            Shared = _shared.Checked,
+            Mode = mode,
+            EntryName = entryName,
+            MonitorIntervalMilliseconds = decimal.ToInt32(_monitorInterval.Value),
+            RouteMonitorIntervalMilliseconds = decimal.ToInt32(_routeMonitorInterval.Value),
+            ReconnectCooldownMilliseconds = decimal.ToInt32(_reconnectCooldown.Value),
+            Verification = new VerificationOptions
             {
-                Id = _id,
-                Name = _name.Text.Trim(),
-                Shared = _shared.Checked,
-                Mode = mode,
-                EntryName = entryName,
-                MonitorIntervalMilliseconds = decimal.ToInt32(_monitorInterval.Value),
-                RouteMonitorIntervalMilliseconds = decimal.ToInt32(_routeMonitorInterval.Value),
-                ReconnectCooldownMilliseconds = decimal.ToInt32(_reconnectCooldown.Value),
-                Verification = new VerificationOptions
-                {
-                    PublicAddress = _publicAddress.Text.Trim(),
-                    ProbeHost = _probeHost.Text.Trim(),
-                    ProbePort = decimal.ToInt32(_probePort.Value),
-                    ProbePath = _probePath.Text.Trim(),
-                    TimeoutSeconds = decimal.ToInt32(_verificationTimeout.Value),
-                    MaxResponseBytes = decimal.ToInt32(_verificationMaxResponse.Value)
-                },
-                Keepalive = new KeepaliveOptions
-                {
-                    Mode = SelectedEnum<L2tpKeepaliveMode>(_keepaliveMode),
-                    CustomIPv4 = _keepaliveCustomIPv4.Text.Trim(),
-                    IntervalSeconds = decimal.ToInt32(_keepaliveInterval.Value),
-                    TimeoutMilliseconds = decimal.ToInt32(_keepaliveTimeout.Value),
-                    FailureThreshold = decimal.ToInt32(_keepaliveFailures.Value)
-                },
-                Custom = new CustomL2tpOptions
-                {
-                    ServerAddress = _serverAddress.Text.Trim(),
-                    UserName = _userName.Text.Trim(),
-                    Domain = _domain.Text.Trim(),
-                    UseCurrentWindowsCredentials = useWindowsCredentials,
-                    ProtectedPassword = protectedPassword,
-                    IpsecAuthentication = ipsecAuth,
-                    ProtectedPreSharedKey = protectedPsk,
-                    Encryption = SelectedEnum<L2tpEncryptionMode>(_encryption),
-                    AllowPap = _allowPap.Checked,
-                    AllowChap = _allowChap.Checked,
-                    AllowMsChapV2 = _allowMsChapV2.Checked
-                }
-            };
-        }
+                PublicAddress = _publicAddress.Text.Trim(),
+                ProbeHost = _probeHost.Text.Trim(),
+                ProbePort = decimal.ToInt32(_probePort.Value),
+                ProbePath = _probePath.Text.Trim(),
+                TimeoutSeconds = decimal.ToInt32(_verificationTimeout.Value),
+                MaxResponseBytes = decimal.ToInt32(_verificationMaxResponse.Value)
+            },
+            Keepalive = new KeepaliveOptions
+            {
+                Mode = SelectedEnum<L2tpKeepaliveMode>(_keepaliveMode),
+                CustomIPv4 = _keepaliveCustomIPv4.Text.Trim(),
+                IntervalSeconds = decimal.ToInt32(_keepaliveInterval.Value),
+                TimeoutMilliseconds = decimal.ToInt32(_keepaliveTimeout.Value),
+                FailureThreshold = decimal.ToInt32(_keepaliveFailures.Value)
+            },
+            Custom = new CustomL2tpOptions
+            {
+                ServerAddress = _serverAddress.Text.Trim(),
+                UserName = _userName.Text.Trim(),
+                Domain = _domain.Text.Trim(),
+                UseCurrentWindowsCredentials = useWindowsCredentials,
+                ProtectedPassword = protectedPassword,
+                IpsecAuthentication = ipsecAuth,
+                ProtectedPreSharedKey = protectedPsk,
+                Encryption = SelectedEnum<L2tpEncryptionMode>(_encryption),
+                AllowPap = _allowPap.Checked,
+                AllowChap = _allowChap.Checked,
+                AllowMsChapV2 = _allowMsChapV2.Checked
+            }
+        };
     }
 
     internal static string ResolveProtectedSecret(
@@ -238,6 +248,16 @@ internal sealed class L2tpSettingsDialog : Form
 
     internal static int ClampNumericValue(int value, int minimum, int maximum) =>
         Math.Clamp(value, minimum, maximum);
+
+    private void ClearPlaintextSecrets()
+    {
+        // TextBox.Text values are immutable strings, so they cannot be zeroed in
+        // place. Clearing both controls immediately after the one DPAPI handoff (and
+        // again on every close path) releases the UI's long-lived references instead
+        // of retaining plaintext until MainForm disposes the dialog.
+        _password.Clear();
+        _preSharedKey.Clear();
+    }
 
     private static void SetNumericValue(NumericUpDown control, int value)
     {
