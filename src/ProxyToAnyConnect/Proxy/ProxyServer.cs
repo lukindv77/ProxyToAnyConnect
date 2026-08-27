@@ -531,21 +531,84 @@ internal sealed class ProxyServer
             throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
         }
 
-        var separator = authority.LastIndexOf(':');
-        if (separator < 0)
-        {
-            return (authority, defaultPort);
-        }
-
-        var host = authority[..separator];
-        if (string.IsNullOrWhiteSpace(host) ||
-            !int.TryParse(authority[(separator + 1)..], out var port) ||
-            port is < 1 or > 65535)
+        var separator = authority.IndexOf(':');
+        if (separator >= 0 && authority.IndexOf(':', separator + 1) >= 0)
         {
             throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
         }
 
-        return (host, port);
+        var host = separator < 0 ? authority : authority[..separator];
+        var port = defaultPort;
+        if (separator >= 0 && !TryParseConnectPort(authority.AsSpan(separator + 1), out port))
+        {
+            throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+        }
+
+        if (host.Length == 0)
+        {
+            throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+        }
+
+        foreach (var character in host)
+        {
+            if (character <= 0x20 || character == 0x7F ||
+                character == (char)0x5C ||
+                character is '@' or '/' or '?' or '#' or ':')
+            {
+                throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+            }
+        }
+
+        if (IPAddress.TryParse(host, out var literal))
+        {
+            if (literal.AddressFamily != AddressFamily.InterNetwork)
+            {
+                throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+            }
+
+            return (literal.ToString(), port);
+        }
+
+        try
+        {
+            return (L2tpDnsResolver.NormalizeDnsHostStrict(host), port);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            throw new InvalidDataException($"Invalid CONNECT target '{authority}'.", ex);
+        }
+    }
+
+    private static bool TryParseConnectPort(ReadOnlySpan<char> value, out int port)
+    {
+        port = 0;
+        if (value.IsEmpty)
+        {
+            return false;
+        }
+
+        var parsed = 0;
+        foreach (var character in value)
+        {
+            if (character < 0x30 || character > 0x39)
+            {
+                return false;
+            }
+
+            parsed = parsed * 10 + (character - 0x30);
+            if (parsed > 65535)
+            {
+                return false;
+            }
+        }
+
+        if (parsed == 0)
+        {
+            return false;
+        }
+
+        port = parsed;
+        return true;
     }
 
     private static Uri ParseAbsoluteHttpUri(string target)
