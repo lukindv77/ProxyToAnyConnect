@@ -827,18 +827,28 @@ internal sealed class ProxyServer
             }
 
             var requestLine = text.AsSpan(0, requestLineEnd);
-            Span<Range> requestParts = stackalloc Range[3];
-            var requestPartCount = requestLine.Split(
-                requestParts,
-                ' ',
-                StringSplitOptions.RemoveEmptyEntries);
-            if (requestPartCount != 3)
+            var firstSpace = requestLine.IndexOf(' ');
+            if (firstSpace <= 0 || firstSpace >= requestLine.Length - 1)
             {
                 throw new InvalidDataException("Invalid HTTP proxy request line.");
             }
 
-            var methodSpan = requestLine[requestParts[0]];
-            var versionSpan = requestLine[requestParts[2]];
+            var afterFirstSpace = requestLine[(firstSpace + 1)..];
+            var secondSpaceOffset = afterFirstSpace.IndexOf(' ');
+            if (secondSpaceOffset <= 0)
+            {
+                throw new InvalidDataException("Invalid HTTP proxy request line.");
+            }
+
+            var secondSpace = firstSpace + 1 + secondSpaceOffset;
+            var versionSpan = requestLine[(secondSpace + 1)..];
+            if (versionSpan.IsEmpty || versionSpan.IndexOf(' ') >= 0)
+            {
+                throw new InvalidDataException("Invalid HTTP proxy request line.");
+            }
+
+            var methodSpan = requestLine[..firstSpace];
+            var targetSpan = requestLine[(firstSpace + 1)..secondSpace];
             if (!IsValidHeaderName(methodSpan))
             {
                 throw new InvalidDataException("Invalid HTTP method token.");
@@ -851,7 +861,7 @@ internal sealed class ProxyServer
             }
 
             var method = methodSpan.ToString();
-            var target = requestLine[requestParts[1]].ToString();
+            var target = targetSpan.ToString();
             var version = versionSpan.ToString();
             var offset = requestLineEnd + 2;
 
