@@ -5,6 +5,8 @@ namespace ProxyToAnyConnect.SelfTests;
 
 internal static class WindowsVpnProfileInspectorLifetimeSelfTests
 {
+    private static readonly TimeSpan HelperStartupObservationTimeout = TimeSpan.FromSeconds(15);
+
     public static async Task<int> RunAsync()
     {
         if (!OperatingSystem.IsWindows())
@@ -55,7 +57,14 @@ internal static class WindowsVpnProfileInspectorLifetimeSelfTests
                 "exercise cancellation ownership",
                 cancellation.Token);
 
-            processIds = await WaitForProcessIdsAsync(pidPath, TimeSpan.FromSeconds(5));
+            // Hosted Windows images can have highly variable cold PowerShell/process
+            // startup latency. Give startup observation its own generous deadline, but
+            // do not weaken the actual ownership assertion below: once cancellation
+            // returns, every observed parent/child PID must already be gone.
+            processIds = await WaitForProcessIdsAsync(
+                pidPath,
+                inspection,
+                HelperStartupObservationTimeout);
             cancellation.Cancel();
 
             try
@@ -95,17 +104,22 @@ internal static class WindowsVpnProfileInspectorLifetimeSelfTests
         }
     }
 
-    private static async Task<int[]> WaitForProcessIdsAsync(string path, TimeSpan timeout)
+    private static async Task<int[]> WaitForProcessIdsAsync(
+        string path,
+        Task inspection,
+        TimeSpan timeout)
     {
-        using var cancellation = new CancellationTokenSource(timeout);
-        while (true)
+        var deadline = Stopwatch.GetTimestamp() +
+            (long)Math.Ceiling(timeout.TotalSeconds * Stopwatch.Frequency);
+        Exception? lastReadFailure = null;
+
+        while (Stopwatch.GetTimestamp() < deadline)
         {
-            cancellation.Token.ThrowIfCancellationRequested();
             try
             {
                 if (File.Exists(path))
                 {
-                    var lines = await File.ReadAllLinesAsync(path, cancellation.Token);
+                    var lines = await File.ReadAllLinesAsync(path);
                     var processIds = lines
                         .Select(line => int.TryParse(line.Trim(), out var processId) ? processId : 0)
                         .Where(processId => processId > 0)
@@ -116,13 +130,38 @@ internal static class WindowsVpnProfileInspectorLifetimeSelfTests
                     }
                 }
             }
-            catch (IOException)
+            catch (IOException ex)
             {
                 // Parent may still be atomically publishing the PID file.
+                lastReadFailure = ex;
             }
 
-            await Task.Delay(TimeSpan.FromMilliseconds(20), cancellation.Token);
+            if (inspection.IsCompleted)
+            {
+                try
+                {
+                    await inspection;
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException(
+                        "Windows VPN profile helper completed/faulted before publishing its parent/child PID evidence.",
+                        ex);
+                }
+
+                throw new InvalidOperationException(
+                    "Windows VPN profile helper completed before publishing its parent/child PID evidence.");
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(25));
         }
+
+        var diagnostic = lastReadFailure is null
+            ? string.Empty
+            : $" Last PID-file read error: {lastReadFailure.Message}";
+        throw new TimeoutException(
+            $"Windows VPN profile helper did not publish two process IDs within {timeout.TotalSeconds:F0} seconds. " +
+            $"PID file exists={File.Exists(path)}.{diagnostic}");
     }
 
     private static bool IsProcessAlive(int processId)
