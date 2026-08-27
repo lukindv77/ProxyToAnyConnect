@@ -38,9 +38,9 @@ internal static class DnsParsedResponseValueSelfTests
             if (timing.Ratio > MaxMedianSlowdownRatio)
             {
                 throw new InvalidOperationException(
-                    $"Value ParsedDnsResponse median was {timing.OptimizedMedianNs:F0} ns/op versus " +
-                    $"{timing.PredecessorMedianNs:F0} ns/op for the reference-record predecessor " +
-                    $"({timing.Ratio:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
+                    $"Value ParsedDnsResponse paired median ratio was {timing.Ratio:F2}x " +
+                    $"(representative medians {timing.OptimizedMedianNs:F0} vs " +
+                    $"{timing.PredecessorMedianNs:F0} ns/op, limit {MaxMedianSlowdownRatio:F2}x).");
             }
 
             Console.WriteLine(
@@ -48,7 +48,7 @@ internal static class DnsParsedResponseValueSelfTests
                 $"(alloc {optimizedBytes / (double)AllocationIterations:F0} vs " +
                 $"{predecessorBytes / (double)AllocationIterations:F0} bytes/result; " +
                 $"timing {timing.OptimizedMedianNs:F0} vs {timing.PredecessorMedianNs:F0} ns/op, " +
-                $"{timing.Ratio:F2}x)");
+                $"paired {timing.Ratio:F2}x)");
             return 0;
         }
         catch (Exception ex)
@@ -121,6 +121,7 @@ internal static class DnsParsedResponseValueSelfTests
     {
         var optimizedRounds = new double[TimingRounds];
         var predecessorRounds = new double[TimingRounds];
+        var ratioRounds = new double[TimingRounds];
         for (var round = 0; round < TimingRounds; round++)
         {
             if ((round & 1) == 0)
@@ -133,11 +134,14 @@ internal static class DnsParsedResponseValueSelfTests
                 predecessorRounds[round] = MeasureNanosecondsPerOperation(predecessor);
                 optimizedRounds[round] = MeasureNanosecondsPerOperation(optimized);
             }
+
+            ratioRounds[round] = optimizedRounds[round] / predecessorRounds[round];
         }
 
-        var optimizedMedian = Median(optimizedRounds);
-        var predecessorMedian = Median(predecessorRounds);
-        return new TimingResult(optimizedMedian, predecessorMedian, optimizedMedian / predecessorMedian);
+        return new TimingResult(
+            Median(optimizedRounds),
+            Median(predecessorRounds),
+            Median(ratioRounds));
     }
 
     private static double MeasureNanosecondsPerOperation(Action action)
