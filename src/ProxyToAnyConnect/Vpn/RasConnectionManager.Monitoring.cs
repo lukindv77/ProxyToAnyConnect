@@ -72,7 +72,13 @@ internal sealed partial class RasConnectionManager
 
         if (Interlocked.CompareExchange(ref _rasConnection, 0, handle) == handle)
         {
-            await _dialer.HangUpAndDrainAsync(handle);
+            // Claim this exact generation before native teardown. If RasHangUp or
+            // invalid-handle drain fails, the shared helper restores this same
+            // HRASCONN only when no newer generation occupies the slot. The monitor
+            // then faults before PBK release, leaving both resources owned for the
+            // next Disconnect/Connect cleanup attempt rather than permitting an
+            // overlapping replacement dial.
+            await HangUpClaimedRasHandleAsync(handle);
         }
 
         ReleaseEphemeralPhonebook(ephemeralPhonebook);
