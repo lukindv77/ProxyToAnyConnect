@@ -98,21 +98,49 @@ internal sealed partial class RasConnectionManager
             return;
         }
 
-        cancellation.Cancel();
+        Exception? cleanupFailure = null;
         try
         {
-            if (task is not null)
+            try
             {
-                await task;
+                cancellation.Cancel();
             }
-        }
-        catch (OperationCanceledException)
-        {
+            catch (Exception ex)
+            {
+                // A throwing token callback is secondary cleanup work. The exact
+                // monitor task still has to be joined and its CTS disposed before
+                // explicit disconnect can release the RAS generation.
+                CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "monitor-cancel");
+            }
+
+            try
+            {
+                if (task is not null)
+                {
+                    await task;
+                }
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "monitor-task");
+            }
         }
         finally
         {
-            cancellation.Dispose();
+            try
+            {
+                cancellation.Dispose();
+            }
+            catch (Exception ex)
+            {
+                CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "monitor-token");
+            }
         }
+
+        RethrowLifecycleCleanupFailure(cleanupFailure);
     }
 
     private async Task HangUpClaimedRasHandleAsync(nint handle)
