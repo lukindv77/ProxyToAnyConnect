@@ -216,9 +216,22 @@ internal static class ProxyConnectSetupSelfTests
             throw new InvalidDataException("Invalid HTTP proxy request line.");
         }
 
-        var method = requestLine[requestParts[0]].ToString();
+        var methodSpan = requestLine[requestParts[0]];
+        var versionSpan = requestLine[requestParts[2]];
+        if (!IsValidBaselineHeaderName(methodSpan))
+        {
+            throw new InvalidDataException("Invalid HTTP method token.");
+        }
+
+        if (!versionSpan.SequenceEqual("HTTP/1.0".AsSpan()) &&
+            !versionSpan.SequenceEqual("HTTP/1.1".AsSpan()))
+        {
+            throw new InvalidDataException("Unsupported HTTP request version.");
+        }
+
+        var method = methodSpan.ToString();
         var target = requestLine[requestParts[1]].ToString();
-        var version = requestLine[requestParts[2]].ToString();
+        var version = versionSpan.ToString();
         var headers = new List<BaselineHeaderLine>();
         var offset = requestLineEnd + 2;
         while (offset < text.Length)
