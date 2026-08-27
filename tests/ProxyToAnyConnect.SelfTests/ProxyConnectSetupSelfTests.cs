@@ -33,7 +33,7 @@ internal static class ProxyConnectSetupSelfTests
             {
                 throw new InvalidOperationException(
                     $"CONNECT syntax-only parse allocated {optimizedBytes} bytes versus " +
-                    $"{predecessorBytes} bytes for full header materialization.");
+                    $"{predecessorBytes} bytes for security-equivalent full header materialization.");
             }
 
             Action optimized = () => GC.KeepAlive(ProxyServer.ParsedProxyRequest.Parse(raw));
@@ -43,12 +43,12 @@ internal static class ProxyConnectSetupSelfTests
             {
                 throw new InvalidOperationException(
                     $"CONNECT syntax-only parse median was {timing.OptimizedMedianNs:F0} ns/op versus " +
-                    $"{timing.PredecessorMedianNs:F0} ns/op for full materialization " +
+                    $"{timing.PredecessorMedianNs:F0} ns/op for security-equivalent full materialization " +
                     $"({timing.Ratio:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
             }
 
             Console.WriteLine(
-                $"PASS: CONNECT header syntax-only parsing reduces setup cost " +
+                $"PASS: CONNECT header syntax-only parsing reduces setup cost against security-equivalent materialization " +
                 $"(alloc {optimizedBytes / (double)AllocationIterations:F0} vs " +
                 $"{predecessorBytes / (double)AllocationIterations:F0} bytes/request; " +
                 $"timing {timing.OptimizedMedianNs:F0} vs {timing.PredecessorMedianNs:F0} ns/op, " +
@@ -87,6 +87,12 @@ internal static class ProxyConnectSetupSelfTests
         AssertBothRejectMalformed(
             "CONNECT example.test:443 HTTP/1.1\r\n" +
             ": missing-name\r\n\r\n");
+        AssertBothRejectMalformed(
+            "CONNECT example.test:443 HTTP/1.1\r\n" +
+            "Bad Name: rejected\r\n\r\n");
+        AssertBothRejectMalformed(
+            "CONNECT example.test:443 HTTP/1.1\r\n" +
+            "X-Test: bad\0value\r\n\r\n");
     }
 
     private static void AssertBothRejectMalformed(string request)
@@ -185,8 +191,9 @@ internal static class ProxyConnectSetupSelfTests
             "X-Trace-Four: delta\r\n" +
             "Cookie: a=1; b=2; c=3\r\n\r\n");
 
-    // Test-only copy of the production text-span parser immediately before the
-    // CONNECT-specific syntax-only path. It materializes every header name/value.
+    // Test-only semantic-equivalent full-materialization comparator. It performs
+    // the same header-name and field-value validation as production before
+    // materializing every header name/value, so the timing gate compares equal work.
     private static BaselineRequest CurrentFullMaterializationParse(ReadOnlySpan<byte> headerBytes)
     {
         var text = Encoding.Latin1.GetString(headerBytes);
@@ -228,18 +235,63 @@ internal static class ProxyConnectSetupSelfTests
 
             var line = remaining[..lineEnd];
             var separator = line.IndexOf(':');
-            if (separator <= 0)
+            if (separator <= 0 || char.IsWhiteSpace(line[separator - 1]))
             {
                 throw new InvalidDataException("Invalid HTTP header line.");
             }
 
+            var name = line[..separator];
+            if (!IsValidBaselineHeaderName(name))
+            {
+                throw new InvalidDataException("Invalid HTTP header name.");
+            }
+
+            var rawValue = line[(separator + 1)..];
+            if (!IsValidBaselineHeaderValue(rawValue))
+            {
+                throw new InvalidDataException("Invalid HTTP header field value.");
+            }
+
             headers.Add(new BaselineHeaderLine(
-                line[..separator].Trim().ToString(),
-                line[(separator + 1)..].Trim().ToString()));
+                name.ToString(),
+                rawValue.Trim().ToString()));
             offset += lineEnd + 2;
         }
 
         return new BaselineRequest(method, target, version, headers);
+    }
+
+    private static bool IsValidBaselineHeaderName(ReadOnlySpan<char> name)
+    {
+        if (name.IsEmpty)
+        {
+            return false;
+        }
+
+        foreach (var character in name)
+        {
+            if (!((uint)(character - '0') <= 9 ||
+                  (uint)((character | 0x20) - 'a') <= 25 ||
+                  character is '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsValidBaselineHeaderValue(ReadOnlySpan<char> value)
+    {
+        foreach (var character in value)
+        {
+            if ((character < 0x20 && character != '\t') || character == 0x7F)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private readonly record struct TimingResult(
