@@ -719,6 +719,11 @@ internal sealed class ProxyServer
                     throw new InvalidDataException("Invalid HTTP header field value.");
                 }
 
+                if (name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                {
+                    ValidateConnectionOptions(rawValue);
+                }
+
                 var value = rawValue.Trim();
                 var header = new HeaderLine(name.ToString(), value.ToString());
                 headers.Add(header);
@@ -825,7 +830,42 @@ internal sealed class ProxyServer
             return true;
         }
 
-        private static void ValidateHeaderLines(string text, int offset)
+        private static void ValidateConnectionOptions(ReadOnlySpan<char> value)
+        {
+            var segmentStart = 0;
+            while (segmentStart <= value.Length)
+            {
+                var remaining = value[segmentStart..];
+                var comma = remaining.IndexOf(',');
+                var segment = comma < 0 ? remaining : remaining[..comma];
+                var trimStart = 0;
+                while (trimStart < segment.Length && segment[trimStart] is ' ' or '\t')
+                {
+                    trimStart++;
+                }
+
+                var trimEnd = segment.Length;
+                while (trimEnd > trimStart && segment[trimEnd - 1] is ' ' or '\t')
+                {
+                    trimEnd--;
+                }
+
+                var option = segment[trimStart..trimEnd];
+                if (!IsValidHeaderName(option))
+                {
+                    throw new InvalidDataException("Invalid HTTP Connection option.");
+                }
+
+                if (comma < 0)
+                {
+                    return;
+                }
+
+                segmentStart += comma + 1;
+            }
+        }
+
+    private static void ValidateHeaderLines(string text, int offset)
         {
             var lineHasName = false;
             var seenColon = false;
