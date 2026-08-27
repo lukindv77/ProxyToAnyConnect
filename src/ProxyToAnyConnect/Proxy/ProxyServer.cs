@@ -243,11 +243,11 @@ internal sealed class ProxyServer
     {
         EnsureInitialBodyRemainderFits(request.ContentLength, remainder.Length);
 
-        var uri = ParseAbsoluteHttpUri(request.Target);
-        var host = uri.IdnHost;
-        var port = uri.IsDefaultPort ? 80 : uri.Port;
-        var pathAndQuery = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
-        var authority = BuildHttpHostAuthority(uri);
+        var target = ParseHttpTarget(request.Target);
+        var host = target.Host;
+        var port = target.Port;
+        var pathAndQuery = target.PathAndQuery;
+        var authority = target.Authority;
 
         await using var upstream = await _socketFactory.ConnectAsync(host, port, cancellationToken);
         await using var upstreamStream = new NetworkStream(upstream.Socket, ownsSocket: false);
@@ -593,7 +593,15 @@ internal sealed class ProxyServer
         return uri;
     }
 
-    internal static string BuildHttpHostAuthority(Uri uri)
+    internal static (string Host, int Port, string Authority, string PathAndQuery) ParseHttpTarget(string target)
+    {
+        var uri = ParseAbsoluteHttpUri(target);
+        var (host, port, authority) = CanonicalizeHttpUri(uri);
+        var pathAndQuery = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+        return (host, port, authority, pathAndQuery);
+    }
+
+    private static (string Host, int Port, string Authority) CanonicalizeHttpUri(Uri uri)
     {
         ArgumentNullException.ThrowIfNull(uri);
         if (!uri.IsAbsoluteUri ||
@@ -608,9 +616,36 @@ internal sealed class ProxyServer
             throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
         }
 
-        var host = uri.IdnHost;
-        return uri.IsDefaultPort ? host : $"{host}:{uri.Port}";
+        string host;
+        var uriHost = uri.IdnHost;
+        if (IPAddress.TryParse(uriHost, out var literal))
+        {
+            if (literal.AddressFamily != AddressFamily.InterNetwork)
+            {
+                throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+            }
+
+            host = literal.ToString();
+        }
+        else
+        {
+            try
+            {
+                host = L2tpDnsResolver.NormalizeDnsHostStrict(uriHost);
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+            {
+                throw new InvalidDataException($"Invalid plain HTTP target host '{uri.Host}'.", ex);
+            }
+        }
+
+        var port = uri.IsDefaultPort ? 80 : uri.Port;
+        var authority = port == 80 ? host : $"{host}:{port}";
+        return (host, port, authority);
     }
+
+    internal static string BuildHttpHostAuthority(Uri uri) =>
+        CanonicalizeHttpUri(uri).Authority;
 
     private static async Task TryWriteErrorAsync(
         TcpClient client,
