@@ -1,0 +1,58 @@
+name: dev-issue28-30-clean-rebuild
+
+on:
+  push:
+    branches: [ dev/issue28-30-clean-rebuild ]
+    paths:
+      - '.github/workflows/dev-issue28-30-clean-rebuild.yml'
+      - '.github/scripts/dev-issue28-30.py'
+      - 'tests/ProxyToAnyConnect.SelfTests/ProxyHttpCanonicalHostSelfTests.cs'
+      - 'tests/ProxyToAnyConnect.SelfTests/ProxyRoutingHostCanonicalizationSelfTests.cs'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply shared routing-host canonicalization
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python .github/scripts/dev-issue28-30.py
+          git -c core.whitespace=cr-at-eol diff --check
+          $changed = @(git diff --name-only)
+          $expected = @(
+            'src/ProxyToAnyConnect/Proxy/ProxyServer.cs',
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          )
+          if ($changed.Count -ne $expected.Count) {
+            throw "Unexpected #28/#30 patch surface: $($changed -join ', ')"
+          }
+          foreach ($path in $expected) {
+            if ($changed -notcontains $path) { throw "#28/#30 omitted expected path: $path" }
+          }
+      - name: Run full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated routing-host sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs tests/ProxyToAnyConnect.SelfTests/ProxyHttpCanonicalHostSelfTests.cs tests/ProxyToAnyConnect.SelfTests/ProxyRoutingHostCanonicalizationSelfTests.cs
+          git commit -m 'proxy: canonicalize routing hosts before outbound ownership'
+          git push origin HEAD:refs/heads/dev/issue28-30-clean-rebuild
