@@ -12,14 +12,15 @@ internal static class CoordinatorCleanupFailureSelfTests
         {
             await AllOwnersDisposeAfterEarlierFailureAsync();
             await IndependentOwnersOverlapAndPreserveInputOrderedFailuresAsync();
+            await IndependentProxyStartsOverlapAndIsolateFailureAsync();
             await LifetimeCancellationFaultStillDisposesNestedOwnersAsync();
             Console.WriteLine(
-                "PASS: coordinator cleanup overlaps independent owners, preserves deterministic failure ordering and drains nested ownership through cancellation callback faults");
+                "PASS: coordinator starts and cleanup overlap independent owners, preserve isolated/pending failures and deterministic cleanup ordering");
             return 0;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"FAIL: coordinator cleanup-failure regression: {ex}");
+            Console.Error.WriteLine($"FAIL: coordinator cleanup/start-independence regression: {ex}");
             return 1;
         }
     }
@@ -105,6 +106,62 @@ internal static class CoordinatorCleanupFailureSelfTests
         }
     }
 
+    private static async Task IndependentProxyStartsOverlapAndIsolateFailureAsync()
+    {
+        var options = CreateIndependentStartOptions();
+        var coordinator = new ProxyRuntimeCoordinator(options);
+        var proxyMap = GetPrivateField<Dictionary<string, ProxyInstanceRuntime>>(coordinator, "_proxyById");
+        var oldRuntimes = proxyMap.Values.ToArray();
+        foreach (var old in oldRuntimes)
+        {
+            await old.DisposeAsync();
+        }
+
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstFactory = new BlockingStartFactory(firstEntered, release, fail: true);
+        var secondFactory = new BlockingStartFactory(secondEntered, release, fail: false);
+
+        proxyMap["proxy-start-a"] = new ProxyInstanceRuntime(options.Proxies[0], firstFactory);
+        proxyMap["proxy-start-b"] = new ProxyInstanceRuntime(options.Proxies[1], secondFactory);
+
+        var startTask = coordinator.StartEnabledAsync();
+        await Task.WhenAll(firstEntered.Task, secondEntered.Task)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+        if (startTask.IsCompleted)
+        {
+            throw new InvalidOperationException(
+                "Coordinator startup completed before blocked independent start generations were released.");
+        }
+
+        release.TrySetResult();
+        await startTask.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var snapshots = coordinator.GetProxySnapshots().ToDictionary(item => item.Id, StringComparer.OrdinalIgnoreCase);
+        if (snapshots["proxy-start-a"].State != ProxyInstanceState.Error ||
+            snapshots["proxy-start-b"].State != ProxyInstanceState.Running)
+        {
+            throw new InvalidOperationException(
+                $"Independent start failure was not isolated: a={snapshots["proxy-start-a"].State}, b={snapshots["proxy-start-b"].State}.");
+        }
+
+        var pending = GetPrivateField<HashSet<string>>(coordinator, "_pendingStartProxyIds");
+        if (!pending.Contains("proxy-start-a") || pending.Contains("proxy-start-b"))
+        {
+            throw new InvalidOperationException(
+                "Coordinator did not retain only the failed desired start for later same-config reconciliation.");
+        }
+
+        if (firstFactory.CreateCount != 1 || secondFactory.CreateCount != 1)
+        {
+            throw new InvalidOperationException(
+                "Independent start generations were not attempted exactly once.");
+        }
+
+        await coordinator.DisposeAsync();
+    }
+
     private static async Task LifetimeCancellationFaultStillDisposesNestedOwnersAsync()
     {
         var coordinator = new ProxyRuntimeCoordinator(CreateOptions());
@@ -147,8 +204,6 @@ internal static class CoordinatorCleanupFailureSelfTests
                 "Coordinator lifetime cancellation callback fault prevented parent or nested VPN lifetime disposal.");
         }
 
-        // The first call reported the callback defect but completed all independent
-        // ownership release. Repeated coordinator disposal is therefore a no-op.
         await coordinator.DisposeAsync();
     }
 
@@ -157,50 +212,75 @@ internal static class CoordinatorCleanupFailureSelfTests
         {
             Proxies =
             [
-                new ProxyOptions
-                {
-                    Id = "proxy-coordinator-cleanup",
-                    Name = "Coordinator cleanup proxy",
-                    Enabled = false,
-                    ListenAddress = "127.0.0.1",
-                    ListenPort = 18321,
-                    VpnConnectionId = "vpn-coordinator-cleanup",
-                    MaxConcurrentConnections = 8,
-                    MaxHeaderBytes = 8192,
-                    ClientHeaderTimeoutSeconds = 5,
-                    OutboundConnectTimeoutSeconds = 5,
-                    DnsTimeoutMilliseconds = 1000
-                }
+                CreateProxy("proxy-coordinator-cleanup", "vpn-coordinator-cleanup", 18321, enabled: false)
             ],
             VpnConnections =
             [
-                new L2tpOptions
-                {
-                    Id = "vpn-coordinator-cleanup",
-                    Name = "Coordinator cleanup VPN",
-                    Shared = false,
-                    Mode = L2tpConnectionMode.ExistingWindowsProfile,
-                    EntryName = "SelfTest-vpn-coordinator-cleanup",
-                    MonitorIntervalMilliseconds = 1000,
-                    RouteMonitorIntervalMilliseconds = 5000,
-                    ReconnectCooldownMilliseconds = 1000,
-                    Verification = new VerificationOptions
-                    {
-                        PublicAddress = "vpn.example.com",
-                        ProbeHost = "api.ipify.org",
-                        ProbePort = 443,
-                        ProbePath = "/",
-                        TimeoutSeconds = 5
-                    },
-                    Keepalive = new KeepaliveOptions
-                    {
-                        Mode = L2tpKeepaliveMode.Off,
-                        IntervalSeconds = 10,
-                        TimeoutMilliseconds = 1000,
-                        FailureThreshold = 3
-                    }
-                }
+                CreateVpn("vpn-coordinator-cleanup")
             ]
+        };
+
+    private static AppOptions CreateIndependentStartOptions() =>
+        new()
+        {
+            Proxies =
+            [
+                CreateProxy("proxy-start-a", "vpn-start-a", 18322, enabled: true),
+                CreateProxy("proxy-start-b", "vpn-start-b", 18323, enabled: true)
+            ],
+            VpnConnections =
+            [
+                CreateVpn("vpn-start-a"),
+                CreateVpn("vpn-start-b")
+            ]
+        };
+
+    private static ProxyOptions CreateProxy(
+        string id,
+        string vpnId,
+        int port,
+        bool enabled) =>
+        new()
+        {
+            Id = id,
+            Name = id,
+            Enabled = enabled,
+            ListenAddress = "127.0.0.1",
+            ListenPort = port,
+            VpnConnectionId = vpnId,
+            MaxConcurrentConnections = 8,
+            MaxHeaderBytes = 8192,
+            ClientHeaderTimeoutSeconds = 5,
+            OutboundConnectTimeoutSeconds = 5,
+            DnsTimeoutMilliseconds = 1000
+        };
+
+    private static L2tpOptions CreateVpn(string id) =>
+        new()
+        {
+            Id = id,
+            Name = id,
+            Shared = false,
+            Mode = L2tpConnectionMode.ExistingWindowsProfile,
+            EntryName = $"SelfTest-{id}",
+            MonitorIntervalMilliseconds = 1000,
+            RouteMonitorIntervalMilliseconds = 5000,
+            ReconnectCooldownMilliseconds = 1000,
+            Verification = new VerificationOptions
+            {
+                PublicAddress = "vpn.example.com",
+                ProbeHost = "api.ipify.org",
+                ProbePort = 443,
+                ProbePath = "/",
+                TimeoutSeconds = 5
+            },
+            Keepalive = new KeepaliveOptions
+            {
+                Mode = L2tpKeepaliveMode.Off,
+                IntervalSeconds = 10,
+                TimeoutMilliseconds = 1000,
+                FailureThreshold = 3
+            }
         };
 
     private static T GetPrivateField<T>(object owner, string fieldName)
@@ -229,6 +309,67 @@ internal static class CoordinatorCleanupFailureSelfTests
         {
             return true;
         }
+    }
+
+    private sealed class BlockingStartFactory : IProxyInstanceStartFactory
+    {
+        private readonly TaskCompletionSource _entered;
+        private readonly TaskCompletionSource _release;
+        private readonly bool _fail;
+        private int _createCount;
+
+        public BlockingStartFactory(
+            TaskCompletionSource entered,
+            TaskCompletionSource release,
+            bool fail)
+        {
+            _entered = entered;
+            _release = release;
+            _fail = fail;
+        }
+
+        public int CreateCount => Volatile.Read(ref _createCount);
+
+        public async Task<ProxyStartAttempt> CreateAsync(
+            ProxyOptions options,
+            ProxyRuntimeMetrics metrics,
+            CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _createCount);
+            _entered.TrySetResult();
+            await _release.Task.WaitAsync(cancellationToken);
+            if (_fail)
+            {
+                throw new SyntheticCleanupException($"Synthetic start failure for {options.Id}");
+            }
+
+            return new ProxyStartAttempt(new NoopLease(), new BlockingProxyServer());
+        }
+    }
+
+    private sealed class BlockingProxyServer : IProxyServerLifetime
+    {
+        public async Task RunAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+            }
+        }
+
+        public Task WaitUntilListeningAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class NoopLease : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class BlockingDisposable : IAsyncDisposable
