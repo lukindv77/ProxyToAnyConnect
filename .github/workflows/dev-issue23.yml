@@ -1,0 +1,138 @@
+name: dev-issue23
+
+on:
+  push:
+    branches: [ dev/issue23-header-values ]
+    paths:
+      - '.github/workflows/dev-issue23.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact dev head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Apply exact parser hardening and run aggregate tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = 'src/ProxyToAnyConnect/Proxy/ProxyServer.cs'
+          $runner = 'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          if ((git hash-object $source).Trim() -ne '16faba550f7e80f3561278bfa7ff4a7b42a33b70') {
+            throw 'ProxyServer.cs no longer matches the audited issue #23 source blob.'
+          }
+          if ((git hash-object $runner).Trim() -ne '1d111f72443818eb50f6ae3f5d58b20e2f9ca520') {
+            throw 'CombinedTestRunner.cs no longer matches the audited issue #23 runner blob.'
+          }
+
+          @'
+          from pathlib import Path
+
+          source = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = source.read_text(encoding='utf-8')
+
+          old_value = '                var value = line[(separator + 1)..].Trim();\n                var header = new HeaderLine(name.ToString(), value.ToString());'
+          new_value = '''                var rawValue = line[(separator + 1)..];
+                          if (!IsValidHeaderValue(rawValue))
+                          {
+                              throw new InvalidDataException("Invalid HTTP header field value.");
+                          }
+
+                          var value = rawValue.Trim();
+                          var header = new HeaderLine(name.ToString(), value.ToString());'''
+          if text.count(old_value) != 1:
+              raise SystemExit(f'expected one ordinary field-value parse site, got {text.count(old_value)}')
+          text = text.replace(old_value, new_value)
+
+          validate_start = text.index('        private static void ValidateHeaderLines(string text, int offset)\n')
+          validate_end = text.index('        public byte[] BuildOriginHeader(string pathAndQuery)\n', validate_start)
+          replacement = '''        private static bool IsValidHeaderValue(ReadOnlySpan<char> value)
+                  {
+                      foreach (var character in value)
+                      {
+                          if ((character < 0x20 && character != '\\t') || character == 0x7F)
+                          {
+                              return false;
+                          }
+                      }
+
+                      return true;
+                  }
+
+                  private static void ValidateHeaderLines(string text, int offset)
+                  {
+                      while (offset < text.Length)
+                      {
+                          var remaining = text.AsSpan(offset);
+                          var lineEnd = remaining.IndexOf("\\r\\n".AsSpan());
+                          if (lineEnd < 0)
+                          {
+                              throw new InvalidDataException("Invalid HTTP header line.");
+                          }
+
+                          if (lineEnd == 0)
+                          {
+                              return;
+                          }
+
+                          var line = remaining[..lineEnd];
+                          var separator = line.IndexOf(':');
+                          if (separator <= 0 || char.IsWhiteSpace(line[separator - 1]))
+                          {
+                              throw new InvalidDataException("Invalid HTTP header line.");
+                          }
+
+                          var name = line[..separator];
+                          if (!IsValidHeaderName(name))
+                          {
+                              throw new InvalidDataException("Invalid HTTP header name.");
+                          }
+
+                          if (!IsValidHeaderValue(line[(separator + 1)..]))
+                          {
+                              throw new InvalidDataException("Invalid HTTP header field value.");
+                          }
+
+                          offset += lineEnd + 2;
+                      }
+                  }
+
+          '''
+          text = text[:validate_start] + replacement + text[validate_end:]
+          text = text.replace('               ": "u8.CopyTo(destination[written..]);', '                ": "u8.CopyTo(destination[written..]);')
+          source.write_text(text, encoding='utf-8', newline='')
+
+          runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
+          runner_text = runner.read_text(encoding='utf-8')
+          anchor = '        await RunAsync(nameof(ProxyHttpHostAuthoritySelfTests), ProxyHttpHostAuthoritySelfTests.RunAsync);\n'
+          addition = anchor + '        await RunAsync(nameof(ProxyHttpHeaderValueSelfTests), ProxyHttpHeaderValueSelfTests.RunAsync);\n'
+          if runner_text.count(anchor) != 1:
+              raise SystemExit(f'expected one Host-authority runner anchor, got {runner_text.count(anchor)}')
+          runner.write_text(runner_text.replace(anchor, addition), encoding='utf-8', newline='')
+          '@ | python -
+
+          git diff --check
+          $changed = @(git diff --name-only)
+          $expected = @($source, $runner)
+          if ($changed.Count -ne 2 -or @($changed | Where-Object { $_ -notin $expected }).Count -ne 0) {
+            throw "Unexpected parser patch result: $($changed -join ', ')"
+          }
+
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add $source $runner
+          git commit -m 'proxy: reject HTTP field-value control characters'
+          git push origin HEAD:refs/heads/dev/issue23-header-values
