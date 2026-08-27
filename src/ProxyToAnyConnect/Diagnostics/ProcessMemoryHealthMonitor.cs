@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
+using ProxyToAnyConnect.Vpn;
 
 namespace ProxyToAnyConnect.Diagnostics;
 
@@ -13,6 +15,7 @@ internal sealed record ProcessMemorySnapshot(
     int Gen0Collections,
     int Gen1Collections,
     int Gen2Collections,
+    int RasCallbackRootCount,
     int HandleCount,
     int ThreadCount);
 
@@ -59,6 +62,7 @@ internal sealed class ProcessMemoryHealthMonitor : IAsyncDisposable
             GC.CollectionCount(0),
             GC.CollectionCount(1),
             GC.CollectionCount(2),
+            WindowsRasDialNative.ActiveCallbackRootCount,
             process.HandleCount,
             process.Threads.Count);
     }
@@ -104,6 +108,7 @@ internal sealed class ProcessMemoryHealthMonitor : IAsyncDisposable
                 snapshot.Gen0Collections,
                 snapshot.Gen1Collections,
                 snapshot.Gen2Collections,
+                snapshot.RasCallbackRootCount,
                 snapshot.HandleCount,
                 snapshot.ThreadCount
             });
@@ -116,14 +121,57 @@ internal sealed class ProcessMemoryHealthMonitor : IAsyncDisposable
             return;
         }
 
-        _shutdown.Cancel();
+        Exception? cleanupFailure = null;
         try
         {
-            await _runTask;
+            try
+            {
+                _shutdown.Cancel();
+            }
+            catch (Exception ex)
+            {
+                cleanupFailure = ex;
+            }
+
+            try
+            {
+                await _runTask;
+            }
+            catch (Exception ex)
+            {
+                CaptureCleanupFailure(ref cleanupFailure, ex, "worker-drain");
+            }
         }
         finally
         {
-            _shutdown.Dispose();
+            try
+            {
+                _shutdown.Dispose();
+            }
+            catch (Exception ex)
+            {
+                CaptureCleanupFailure(ref cleanupFailure, ex, "shutdown-token");
+            }
         }
+
+        if (cleanupFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+        }
+    }
+
+    private static void CaptureCleanupFailure(
+        ref Exception? primaryFailure,
+        Exception failure,
+        string phase)
+    {
+        if (primaryFailure is null)
+        {
+            primaryFailure = failure;
+            return;
+        }
+
+        primaryFailure.Data[$"ProcessMemoryCleanup:{phase}"] =
+            $"{failure.GetType().FullName}: {failure.Message}";
     }
 }
