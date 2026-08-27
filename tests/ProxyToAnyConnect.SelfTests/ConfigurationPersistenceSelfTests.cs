@@ -15,11 +15,12 @@ internal static class ConfigurationPersistenceSelfTests
         try
         {
             await SuccessfulSavePublishesCompleteJsonAsync(root);
+            await CustomEphemeralRoundTripPreservesSchemaAsync(root);
             await PreCancelledSavePreservesPublishedFileAsync(root);
             await PublicationFailureCleansUniqueTemporaryFileAsync(root);
 
             Console.WriteLine(
-                "PASS: configuration persistence publishes complete files and cleans cancelled/failed save ownership");
+                "PASS: configuration persistence publishes complete Existing/CustomEphemeral files and cleans cancelled/failed save ownership");
             return 0;
         }
         catch (Exception ex)
@@ -42,7 +43,7 @@ internal static class ConfigurationPersistenceSelfTests
     private static async Task SuccessfulSavePublishesCompleteJsonAsync(string root)
     {
         var path = Path.Combine(root, "successful.json");
-        var options = CreateOptions("Successful persistence");
+        var options = CreateExistingProfileOptions("Successful persistence");
 
         await options.SaveAsync(path, CancellationToken.None);
         var loaded = await AppOptions.LoadAsync(path, CancellationToken.None);
@@ -53,6 +54,77 @@ internal static class ConfigurationPersistenceSelfTests
         }
 
         AssertNoTemporarySiblings(root, Path.GetFileName(path), "successful save");
+    }
+
+    private static async Task CustomEphemeralRoundTripPreservesSchemaAsync(string root)
+    {
+        var path = Path.Combine(root, "custom-ephemeral.json");
+        var options = new AppOptions
+        {
+            Proxies =
+            [
+                new ProxyOptions
+                {
+                    Id = "proxy-custom",
+                    Name = "Custom proxy",
+                    Enabled = false,
+                    ListenAddress = "127.0.0.1",
+                    ListenPort = 18081,
+                    VpnConnectionId = "vpn-custom"
+                }
+            ],
+            VpnConnections =
+            [
+                new L2tpOptions
+                {
+                    Id = "vpn-custom",
+                    Name = "Custom VPN",
+                    Mode = L2tpConnectionMode.CustomEphemeral,
+                    Verification = new VerificationOptions
+                    {
+                        PublicAddress = "vpn.example.com"
+                    },
+                    Custom = new CustomL2tpOptions
+                    {
+                        ServerAddress = "l2tp.example.com",
+                        UserName = "self-test-user",
+                        Domain = "SELFTEST",
+                        UseCurrentWindowsCredentials = false,
+                        ProtectedPassword = "protected-password-carrier",
+                        IpsecAuthentication = L2tpIpsecAuthentication.PreSharedKey,
+                        ProtectedPreSharedKey = "protected-psk-carrier",
+                        Encryption = L2tpEncryptionMode.Maximum,
+                        AllowPap = true,
+                        AllowChap = true,
+                        AllowMsChapV2 = false
+                    }
+                }
+            ]
+        };
+
+        await options.SaveAsync(path, CancellationToken.None);
+        var loaded = await AppOptions.LoadAsync(path, CancellationToken.None);
+        var vpn = loaded.VpnConnections.Single();
+        var custom = vpn.Custom;
+
+        if (vpn.Mode != L2tpConnectionMode.CustomEphemeral ||
+            custom.ServerAddress != "l2tp.example.com" ||
+            custom.UserName != "self-test-user" ||
+            custom.Domain != "SELFTEST" ||
+            custom.UseCurrentWindowsCredentials ||
+            custom.ProtectedPassword != "protected-password-carrier" ||
+            custom.IpsecAuthentication != L2tpIpsecAuthentication.PreSharedKey ||
+            custom.ProtectedPreSharedKey != "protected-psk-carrier" ||
+            custom.Encryption != L2tpEncryptionMode.Maximum ||
+            !custom.AllowPap ||
+            !custom.AllowChap ||
+            custom.AllowMsChapV2)
+        {
+            throw new InvalidOperationException(
+                "CustomEphemeral configuration schema changed or lost fields during durable round-trip.");
+        }
+
+        AssertNoTemporarySiblings(root, Path.GetFileName(path), "CustomEphemeral save");
     }
 
     private static async Task PreCancelledSavePreservesPublishedFileAsync(string root)
@@ -66,7 +138,7 @@ internal static class ConfigurationPersistenceSelfTests
 
         try
         {
-            await CreateOptions("Cancelled persistence").SaveAsync(path, cancellation.Token);
+            await CreateExistingProfileOptions("Cancelled persistence").SaveAsync(path, cancellation.Token);
             throw new InvalidOperationException("Pre-cancelled configuration save unexpectedly completed.");
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
@@ -90,7 +162,7 @@ internal static class ConfigurationPersistenceSelfTests
 
         try
         {
-            await CreateOptions("Failed publication").SaveAsync(targetDirectory, CancellationToken.None);
+            await CreateExistingProfileOptions("Failed publication").SaveAsync(targetDirectory, CancellationToken.None);
             throw new InvalidOperationException(
                 "Configuration save unexpectedly replaced a directory with the JSON file.");
         }
@@ -111,13 +183,36 @@ internal static class ConfigurationPersistenceSelfTests
         AssertNoTemporarySiblings(root, Path.GetFileName(targetDirectory), "failed publication");
     }
 
-    private static AppOptions CreateOptions(string proxyName)
-    {
-        var options = new AppOptions();
-        options.Proxies[0].Name = proxyName;
-        options.Proxies[0].Enabled = false;
-        return options;
-    }
+    private static AppOptions CreateExistingProfileOptions(string proxyName) =>
+        new()
+        {
+            Proxies =
+            [
+                new ProxyOptions
+                {
+                    Id = "proxy-existing",
+                    Name = proxyName,
+                    Enabled = false,
+                    ListenAddress = "127.0.0.1",
+                    ListenPort = 18080,
+                    VpnConnectionId = "vpn-existing"
+                }
+            ],
+            VpnConnections =
+            [
+                new L2tpOptions
+                {
+                    Id = "vpn-existing",
+                    Name = "Existing VPN",
+                    Mode = L2tpConnectionMode.ExistingWindowsProfile,
+                    EntryName = "SelfTest-L2TP",
+                    Verification = new VerificationOptions
+                    {
+                        PublicAddress = "vpn.example.com"
+                    }
+                }
+            ]
+        };
 
     private static void AssertNoTemporarySiblings(string root, string fileName, string phase)
     {
@@ -126,8 +221,7 @@ internal static class ConfigurationPersistenceSelfTests
         if (leftovers.Length != 0)
         {
             throw new InvalidOperationException(
-                $"{phase}: configuration save left {leftovers.Length} owned temporary file(s)."
-            );
+                $"{phase}: configuration save left {leftovers.Length} owned temporary file(s).");
         }
     }
 }
