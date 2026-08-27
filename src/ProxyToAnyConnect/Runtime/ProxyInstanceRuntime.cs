@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
 
@@ -181,56 +182,49 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         Task? observerToJoin = null;
+        Exception? cleanupFailure = null;
+        var performedShutdown = false;
+
         await _gate.WaitAsync(cancellationToken);
         try
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-            if (State == ProxyInstanceState.Paused && _lease is null)
+            if (State == ProxyInstanceState.Paused &&
+                _lease is null &&
+                _runTask is null &&
+                _runCancellation is null)
             {
                 observerToJoin = Interlocked.Exchange(ref _observerTask, null);
             }
             else
             {
+                performedShutdown = true;
                 SetState(ProxyInstanceState.Stopping);
-                unchecked { _generation++; }
 
-                var cancellation = _runCancellation;
-                var runTask = _runTask;
-                var lease = _lease;
+                var stopResult = await StopPublishedOwnershipLockedAsync();
+                observerToJoin = stopResult.Observer;
+                cleanupFailure = stopResult.CleanupFailure;
 
-                _runCancellation = null;
-                _runTask = null;
-                _lease = null;
-                observerToJoin = Interlocked.Exchange(ref _observerTask, null);
-
-                cancellation?.Cancel();
-                if (runTask is not null)
+                if (cleanupFailure is null)
                 {
-                    try
-                    {
-                        await runTask.WaitAsync(cancellationToken);
-                    }
-                    catch (OperationCanceledException) when (cancellation?.IsCancellationRequested == true)
-                    {
-                    }
-                    catch (Exception ex) when (ex is IOException or System.Net.Sockets.SocketException)
-                    {
-                        System.Diagnostics.Debug.WriteLine(ex);
-                    }
+                    Volatile.Write(ref _lastError, null);
+                    SetState(ProxyInstanceState.Paused);
+                    AppLog.Info(
+                        "proxy.paused",
+                        "Proxy listener was paused and its L2TP lease released after exact run drain.",
+                        new { ProxyId = _options.Id, ProxyName = _options.Name });
                 }
-
-                cancellation?.Dispose();
-                if (lease is not null)
+                else
                 {
-                    await lease.DisposeAsync();
+                    Volatile.Write(ref _lastError, cleanupFailure.Message);
+                    SetState(ProxyInstanceState.Error);
+                    AppLog.Error(
+                        "proxy.pause.cleanup_failed",
+                        "Proxy listener stopped, but one or more shutdown ownership releases failed.",
+                        cleanupFailure,
+                        new { ProxyId = _options.Id, ProxyName = _options.Name });
                 }
-
-                SetState(ProxyInstanceState.Paused);
-                AppLog.Info(
-                    "proxy.paused",
-                    "Proxy listener was paused and its L2TP lease released.",
-                    new { ProxyId = _options.Id, ProxyName = _options.Name });
             }
         }
         finally
@@ -239,6 +233,21 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
         }
 
         await JoinObserverAsync(observerToJoin);
+
+        if (performedShutdown && cancellationToken.IsCancellationRequested)
+        {
+            if (cleanupFailure is not null)
+            {
+                throw new OperationCanceledException(
+                    "Proxy pause was cancelled after transactional shutdown completed with a cleanup defect.",
+                    cleanupFailure,
+                    cancellationToken);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
+        RethrowStopFailure(cleanupFailure);
     }
 
     public ProxyRuntimeSnapshot Snapshot()
@@ -331,6 +340,104 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
         }
     }
 
+    private async Task<StopOwnershipResult> StopPublishedOwnershipLockedAsync()
+    {
+        unchecked { _generation++; }
+
+        var cancellation = _runCancellation;
+        var runTask = _runTask;
+        var lease = _lease;
+        _runCancellation = null;
+        _runTask = null;
+        _lease = null;
+        var observer = Interlocked.Exchange(ref _observerTask, null);
+        Exception? cleanupFailure = null;
+
+        if (cancellation is not null)
+        {
+            try
+            {
+                cancellation.Cancel();
+            }
+            catch (Exception ex)
+            {
+                CaptureStopFailure(ref cleanupFailure, ex, "run-cancel");
+            }
+        }
+
+        if (runTask is not null)
+        {
+            try
+            {
+                // Once shutdown owns this exact generation, caller cancellation must
+                // not skip the drain and release its VPN lease underneath live proxy
+                // sessions. Caller cancellation is restored only after this task and
+                // all independent ownership releases complete.
+                await runTask;
+            }
+            catch (OperationCanceledException) when (cancellation?.IsCancellationRequested == true)
+            {
+            }
+            catch (Exception ex) when (ex is IOException or System.Net.Sockets.SocketException)
+            {
+                System.Diagnostics.Debug.WriteLine(ex);
+            }
+            catch (Exception ex)
+            {
+                CaptureStopFailure(ref cleanupFailure, ex, "run-drain");
+            }
+        }
+
+        if (cancellation is not null)
+        {
+            try
+            {
+                cancellation.Dispose();
+            }
+            catch (Exception ex)
+            {
+                CaptureStopFailure(ref cleanupFailure, ex, "run-token");
+            }
+        }
+
+        if (lease is not null)
+        {
+            try
+            {
+                await lease.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                CaptureStopFailure(ref cleanupFailure, ex, "vpn-lease");
+            }
+        }
+
+        return new StopOwnershipResult(observer, cleanupFailure);
+    }
+
+    private static void CaptureStopFailure(
+        ref Exception? primaryFailure,
+        Exception failure,
+        string phase)
+    {
+        if (primaryFailure is null)
+        {
+            primaryFailure = failure;
+            return;
+        }
+
+        primaryFailure.Data[$"ProxyStop:{phase}"] =
+            $"{failure.GetType().FullName}: {failure.Message}";
+    }
+
+    private static void RethrowStopFailure(Exception? cleanupFailure)
+    {
+        if (cleanupFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+        }
+    }
+
     private static async Task JoinObserverAsync(Task? observer)
     {
         if (observer is null)
@@ -361,34 +468,24 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
         }
 
         Task? observerToJoin;
+        Exception? cleanupFailure;
         await _gate.WaitAsync();
         try
         {
-            unchecked { _generation++; }
-            _runCancellation?.Cancel();
-            if (_runTask is not null)
+            var stopResult = await StopPublishedOwnershipLockedAsync();
+            observerToJoin = stopResult.Observer;
+            cleanupFailure = stopResult.CleanupFailure;
+
+            if (cleanupFailure is null)
             {
-                try
-                {
-                    await _runTask;
-                }
-                catch
-                {
-                }
+                Volatile.Write(ref _lastError, null);
+                SetState(ProxyInstanceState.Paused);
             }
-
-            _runCancellation?.Dispose();
-            _runCancellation = null;
-            _runTask = null;
-            observerToJoin = Interlocked.Exchange(ref _observerTask, null);
-
-            if (_lease is not null)
+            else
             {
-                await _lease.DisposeAsync();
-                _lease = null;
+                Volatile.Write(ref _lastError, cleanupFailure.Message);
+                SetState(ProxyInstanceState.Error);
             }
-
-            SetState(ProxyInstanceState.Paused);
         }
         finally
         {
@@ -396,12 +493,17 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
         }
 
         await JoinObserverAsync(observerToJoin);
+        RethrowStopFailure(cleanupFailure);
 
         // SemaphoreSlim only creates an OS wait handle if AvailableWaitHandle is
         // requested (it is not here). Do not race Dispose() against a caller that
         // passed the pre-wait disposed check immediately before disposal; once this
         // runtime becomes unreachable, the managed semaphore is collectible with it.
     }
+
+    private readonly record struct StopOwnershipResult(
+        Task? Observer,
+        Exception? CleanupFailure);
 }
 
 internal readonly record struct ProxyRuntimeSnapshot(
