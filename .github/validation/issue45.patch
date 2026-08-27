@@ -1,0 +1,242 @@
+diff --git a/src/ProxyToAnyConnect/Proxy/ProxyServer.cs b/src/ProxyToAnyConnect/Proxy/ProxyServer.cs
+index 7033087..3e9c991 100644
+--- a/src/ProxyToAnyConnect/Proxy/ProxyServer.cs
++++ b/src/ProxyToAnyConnect/Proxy/ProxyServer.cs
+@@ -827,18 +827,28 @@ internal sealed class ProxyServer
+             }
+ 
+             var requestLine = text.AsSpan(0, requestLineEnd);
+-            Span<Range> requestParts = stackalloc Range[3];
+-            var requestPartCount = requestLine.Split(
+-                requestParts,
+-                ' ',
+-                StringSplitOptions.RemoveEmptyEntries);
+-            if (requestPartCount != 3)
++            var firstSpace = requestLine.IndexOf(' ');
++            if (firstSpace <= 0 || firstSpace >= requestLine.Length - 1)
+             {
+                 throw new InvalidDataException("Invalid HTTP proxy request line.");
+             }
+ 
+-            var methodSpan = requestLine[requestParts[0]];
+-            var versionSpan = requestLine[requestParts[2]];
++            var afterFirstSpace = requestLine[(firstSpace + 1)..];
++            var secondSpaceOffset = afterFirstSpace.IndexOf(' ');
++            if (secondSpaceOffset <= 0)
++            {
++                throw new InvalidDataException("Invalid HTTP proxy request line.");
++            }
++
++            var secondSpace = firstSpace + 1 + secondSpaceOffset;
++            var versionSpan = requestLine[(secondSpace + 1)..];
++            if (versionSpan.IsEmpty || versionSpan.IndexOf(' ') >= 0)
++            {
++                throw new InvalidDataException("Invalid HTTP proxy request line.");
++            }
++
++            var methodSpan = requestLine[..firstSpace];
++            var targetSpan = requestLine[(firstSpace + 1)..secondSpace];
+             if (!IsValidHeaderName(methodSpan))
+             {
+                 throw new InvalidDataException("Invalid HTTP method token.");
+@@ -851,7 +861,7 @@ internal sealed class ProxyServer
+             }
+ 
+             var method = methodSpan.ToString();
+-            var target = requestLine[requestParts[1]].ToString();
++            var target = targetSpan.ToString();
+             var version = versionSpan.ToString();
+             var offset = requestLineEnd + 2;
+ 
+diff --git a/tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs b/tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs
+index 6891387..2019f12 100644
+--- a/tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs
++++ b/tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs
+@@ -65,7 +65,7 @@ internal static class ProxyConnectSetupSelfTests
+     private static void ConnectParsingPreservesSemanticsAndValidation()
+     {
+         var raw = Encoding.Latin1.GetBytes(
+-            "CONNECT   example.test:443   HTTP/1.1\r\n" +
++            "CONNECT example.test:443 HTTP/1.1\r\n" +
+             "Host: example.test:443\r\n" +
+             "Proxy-Authorization: Basic ignored-by-tunnel-setup\r\n" +
+             "X-Test: caf\u00e9\r\n\r\n");
+@@ -206,18 +206,28 @@ internal static class ProxyConnectSetupSelfTests
+         }
+ 
+         var requestLine = text.AsSpan(0, requestLineEnd);
+-        Span<Range> requestParts = stackalloc Range[3];
+-        var requestPartCount = requestLine.Split(
+-            requestParts,
+-            ' ',
+-            StringSplitOptions.RemoveEmptyEntries);
+-        if (requestPartCount != 3)
++        var firstSpace = requestLine.IndexOf(' ');
++        if (firstSpace <= 0 || firstSpace >= requestLine.Length - 1)
++        {
++            throw new InvalidDataException("Invalid HTTP proxy request line.");
++        }
++
++        var afterFirstSpace = requestLine[(firstSpace + 1)..];
++        var secondSpaceOffset = afterFirstSpace.IndexOf(' ');
++        if (secondSpaceOffset <= 0)
++        {
++            throw new InvalidDataException("Invalid HTTP proxy request line.");
++        }
++
++        var secondSpace = firstSpace + 1 + secondSpaceOffset;
++        var versionSpan = requestLine[(secondSpace + 1)..];
++        if (versionSpan.IsEmpty || versionSpan.IndexOf(' ') >= 0)
+         {
+             throw new InvalidDataException("Invalid HTTP proxy request line.");
+         }
+ 
+-        var methodSpan = requestLine[requestParts[0]];
+-        var versionSpan = requestLine[requestParts[2]];
++        var methodSpan = requestLine[..firstSpace];
++        var targetSpan = requestLine[(firstSpace + 1)..secondSpace];
+         if (!IsValidBaselineHeaderName(methodSpan))
+         {
+             throw new InvalidDataException("Invalid HTTP method token.");
+@@ -230,7 +240,7 @@ internal static class ProxyConnectSetupSelfTests
+         }
+ 
+         var method = methodSpan.ToString();
+-        var target = requestLine[requestParts[1]].ToString();
++        var target = targetSpan.ToString();
+         var version = versionSpan.ToString();
+         var headers = new List<BaselineHeaderLine>();
+         var offset = requestLineEnd + 2;
+diff --git a/tests/ProxyToAnyConnect.SelfTests/ProxyHttpRequestLineSelfTests.cs b/tests/ProxyToAnyConnect.SelfTests/ProxyHttpRequestLineSelfTests.cs
+index 3300218..bf385ae 100644
+--- a/tests/ProxyToAnyConnect.SelfTests/ProxyHttpRequestLineSelfTests.cs
++++ b/tests/ProxyToAnyConnect.SelfTests/ProxyHttpRequestLineSelfTests.cs
+@@ -35,6 +35,15 @@ internal static class ProxyHttpRequestLineSelfTests
+         AssertParseRejected("GET http://example.test/ HTTP/2.0\r\nHost: example.test\r\n\r\n");
+         AssertParseRejected("GET http://example.test/ http/1.1\r\nHost: example.test\r\n\r\n");
+         AssertParseRejected("CONNECT example.test:443 HTTP/9.9\r\n\r\n");
++        AssertParseRejected("GET  http://example.test/ HTTP/1.1\r\nHost: example.test\r\n\r\n");
++        AssertParseRejected("GET http://example.test/  HTTP/1.1\r\nHost: example.test\r\n\r\n");
++        AssertParseRejected(" GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\n\r\n");
++        AssertParseRejected("GET http://example.test/ HTTP/1.1 \r\nHost: example.test\r\n\r\n");
++        AssertParseRejected("GET\thttp://example.test/\tHTTP/1.1\r\nHost: example.test\r\n\r\n");
++        AssertParseRejected("GET\vhttp://example.test/\vHTTP/1.1\r\nHost: example.test\r\n\r\n");
++        AssertParseRejected("GET\fhttp://example.test/\fHTTP/1.1\r\nHost: example.test\r\n\r\n");
++        AssertParseRejected("GET\rhttp://example.test/\rHTTP/1.1\r\nHost: example.test\r\n\r\n");
++        AssertParseRejected("CONNECT  example.test:443 HTTP/1.1\r\n\r\n");
+     }
+ 
+     private static void ParserAcceptsSupportedHttpVersions()
+@@ -85,6 +94,15 @@ internal static class ProxyHttpRequestLineSelfTests
+             await AssertBadRequestAsync(port,
+                 "GET http://example.test/path HTTP/2.0\r\nHost: example.test\r\n\r\n",
+                 timeout.Token);
++            await AssertBadRequestAsync(port,
++                "GET  http://example.test/path HTTP/1.1\r\nHost: example.test\r\n\r\n",
++                timeout.Token);
++            await AssertBadRequestAsync(port,
++                "GET\thttp://example.test/path\tHTTP/1.1\r\nHost: example.test\r\n\r\n",
++                timeout.Token);
++            await AssertBadRequestAsync(port,
++                "CONNECT  example.test:443 HTTP/1.1\r\n\r\n",
++                timeout.Token);
+ 
+             if (factory.ConnectCount != 0)
+             {
+diff --git a/tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs b/tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs
+index 5ad006b..e508d8e 100644
+--- a/tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs
++++ b/tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs
+@@ -94,8 +94,8 @@ internal static class ProxyParserAllocationSelfTests
+         string[] requestLines =
+         [
+             "GET http://example.test/a HTTP/1.1",
+-            "  GET   http://example.test/a   HTTP/1.1",
+-            "CONNECT   example.test:443   HTTP/1.1",
++            "GET http://example.test/b HTTP/1.1",
++            "CONNECT example.test:443 HTTP/1.1",
+             "GET http://example.test/a HTTP/1.0"
+         ];
+ 
+@@ -323,19 +323,29 @@ internal static class ProxyParserAllocationSelfTests
+         }
+ 
+         var requestLine = text.AsSpan(0, requestLineEnd);
+-        Span<Range> requestParts = stackalloc Range[3];
+-        var requestPartCount = requestLine.Split(
+-            requestParts,
+-            ' ',
+-            StringSplitOptions.RemoveEmptyEntries);
+-        if (requestPartCount != 3)
++        var firstSpace = requestLine.IndexOf(' ');
++        if (firstSpace <= 0 || firstSpace >= requestLine.Length - 1)
+         {
+             throw new InvalidDataException("Invalid HTTP proxy request line.");
+         }
+ 
+-        var method = requestLine[requestParts[0]].ToString();
+-        var target = requestLine[requestParts[1]].ToString();
+-        var version = requestLine[requestParts[2]].ToString();
++        var afterFirstSpace = requestLine[(firstSpace + 1)..];
++        var secondSpaceOffset = afterFirstSpace.IndexOf(' ');
++        if (secondSpaceOffset <= 0)
++        {
++            throw new InvalidDataException("Invalid HTTP proxy request line.");
++        }
++
++        var secondSpace = firstSpace + 1 + secondSpaceOffset;
++        var versionSpan = requestLine[(secondSpace + 1)..];
++        if (versionSpan.IsEmpty || versionSpan.IndexOf(' ') >= 0)
++        {
++            throw new InvalidDataException("Invalid HTTP proxy request line.");
++        }
++
++        var method = requestLine[..firstSpace].ToString();
++        var target = requestLine[(firstSpace + 1)..secondSpace].ToString();
++        var version = versionSpan.ToString();
+ 
+         var headers = new List<CurrentTextHeaderLine>();
+         var offset = requestLineEnd + 2;
+diff --git a/tests/ProxyToAnyConnect.SelfTests/ProxySetupTimingSelfTests.cs b/tests/ProxyToAnyConnect.SelfTests/ProxySetupTimingSelfTests.cs
+index db140c2..0065b0c 100644
+--- a/tests/ProxyToAnyConnect.SelfTests/ProxySetupTimingSelfTests.cs
++++ b/tests/ProxyToAnyConnect.SelfTests/ProxySetupTimingSelfTests.cs
+@@ -235,19 +235,29 @@ internal static class ProxySetupTimingSelfTests
+         }
+ 
+         var requestLine = text.AsSpan(0, requestLineEnd);
+-        Span<Range> requestParts = stackalloc Range[3];
+-        var requestPartCount = requestLine.Split(
+-            requestParts,
+-            ' ',
+-            StringSplitOptions.RemoveEmptyEntries);
+-        if (requestPartCount != 3)
++        var firstSpace = requestLine.IndexOf(' ');
++        if (firstSpace <= 0 || firstSpace >= requestLine.Length - 1)
+         {
+             throw new InvalidDataException("Invalid HTTP proxy request line.");
+         }
+ 
+-        var method = requestLine[requestParts[0]].ToString();
+-        var target = requestLine[requestParts[1]].ToString();
+-        var version = requestLine[requestParts[2]].ToString();
++        var afterFirstSpace = requestLine[(firstSpace + 1)..];
++        var secondSpaceOffset = afterFirstSpace.IndexOf(' ');
++        if (secondSpaceOffset <= 0)
++        {
++            throw new InvalidDataException("Invalid HTTP proxy request line.");
++        }
++
++        var secondSpace = firstSpace + 1 + secondSpaceOffset;
++        var versionSpan = requestLine[(secondSpace + 1)..];
++        if (versionSpan.IsEmpty || versionSpan.IndexOf(' ') >= 0)
++        {
++            throw new InvalidDataException("Invalid HTTP proxy request line.");
++        }
++
++        var method = requestLine[..firstSpace].ToString();
++        var target = requestLine[(firstSpace + 1)..secondSpace].ToString();
++        var version = versionSpan.ToString();
+ 
+         var headers = new List<TimingHeaderLine>();
+         var offset = requestLineEnd + 2;
