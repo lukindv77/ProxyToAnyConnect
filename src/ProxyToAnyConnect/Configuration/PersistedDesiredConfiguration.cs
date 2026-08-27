@@ -14,14 +14,14 @@ internal static class PersistedDesiredConfiguration
         ArgumentNullException.ThrowIfNull(adoptPersisted);
         ArgumentNullException.ThrowIfNull(applyRuntimeAsync);
 
-        // Durable publication is the desired-state linearization point. Once Save
-        // succeeds, callers must expose the same desired configuration that will be
-        // loaded after restart even if live runtime reconciliation fails afterwards.
-        await saveAsync(desired, cancellationToken).ConfigureAwait(false);
+        // Durable publication is the desired-state linearization point. Preserve the
+        // caller synchronization context across this boundary because GUI callers
+        // publish the persisted generation into UI-owned state immediately after it.
+        await saveAsync(desired, cancellationToken);
         adoptPersisted(desired);
 
         // Runtime apply is deliberately after adoption. Its failure is a runtime
         // convergence problem, not a rollback of an already-published config file.
-        await applyRuntimeAsync(desired, cancellationToken).ConfigureAwait(false);
+        await applyRuntimeAsync(desired, cancellationToken);
     }
 }
