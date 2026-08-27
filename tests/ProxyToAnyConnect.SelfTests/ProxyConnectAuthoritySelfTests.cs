@@ -31,9 +31,11 @@ internal static class ProxyConnectAuthoritySelfTests
     private static void AcceptedAuthoritiesAreCanonicalized()
     {
         AssertAuthority("example.test", "example.test", 443);
+        AssertAuthority("example.test.", "example.test", 443);
         AssertAuthority("EXAMPLE.TEST:8443", "example.test", 8443);
         AssertAuthority("127.0.0.1:9443", "127.0.0.1", 9443);
         AssertAuthority("münich.example:443", "xn--mnich-kva.example", 443);
+        AssertAuthority("münich.example.:443", "xn--mnich-kva.example", 443);
     }
 
     private static void MalformedAuthoritiesAreRejected()
@@ -55,7 +57,7 @@ internal static class ProxyConnectAuthoritySelfTests
             "example.test\\x:443",
             "example..test:443",
             ".example.test:443",
-            "example.test.:443",
+            "example.test..:443",
             "-example.test:443",
             "example-.test:443",
             "bad_host.test:443",
@@ -101,6 +103,7 @@ internal static class ProxyConnectAuthoritySelfTests
                 "example.test#x:443",
                 "example.test\\x:443",
                 "example..test:443",
+                "example.test..:443",
                 "bad_host.test:443",
                 "2001:db8::1:443"
             })

@@ -96,7 +96,7 @@ internal static class ProxyParserAllocationSelfTests
             "GET http://example.test/a HTTP/1.1",
             "  GET   http://example.test/a   HTTP/1.1",
             "CONNECT   example.test:443   HTTP/1.1",
-            "GET http://example.test/a HTTP/1.1 extra-data"
+            "GET http://example.test/a HTTP/1.0"
         ];
 
         foreach (var requestLine in requestLines)

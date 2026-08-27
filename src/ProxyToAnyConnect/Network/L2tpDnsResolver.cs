@@ -599,13 +599,22 @@ internal sealed class L2tpDnsResolver
     }
 
     private static string NormalizeDnsName(string host) =>
-        NormalizeDnsHostStrict(host.Trim().TrimEnd('.'));
+        NormalizeDnsHostStrict(host.Trim());
 
     internal static string NormalizeDnsHostStrict(string host)
     {
         if (string.IsNullOrEmpty(host))
         {
             throw new InvalidOperationException("DNS host is empty.");
+        }
+
+        if (host.EndsWith(".", StringComparison.Ordinal))
+        {
+            host = host[..^1];
+            if (host.Length == 0 || host.EndsWith(".", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("DNS host has an invalid terminal root label.");
+            }
         }
 
         var asciiHost = IdnMapping.GetAscii(host).ToLowerInvariant();
