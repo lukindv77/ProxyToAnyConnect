@@ -1,0 +1,226 @@
+name: one-shot-coordinator-parallel-cleanup-run
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply coordinator cleanup independence patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          coordinator = Path('src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs')
+          text = coordinator.read_text(encoding='utf-8')
+          old = '''    internal static async Task<Exception?> DisposeOwnedResourcesAsync(
+        IEnumerable<IAsyncDisposable> resources,
+        string phase,
+        Exception? primaryFailure = null)
+    {
+        ArgumentNullException.ThrowIfNull(resources);
+        ArgumentException.ThrowIfNullOrWhiteSpace(phase);
+
+        var index = 0;
+        foreach (var resource in resources)
+        {
+            try
+            {
+                await resource.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                if (primaryFailure is null)
+                {
+                    primaryFailure = ex;
+                }
+                else
+                {
+                    primaryFailure.Data[$"CoordinatorCleanup:{phase}:{index}"] =
+                        $"{ex.GetType().FullName}: {ex.Message}";
+                }
+            }
+
+            index++;
+        }
+
+        return primaryFailure;
+    }
+'''
+          new = '''    internal static async Task<Exception?> DisposeOwnedResourcesAsync(
+        IEnumerable<IAsyncDisposable> resources,
+        string phase,
+        Exception? primaryFailure = null)
+    {
+        ArgumentNullException.ThrowIfNull(resources);
+        ArgumentException.ThrowIfNullOrWhiteSpace(phase);
+
+        // Owners inside one dependency phase are independent. Start every teardown
+        // before awaiting any one of them so a stuck dedicated RAS owner cannot add
+        // its full timeout to every unrelated proxy/VPN group. Error aggregation is
+        // consumed in input order, preserving deterministic primary/secondary detail.
+        // Cross-phase ordering remains enforced by coordinator call sites.
+        var owned = resources.ToArray();
+        var attempts = new Task<Exception?>[owned.Length];
+        for (var index = 0; index < owned.Length; index++)
+        {
+            attempts[index] = DisposeOneOwnedResourceAsync(owned[index]);
+        }
+
+        for (var index = 0; index < attempts.Length; index++)
+        {
+            var failure = await attempts[index];
+            if (failure is null)
+            {
+                continue;
+            }
+
+            if (primaryFailure is null)
+            {
+                primaryFailure = failure;
+            }
+            else
+            {
+                primaryFailure.Data[$"CoordinatorCleanup:{phase}:{index}"] =
+                    $"{failure.GetType().FullName}: {failure.Message}";
+            }
+        }
+
+        return primaryFailure;
+    }
+
+    private static async Task<Exception?> DisposeOneOwnedResourceAsync(IAsyncDisposable resource)
+    {
+        try
+        {
+            await resource.DisposeAsync();
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+'''
+          if text.count(old) != 1:
+              raise SystemExit('Expected DisposeOwnedResourcesAsync fragment was not found exactly once.')
+          coordinator.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          tests = Path('tests/ProxyToAnyConnect.SelfTests/CoordinatorCleanupFailureSelfTests.cs')
+          text = tests.read_text(encoding='utf-8')
+          old = '''            await AllOwnersDisposeAfterEarlierFailureAsync();
+            await LifetimeCancellationFaultStillDisposesNestedOwnersAsync();
+            Console.WriteLine(
+                "PASS: coordinator cleanup attempts every owner and preserves nested ownership through cancellation callback faults");
+'''
+          new = '''            await AllOwnersDisposeAfterEarlierFailureAsync();
+            await IndependentOwnersDisposeConcurrentlyAsync();
+            await LifetimeCancellationFaultStillDisposesNestedOwnersAsync();
+            Console.WriteLine(
+                "PASS: coordinator cleanup runs independent owners concurrently, preserves deterministic failures and drains nested ownership through cancellation callback faults");
+'''
+          if text.count(old) != 1:
+              raise SystemExit('Expected coordinator cleanup RunAsync fragment was not found exactly once.')
+          text = text.replace(old, new, 1)
+
+          marker = '''    private static async Task LifetimeCancellationFaultStillDisposesNestedOwnersAsync()
+'''
+          addition = '''    private static async Task IndependentOwnersDisposeConcurrentlyAsync()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstFailure = new SyntheticCleanupException("parallel first owner failed");
+        var secondFailure = new SyntheticCleanupException("parallel second owner failed");
+        var first = new BlockingDisposable(firstEntered, release, firstFailure);
+        var second = new BlockingDisposable(secondEntered, release, secondFailure);
+
+        var cleanupTask = ProxyRuntimeCoordinator.DisposeOwnedResourcesAsync(
+            new IAsyncDisposable[] { first, second },
+            "parallel-self-test");
+
+        await Task.WhenAll(firstEntered.Task, secondEntered.Task).WaitAsync(TimeSpan.FromSeconds(1));
+        if (cleanupTask.IsCompleted)
+        {
+            throw new InvalidOperationException(
+                "Coordinator cleanup completed before blocked independent owners were released.");
+        }
+
+        release.SetResult();
+        var returned = await cleanupTask.WaitAsync(TimeSpan.FromSeconds(1));
+        if (!ReferenceEquals(returned, firstFailure))
+        {
+            throw new InvalidOperationException(
+                "Concurrent coordinator cleanup did not preserve input-order primary failure selection.");
+        }
+
+        var secondaryKey = "CoordinatorCleanup:parallel-self-test:1";
+        if (!firstFailure.Data.Contains(secondaryKey) ||
+            firstFailure.Data[secondaryKey]?.ToString()?.Contains(
+                "parallel second owner failed",
+                StringComparison.Ordinal) != true)
+        {
+            throw new InvalidOperationException(
+                "Concurrent coordinator cleanup did not attach the later input-order failure diagnostically.");
+        }
+    }
+
+'''
+          if text.count(marker) != 1:
+              raise SystemExit('Expected lifetime test marker was not found exactly once.')
+          text = text.replace(marker, addition + marker, 1)
+
+          marker = '''    private sealed class RecordingDisposable : IAsyncDisposable
+'''
+          addition = '''    private sealed class BlockingDisposable : IAsyncDisposable
+    {
+        private readonly TaskCompletionSource _entered;
+        private readonly TaskCompletionSource _release;
+        private readonly Exception? _failure;
+
+        public BlockingDisposable(
+            TaskCompletionSource entered,
+            TaskCompletionSource release,
+            Exception? failure)
+        {
+            _entered = entered;
+            _release = release;
+            _failure = failure;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _entered.TrySetResult();
+            await _release.Task;
+            if (_failure is not null)
+            {
+                throw _failure;
+            }
+        }
+    }
+
+'''
+          if text.count(marker) != 1:
+              raise SystemExit('Expected RecordingDisposable marker was not found exactly once.')
+          tests.write_text(text.replace(marker, addition + marker, 1), encoding='utf-8')
+          PY
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs tests/ProxyToAnyConnect.SelfTests/CoordinatorCleanupFailureSelfTests.cs
+          git rm .github/workflows/one-shot-coordinator-parallel-cleanup.yml .github/workflows/one-shot-coordinator-parallel-cleanup-run.yml
+          git diff --cached --check
+          git commit -m 'perf: drain independent coordinator owners concurrently'
+          git push origin HEAD:main
