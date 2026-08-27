@@ -28,13 +28,14 @@ internal sealed class MainForm : Form
     private readonly Label _effectiveLogPath = new() { AutoSize = true };
     private readonly Label _configurationStatus = new() { AutoSize = true };
 
-    private AppOptions _options;
+    private readonly EditableConfigurationDraft _configurationDraft;
+    private AppOptions _options => _configurationDraft.Current;
     private bool _allowExit;
     private int _configurationCommandsStopping;
 
     public MainForm(AppOptions options, string configPath, ProxyRuntimeHost runtimeHost)
     {
-        _options = options;
+        _configurationDraft = new EditableConfigurationDraft(options);
         _configPath = configPath;
         _runtimeHost = runtimeHost;
         RebuildVpnNameIndex();
@@ -282,11 +283,18 @@ internal sealed class MainForm : Form
         RefreshProxyGrid();
         RefreshVpnGrid();
         SetLabelText(_effectiveLogPath, AppLog.LogRootDirectory ?? AppContext.BaseDirectory);
+        var draftStatus = _configurationDraft.ValidationError is { Length: > 0 } draftError
+            ? _configurationDraft.HasUnpersistedChanges
+                ? $"Черновик настроек не сохранён: {draftError}"
+                : $"Сохранённая конфигурация требует исправления: {draftError}"
+            : _configurationDraft.HasUnpersistedChanges
+                ? "Черновик настроек валиден, но ещё не сохранён/не применён."
+                : null;
         SetLabelText(
             _configurationStatus,
-            string.IsNullOrWhiteSpace(_runtimeHost.ConfigurationError)
+            draftStatus ?? (string.IsNullOrWhiteSpace(_runtimeHost.ConfigurationError)
                 ? "Конфигурация runtime: OK"
-                : $"Конфигурация runtime: {_runtimeHost.ConfigurationError}");
+                : $"Конфигурация runtime: {_runtimeHost.ConfigurationError}"));
     }
 
     private void RefreshProxyGrid()
@@ -622,8 +630,28 @@ internal sealed class MainForm : Form
 
     private async Task ApplyConfigurationAsync(
         AppOptions newOptions,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool configureLoggingAfterPersist = false)
     {
+        // Retain every editor result as the next repair base, but never publish an
+        // invalid accumulated generation.
+        if (!_configurationDraft.Stage(newOptions))
+        {
+            RebuildVpnNameIndex();
+            if (Volatile.Read(ref _configurationCommandsStopping) == 0)
+            {
+                RefreshRuntimeViews();
+                MessageBox.Show(
+                    this,
+                    "Изменение сохранено только в черновике окна. Файл настроек и runtime не изменены.\n\n" +
+                    $"Исправьте оставшуюся ошибку: {_configurationDraft.ValidationError}",
+                    "Черновик настроек требует исправления",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+            return;
+        }
+
         var persisted = false;
         try
         {
@@ -632,8 +660,12 @@ internal sealed class MainForm : Form
                 (desired, operationToken) => desired.SaveAsync(_configPath, operationToken),
                 desired =>
                 {
-                    _options = desired;
+                    _configurationDraft.MarkPersisted(desired);
                     RebuildVpnNameIndex();
+                    if (configureLoggingAfterPersist)
+                    {
+                        AppLog.Configure(desired.Logging);
+                    }
                     persisted = true;
                 },
                 (desired, operationToken) => _runtimeHost.ApplyOptionsAsync(desired, operationToken),
@@ -658,11 +690,13 @@ internal sealed class MainForm : Form
         }
         finally
         {
-            if (persisted && Volatile.Read(ref _configurationCommandsStopping) == 0)
+            if (Volatile.Read(ref _configurationCommandsStopping) == 0)
             {
-                // Show the persisted desired settings through subsequent editors and
-                // refresh current runtime/Error state even when reconciliation failed.
                 RefreshRuntimeViews();
+                if (persisted && configureLoggingAfterPersist)
+                {
+                    RefreshLoggingSettings();
+                }
             }
         }
     }
@@ -699,23 +733,12 @@ internal sealed class MainForm : Form
             Logging = newLogging
         };
 
-        try
-        {
-            await newOptions.SaveAsync(_configPath, cancellationToken);
-            _options = newOptions;
-            AppLog.Configure(newLogging);
-            if (Volatile.Read(ref _configurationCommandsStopping) == 0)
-            {
-                RefreshLoggingSettings();
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, ex.Message, "Не удалось сохранить настройки", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
+        // Logging may be the final repair that validates an accumulated topology
+        // draft, so persist and reconcile the complete current generation.
+        await ApplyConfigurationAsync(
+            newOptions,
+            cancellationToken,
+            configureLoggingAfterPersist: true);
     }
 
     private void RefreshLoggingSettings()

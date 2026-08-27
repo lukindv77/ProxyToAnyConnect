@@ -9,7 +9,7 @@ internal sealed class L2tpSettingsDialog : Form
 {
     private readonly string _id;
     private readonly L2tpOptions? _existing;
-    private readonly WindowsVpnProfileInspector _profileInspector = new();
+    private readonly Func<CancellationToken, Task<IReadOnlyList<VpnProfileInfo>>> _profileLoader;
     private CancellationTokenSource? _profileLoadCancellation;
     private Task _profileLoadTask = Task.CompletedTask;
     private int _profileLoadStopping;
@@ -58,8 +58,16 @@ internal sealed class L2tpSettingsDialog : Form
     private readonly Label _profileStatus = new() { AutoSize = true };
 
     public L2tpSettingsDialog(L2tpOptions? existing)
+        : this(existing, null)
+    {
+    }
+
+    internal L2tpSettingsDialog(
+        L2tpOptions? existing,
+        Func<CancellationToken, Task<IReadOnlyList<VpnProfileInfo>>>? profileLoader)
     {
         _existing = existing;
+        _profileLoader = profileLoader ?? new WindowsVpnProfileInspector().ListL2tpProfilesAsync;
         _id = existing?.Id ?? Guid.NewGuid().ToString("N");
 
         Text = existing is null ? "Новое L2TP соединение" : $"L2TP — {existing.Name}";
@@ -401,7 +409,7 @@ internal sealed class L2tpSettingsDialog : Form
         _allowMsChapV2.Checked = existing?.Custom.AllowMsChapV2 ?? true;
     }
 
-    private void StartWindowsProfileLoad()
+    internal void StartWindowsProfileLoad()
     {
         if (Volatile.Read(ref _profileLoadStopping) != 0)
         {
@@ -432,7 +440,7 @@ internal sealed class L2tpSettingsDialog : Form
 
         try
         {
-            var profiles = await _profileInspector.ListL2tpProfilesAsync(cancellation.Token);
+            var profiles = await _profileLoader(cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
             if (!OwnsProfileLoad(cancellation))
             {
