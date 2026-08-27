@@ -146,9 +146,9 @@ if ([string]::IsNullOrWhiteSpace($profileFingerprint) -or
     throw 'Windows VPN profile fingerprint changed between Baseline and Final checkpoints.'
 }
 
-$baselineProcesses = Get-CapturedProcesses -Bundle $baseline -Stage 'Baseline'
-$readyProcesses = Get-CapturedProcesses -Bundle $ready -Stage 'Ready'
-$finalProcesses = Get-CapturedProcesses -Bundle $final -Stage 'Final'
+$baselineProcesses = @(Get-CapturedProcesses -Bundle $baseline -Stage 'Baseline')
+$readyProcesses = @(Get-CapturedProcesses -Bundle $ready -Stage 'Ready')
+$finalProcesses = @(Get-CapturedProcesses -Bundle $final -Stage 'Final')
 
 if ($RequireProcessLifecycle) {
     if ($baselineProcesses.Count -ne 0) {
@@ -238,7 +238,7 @@ elseif ($RequireProxyHttpProbe) {
 function New-StageSummary {
     param(
         [Parameter(Mandatory = $true)] $Bundle,
-        [Parameter(Mandatory = $true)] $Processes
+        [Parameter(Mandatory = $true)][int] $ProcessCount
     )
 
     return [ordered]@{
@@ -248,7 +248,7 @@ function New-StageSummary {
         validatedFileCount = $Bundle.Manifest.fileCount
         routeFingerprint = [string]$Bundle.Evidence.routeFingerprint
         profileFingerprint = [string]$Bundle.Evidence.profileFingerprint
-        processCount = $Processes.Count
+        processCount = $ProcessCount
         assertionCount = $Bundle.Summary.assertionCount
         failedAssertionCount = $Bundle.Summary.failedAssertionCount
     }
@@ -273,9 +273,9 @@ $acceptance = [ordered]@{
     proxyPublicIPv4 = $proxyPublicIPv4
     proxyHttpValidated = $proxyHttpValidated
     stages = [ordered]@{
-        Baseline = New-StageSummary -Bundle $baseline -Processes $baselineProcesses
-        Ready = New-StageSummary -Bundle $ready -Processes $readyProcesses
-        Final = New-StageSummary -Bundle $final -Processes $finalProcesses
+        Baseline = New-StageSummary -Bundle $baseline -ProcessCount $baselineProcesses.Count
+        Ready = New-StageSummary -Bundle $ready -ProcessCount $readyProcesses.Count
+        Final = New-StageSummary -Bundle $final -ProcessCount $finalProcesses.Count
     }
 }
 
