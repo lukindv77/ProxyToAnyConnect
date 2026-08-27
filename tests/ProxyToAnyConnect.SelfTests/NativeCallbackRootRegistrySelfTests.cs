@@ -8,12 +8,19 @@ internal static class NativeCallbackRootRegistrySelfTests
     {
         try
         {
-            ZeroAndDuplicateHandlesRemainBounded();
-            UniqueHandleChurnReturnsToZero();
-            await ConcurrentHandleChurnReturnsToZeroAsync();
+            var baseline = NativeCallbackRootHealth.CurrentCount;
+            ZeroAndDuplicateHandlesRemainBounded(baseline);
+            UniqueHandleChurnReturnsToBaseline(baseline);
+            await ConcurrentHandleChurnReturnsToBaselineAsync(baseline);
+
+            if (NativeCallbackRootHealth.CurrentCount != baseline)
+            {
+                throw new InvalidOperationException(
+                    $"Native callback-root health retained {NativeCallbackRootHealth.CurrentCount - baseline} owner(s) after the full churn suite.");
+            }
 
             Console.WriteLine(
-                "PASS: native callback roots are exact-handle keyed, duplicate-bounded and return to zero after concurrent churn");
+                $"PASS: native callback roots are exact-handle keyed, duplicate-bounded, expose a monotonic high-watermark and return to baseline after concurrent churn (baseline={baseline}, high={NativeCallbackRootHealth.HighWatermark})");
             return 0;
         }
         catch (Exception ex)
@@ -23,11 +30,13 @@ internal static class NativeCallbackRootRegistrySelfTests
         }
     }
 
-    private static void ZeroAndDuplicateHandlesRemainBounded()
+    private static void ZeroAndDuplicateHandlesRemainBounded(int baseline)
     {
         var registry = new NativeCallbackRootRegistry<object>();
         registry.AddOrReplace(0, new object());
-        if (registry.Count != 0 || registry.Remove(0))
+        if (registry.Count != 0 ||
+            registry.Remove(0) ||
+            NativeCallbackRootHealth.CurrentCount != baseline)
         {
             throw new InvalidOperationException("Zero native handle unexpectedly acquired callback ownership.");
         }
@@ -35,19 +44,22 @@ internal static class NativeCallbackRootRegistrySelfTests
         var handle = (nint)123;
         registry.AddOrReplace(handle, new object());
         registry.AddOrReplace(handle, new object());
-        if (registry.Count != 1)
+        if (registry.Count != 1 || NativeCallbackRootHealth.CurrentCount != baseline + 1)
         {
             throw new InvalidOperationException(
-                $"Duplicate exact handle grew callback roots to {registry.Count}; expected one.");
+                $"Duplicate exact handle grew callback ownership unexpectedly: local={registry.Count}, global={NativeCallbackRootHealth.CurrentCount}.");
         }
 
-        if (!registry.Remove(handle) || registry.Remove(handle) || registry.Count != 0)
+        if (!registry.Remove(handle) ||
+            registry.Remove(handle) ||
+            registry.Count != 0 ||
+            NativeCallbackRootHealth.CurrentCount != baseline)
         {
             throw new InvalidOperationException("Exact callback root removal was not idempotent/bounded.");
         }
     }
 
-    private static void UniqueHandleChurnReturnsToZero()
+    private static void UniqueHandleChurnReturnsToBaseline(int baseline)
     {
         const int count = 8192;
         var registry = new NativeCallbackRootRegistry<object>();
@@ -56,10 +68,16 @@ internal static class NativeCallbackRootRegistrySelfTests
             registry.AddOrReplace((nint)index, new object());
         }
 
-        if (registry.Count != count)
+        if (registry.Count != count || NativeCallbackRootHealth.CurrentCount != baseline + count)
         {
             throw new InvalidOperationException(
-                $"Expected {count} unique callback roots, observed {registry.Count}.");
+                $"Expected {count} unique callback roots above baseline, local={registry.Count}, global={NativeCallbackRootHealth.CurrentCount}.");
+        }
+
+        if (NativeCallbackRootHealth.HighWatermark < baseline + count)
+        {
+            throw new InvalidOperationException(
+                $"Native callback-root high-watermark {NativeCallbackRootHealth.HighWatermark} did not observe {baseline + count} live owners.");
         }
 
         for (var index = 1; index <= count; index++)
@@ -70,13 +88,14 @@ internal static class NativeCallbackRootRegistrySelfTests
             }
         }
 
-        if (registry.Count != 0)
+        if (registry.Count != 0 || NativeCallbackRootHealth.CurrentCount != baseline)
         {
-            throw new InvalidOperationException($"Sequential callback-root churn retained {registry.Count} roots.");
+            throw new InvalidOperationException(
+                $"Sequential callback-root churn did not return to baseline {baseline}: local={registry.Count}, global={NativeCallbackRootHealth.CurrentCount}.");
         }
     }
 
-    private static async Task ConcurrentHandleChurnReturnsToZeroAsync()
+    private static async Task ConcurrentHandleChurnReturnsToBaselineAsync(int baseline)
     {
         const int workers = 8;
         const int handlesPerWorker = 1024;
@@ -93,7 +112,7 @@ internal static class NativeCallbackRootRegistrySelfTests
                     if ((handle & 3) == 0)
                     {
                         // Replacing the same exact owner concurrently with unrelated
-                        // handles must not add another dictionary entry.
+                        // handles must not add another dictionary/global health owner.
                         registry.AddOrReplace((nint)handle, new object());
                     }
                 }
@@ -110,10 +129,10 @@ internal static class NativeCallbackRootRegistrySelfTests
             .ToArray();
 
         await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5));
-        if (registry.Count != 0)
+        if (registry.Count != 0 || NativeCallbackRootHealth.CurrentCount != baseline)
         {
             throw new InvalidOperationException(
-                $"Concurrent callback-root churn retained {registry.Count} root(s).");
+                $"Concurrent callback-root churn did not return to baseline {baseline}: local={registry.Count}, global={NativeCallbackRootHealth.CurrentCount}.");
         }
     }
 }
