@@ -1,3 +1,5 @@
+using System.Reflection;
+using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Runtime;
 
 namespace ProxyToAnyConnect.SelfTests;
@@ -9,8 +11,9 @@ internal static class CoordinatorCleanupFailureSelfTests
         try
         {
             await AllOwnersDisposeAfterEarlierFailureAsync();
+            await LifetimeCancellationFaultStillDisposesNestedOwnersAsync();
             Console.WriteLine(
-                "PASS: coordinator cleanup attempts every owner and preserves primary/secondary failure ordering");
+                "PASS: coordinator cleanup attempts every owner and preserves nested ownership through cancellation callback faults");
             return 0;
         }
         catch (Exception ex)
@@ -57,6 +60,132 @@ internal static class CoordinatorCleanupFailureSelfTests
         {
             throw new InvalidOperationException(
                 "Coordinator cleanup did not attach the later teardown failure to the primary exception.");
+        }
+    }
+
+    private static async Task LifetimeCancellationFaultStillDisposesNestedOwnersAsync()
+    {
+        var coordinator = new ProxyRuntimeCoordinator(CreateOptions());
+        var lifetime = GetPrivateField<CancellationTokenSource>(coordinator, "_lifetime");
+        var vpnMap = GetPrivateField<Dictionary<string, VpnLeaseManager>>(coordinator, "_vpnById");
+        var proxyMap = GetPrivateField<Dictionary<string, ProxyInstanceRuntime>>(coordinator, "_proxyById");
+        var pendingStarts = GetPrivateField<HashSet<string>>(coordinator, "_pendingStartProxyIds");
+        var nestedVpn = vpnMap["vpn-coordinator-cleanup"];
+        var nestedLifetime = GetPrivateField<CancellationTokenSource>(nestedVpn, "_lifetime");
+
+        _ = lifetime.Token.Register(
+            static () => throw new SyntheticCleanupException(
+                "coordinator lifetime cancellation callback failed"));
+
+        try
+        {
+            await coordinator.DisposeAsync();
+            throw new InvalidOperationException(
+                "Throwing coordinator lifetime cancellation callback was not surfaced from DisposeAsync.");
+        }
+        catch (AggregateException ex) when (
+            ex.InnerExceptions.Any(inner =>
+                inner is SyntheticCleanupException synthetic &&
+                synthetic.Message == "coordinator lifetime cancellation callback failed"))
+        {
+        }
+
+        if (proxyMap.Count != 0 || vpnMap.Count != 0 || pendingStarts.Count != 0)
+        {
+            throw new InvalidOperationException(
+                "Coordinator lifetime cancellation callback fault left nested runtime ownership published.");
+        }
+
+        if (GetPrivateField<int>(coordinator, "_disposed") == 0 ||
+            !CancellationSourceWasDisposed(lifetime) ||
+            !CancellationSourceWasDisposed(nestedLifetime) ||
+            GetPrivateField<int>(nestedVpn, "_disposed") == 0)
+        {
+            throw new InvalidOperationException(
+                "Coordinator lifetime cancellation callback fault prevented parent or nested VPN lifetime disposal.");
+        }
+
+        // The first call reported the callback defect but completed all independent
+        // ownership release. Repeated coordinator disposal is therefore a no-op.
+        await coordinator.DisposeAsync();
+    }
+
+    private static AppOptions CreateOptions() =>
+        new()
+        {
+            Proxies =
+            [
+                new ProxyOptions
+                {
+                    Id = "proxy-coordinator-cleanup",
+                    Name = "Coordinator cleanup proxy",
+                    Enabled = false,
+                    ListenAddress = "127.0.0.1",
+                    ListenPort = 18321,
+                    VpnConnectionId = "vpn-coordinator-cleanup",
+                    MaxConcurrentConnections = 8,
+                    MaxHeaderBytes = 8192,
+                    ClientHeaderTimeoutSeconds = 5,
+                    OutboundConnectTimeoutSeconds = 5,
+                    DnsTimeoutMilliseconds = 1000
+                }
+            ],
+            VpnConnections =
+            [
+                new L2tpOptions
+                {
+                    Id = "vpn-coordinator-cleanup",
+                    Name = "Coordinator cleanup VPN",
+                    Shared = false,
+                    Mode = L2tpConnectionMode.ExistingWindowsProfile,
+                    EntryName = "SelfTest-vpn-coordinator-cleanup",
+                    MonitorIntervalMilliseconds = 1000,
+                    RouteMonitorIntervalMilliseconds = 5000,
+                    ReconnectCooldownMilliseconds = 1000,
+                    Verification = new VerificationOptions
+                    {
+                        PublicAddress = "vpn.example.com",
+                        ProbeHost = "api.ipify.org",
+                        ProbePort = 443,
+                        ProbePath = "/",
+                        TimeoutSeconds = 5
+                    },
+                    Keepalive = new KeepaliveOptions
+                    {
+                        Mode = L2tpKeepaliveMode.Off,
+                        IntervalSeconds = 10,
+                        TimeoutMilliseconds = 1000,
+                        FailureThreshold = 3
+                    }
+                }
+            ]
+        };
+
+    private static T GetPrivateField<T>(object owner, string fieldName)
+    {
+        var field = owner.GetType().GetField(
+            fieldName,
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingFieldException(owner.GetType().FullName, fieldName);
+        var value = field.GetValue(owner);
+        if (value is null)
+        {
+            return default!;
+        }
+
+        return (T)value;
+    }
+
+    private static bool CancellationSourceWasDisposed(CancellationTokenSource source)
+    {
+        try
+        {
+            _ = source.Token;
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            return true;
         }
     }
 
