@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
 using ProxyToAnyConnect.Network;
@@ -169,9 +170,30 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
                     "Last active proxy released the L2TP connection; stopping maintenance and disconnecting RAS.",
                     new { VpnId = _options.Id, VpnName = _options.Name });
 
-                await StopMaintenanceLockedAsync();
-                await _connectionManager.DisconnectAsync();
-                DnsCache.Clear();
+                Exception? cleanupFailure = null;
+                try
+                {
+                    await StopMaintenanceLockedAsync();
+                }
+                catch (Exception ex)
+                {
+                    CaptureCleanupFailure(ref cleanupFailure, ex, "maintenance-stop");
+                }
+
+                try
+                {
+                    await _connectionManager.DisconnectAsync();
+                }
+                catch (Exception ex)
+                {
+                    CaptureCleanupFailure(ref cleanupFailure, ex, "connection-disconnect");
+                }
+                finally
+                {
+                    DnsCache.Clear();
+                }
+
+                RethrowCleanupFailure(cleanupFailure);
             }
         }
         finally
@@ -281,8 +303,15 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
 
                     if (ActiveProxyCount == 0)
                     {
-                        await _connectionManager.DisconnectAsync();
-                        DnsCache.Clear();
+                        try
+                        {
+                            await _connectionManager.DisconnectAsync();
+                        }
+                        finally
+                        {
+                            DnsCache.Clear();
+                        }
+
                         AppLog.Info(
                             "vpn.maintenance.reconnect_discarded",
                             "Reconnect completed after the last proxy lease was released; L2TP was disconnected again.",
@@ -327,28 +356,78 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
         }
 
         _lifetime.Cancel();
+        Exception? cleanupFailure = null;
 
-        await _gate.WaitAsync();
         try
         {
-            _consumers.Clear();
-            Volatile.Write(ref _activeProxyCount, 0);
-            await StopMaintenanceLockedAsync();
-            await _connectionManager.DisposeAsync();
-            DnsCache.Clear();
-            VpnLatestStatusRegistry.Remove(_options.Id);
+            await _gate.WaitAsync();
+            try
+            {
+                _consumers.Clear();
+                Volatile.Write(ref _activeProxyCount, 0);
+
+                try
+                {
+                    await StopMaintenanceLockedAsync();
+                }
+                catch (Exception ex)
+                {
+                    CaptureCleanupFailure(ref cleanupFailure, ex, "maintenance-stop");
+                }
+
+                try
+                {
+                    await _connectionManager.DisposeAsync();
+                }
+                catch (Exception ex)
+                {
+                    CaptureCleanupFailure(ref cleanupFailure, ex, "connection-dispose");
+                }
+                finally
+                {
+                    DnsCache.Clear();
+                    VpnLatestStatusRegistry.Remove(_options.Id);
+                }
+            }
+            finally
+            {
+                _gate.Release();
+            }
         }
         finally
         {
-            _gate.Release();
+            _lifetime.Dispose();
         }
 
-        _lifetime.Dispose();
+        RethrowCleanupFailure(cleanupFailure);
 
         // Do not race SemaphoreSlim.Dispose() against a VpnLease.DisposeAsync()
         // caller that passed the pre-wait disposed check just before shutdown.
         // AvailableWaitHandle is never used, so there is no OS wait handle to
         // release; the managed gate becomes collectible with this manager.
+    }
+
+    private static void CaptureCleanupFailure(
+        ref Exception? primaryFailure,
+        Exception failure,
+        string phase)
+    {
+        if (primaryFailure is null)
+        {
+            primaryFailure = failure;
+            return;
+        }
+
+        primaryFailure.Data[$"VpnCleanup:{phase}"] =
+            $"{failure.GetType().FullName}: {failure.Message}";
+    }
+
+    private static void RethrowCleanupFailure(Exception? cleanupFailure)
+    {
+        if (cleanupFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+        }
     }
 
     internal sealed class VpnLease : IAsyncDisposable
