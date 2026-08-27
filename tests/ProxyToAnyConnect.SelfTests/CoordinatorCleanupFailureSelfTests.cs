@@ -11,9 +11,10 @@ internal static class CoordinatorCleanupFailureSelfTests
         try
         {
             await AllOwnersDisposeAfterEarlierFailureAsync();
+            await IndependentOwnersOverlapAndPreserveInputOrderedFailuresAsync();
             await LifetimeCancellationFaultStillDisposesNestedOwnersAsync();
             Console.WriteLine(
-                "PASS: coordinator cleanup attempts every owner and preserves nested ownership through cancellation callback faults");
+                "PASS: coordinator cleanup overlaps independent owners, preserves deterministic failure ordering and drains nested ownership through cancellation callback faults");
             return 0;
         }
         catch (Exception ex)
@@ -45,7 +46,7 @@ internal static class CoordinatorCleanupFailureSelfTests
         if (!order.SequenceEqual(["first", "second", "third"]))
         {
             throw new InvalidOperationException(
-                $"Coordinator cleanup did not preserve deterministic owner order: {string.Join(",", order)}.");
+                $"Coordinator cleanup did not start synchronous owners in deterministic input order: {string.Join(",", order)}.");
         }
 
         if (first.DisposeCount != 1 || second.DisposeCount != 1 || third.DisposeCount != 1)
@@ -60,6 +61,47 @@ internal static class CoordinatorCleanupFailureSelfTests
         {
             throw new InvalidOperationException(
                 "Coordinator cleanup did not attach the later teardown failure to the primary exception.");
+        }
+    }
+
+    private static async Task IndependentOwnersOverlapAndPreserveInputOrderedFailuresAsync()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstFailure = new SyntheticCleanupException("parallel first owner failed");
+        var secondFailure = new SyntheticCleanupException("parallel second owner failed");
+        var first = new BlockingDisposable(firstEntered, release, firstFailure);
+        var second = new BlockingDisposable(secondEntered, release, secondFailure);
+
+        var cleanupTask = ProxyRuntimeCoordinator.DisposeOwnedResourcesAsync(
+            new IAsyncDisposable[] { first, second },
+            "parallel-self-test");
+
+        await Task.WhenAll(firstEntered.Task, secondEntered.Task)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+        if (cleanupTask.IsCompleted)
+        {
+            throw new InvalidOperationException(
+                "Coordinator cleanup completed before blocked independent owners were released.");
+        }
+
+        release.TrySetResult();
+        var returned = await cleanupTask.WaitAsync(TimeSpan.FromSeconds(1));
+        if (!ReferenceEquals(returned, firstFailure))
+        {
+            throw new InvalidOperationException(
+                "Concurrent coordinator cleanup did not preserve input-order primary failure selection.");
+        }
+
+        var secondaryKey = "CoordinatorCleanup:parallel-self-test:1";
+        if (!firstFailure.Data.Contains(secondaryKey) ||
+            firstFailure.Data[secondaryKey]?.ToString()?.Contains(
+                "parallel second owner failed",
+                StringComparison.Ordinal) != true)
+        {
+            throw new InvalidOperationException(
+                "Concurrent coordinator cleanup did not retain the later input-order failure diagnostically.");
         }
     }
 
@@ -186,6 +228,33 @@ internal static class CoordinatorCleanupFailureSelfTests
         catch (ObjectDisposedException)
         {
             return true;
+        }
+    }
+
+    private sealed class BlockingDisposable : IAsyncDisposable
+    {
+        private readonly TaskCompletionSource _entered;
+        private readonly TaskCompletionSource _release;
+        private readonly Exception? _failure;
+
+        public BlockingDisposable(
+            TaskCompletionSource entered,
+            TaskCompletionSource release,
+            Exception? failure)
+        {
+            _entered = entered;
+            _release = release;
+            _failure = failure;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _entered.TrySetResult();
+            await _release.Task;
+            if (_failure is not null)
+            {
+                throw _failure;
+            }
         }
     }
 
