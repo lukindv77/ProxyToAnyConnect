@@ -65,3 +65,7 @@ Source audit confirms the major UI/runtime mechanisms are already present: indep
 3. Run exact-head full Windows CI and fix any later suite exposed after framing/startup gates.
 4. Continue performance/memory hardening (#11/#13) and close implementation-complete product blocks only when their remaining Windows acceptance is evidenced.
 5. Keep issue threads and handoff docs synchronized after each material source/CI result.
+
+## Repository protection validation — 2026-08-27
+
+The repository is public and the default branch is protected by an active branch ruleset. Direct updates, deletions and force pushes are restricted; repository administrators and the OpenAI ChatGPT Codex Connector integration are configured as always-allowed bypass actors. This documentation-only change is intentionally used as a live write-path validation for the protected `main` workflow before continuing runtime development.
