@@ -67,6 +67,7 @@ internal static class CombinedTestRunner
         await RunAsync(nameof(VpnLeaseManagerLifetimeSelfTests), VpnLeaseManagerLifetimeSelfTests.RunAsync);
         await RunAsync(nameof(VpnSharedFailClosedSelfTests), VpnSharedFailClosedSelfTests.RunAsync);
         Run(nameof(ReconnectCooldownSelfTests), ReconnectCooldownSelfTests.Run);
+        await RunAsync(nameof(VpnReconnectCooldownMaintenanceSelfTests), VpnReconnectCooldownMaintenanceSelfTests.RunAsync);
         await RunAsync(nameof(LoggingAndMetricsSelfTests), LoggingAndMetricsSelfTests.RunAsync);
         Run(nameof(DailyLogPathCacheSelfTests), DailyLogPathCacheSelfTests.Run);
         Run(nameof(DailyLogEncodingSelfTests), DailyLogEncodingSelfTests.Run);
@@ -107,7 +108,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, bounded-settings/secret-pruning, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation/generation-serialization/host-shutdown, native-ICMP keepalive, cancellable-RAS-dial/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle, shared-VPN fail-closed/reconnect ownership, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, bounded-settings/secret-pruning, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation/generation-serialization/host-shutdown, native-ICMP keepalive, cancellable-RAS-dial/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle, shared-VPN fail-closed/reconnect ownership, reconnect-cooldown maintenance, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
