@@ -10,6 +10,7 @@ internal sealed class L2tpSettingsDialog : Form
     private readonly string _id;
     private readonly L2tpOptions? _existing;
     private readonly WindowsVpnProfileInspector _profileInspector = new();
+    private CancellationTokenSource? _profileLoadCancellation;
 
     private readonly TextBox _name = new() { Dock = DockStyle.Fill };
     private readonly CheckBox _shared = new() { Text = "Общее L2TP для нескольких proxy", AutoSize = true };
@@ -143,6 +144,7 @@ internal sealed class L2tpSettingsDialog : Form
         _useWindowsCredentials.CheckedChanged += (_, _) => RefreshCredentialVisibility();
         _refreshProfiles.Click += async (_, _) => await LoadWindowsProfilesAsync();
         Shown += async (_, _) => await LoadWindowsProfilesAsync();
+        FormClosed += (_, _) => CancelProfileLoad();
 
         LoadExisting(existing);
         RefreshModeVisibility();
@@ -366,16 +368,27 @@ internal sealed class L2tpSettingsDialog : Form
 
     private async Task LoadWindowsProfilesAsync()
     {
-        if (SelectedEnum<L2tpConnectionMode>(_mode) != L2tpConnectionMode.ExistingWindowsProfile)
+        if (SelectedEnum<L2tpConnectionMode>(_mode) != L2tpConnectionMode.ExistingWindowsProfile ||
+            IsDisposed || Disposing)
         {
             return;
         }
 
+        CancelProfileLoad();
+        var cancellation = new CancellationTokenSource();
+        _profileLoadCancellation = cancellation;
         _refreshProfiles.Enabled = false;
         _profileStatus.Text = "Чтение Windows VPN profiles...";
+
         try
         {
-            var profiles = await _profileInspector.ListL2tpProfilesAsync(CancellationToken.None);
+            var profiles = await _profileInspector.ListL2tpProfilesAsync(cancellation.Token);
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (!OwnsProfileLoad(cancellation))
+            {
+                return;
+            }
+
             var selectedName = (_windowsProfile.SelectedItem as ProfileItem)?.Profile.Name ?? _existing?.EntryName;
             _windowsProfile.Items.Clear();
             foreach (var profile in profiles)
@@ -405,13 +418,46 @@ internal sealed class L2tpSettingsDialog : Form
                 ? "L2TP profiles не найдены."
                 : $"Найдено L2TP profiles: {profiles.Count}";
         }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // Closing the dialog, switching mode or starting a newer refresh owns
+            // cancellation. Do not turn expected UI lifecycle into a visible error.
+        }
         catch (Exception ex)
         {
-            _profileStatus.Text = $"Ошибка: {ex.Message}";
+            if (OwnsProfileLoad(cancellation))
+            {
+                _profileStatus.Text = $"Ошибка: {ex.Message}";
+            }
         }
         finally
         {
-            _refreshProfiles.Enabled = true;
+            if (ReferenceEquals(_profileLoadCancellation, cancellation))
+            {
+                _profileLoadCancellation = null;
+                if (!IsDisposed && !Disposing)
+                {
+                    _refreshProfiles.Enabled = true;
+                }
+            }
+
+            cancellation.Dispose();
+        }
+    }
+
+    private bool OwnsProfileLoad(CancellationTokenSource cancellation) =>
+        ReferenceEquals(_profileLoadCancellation, cancellation) &&
+        !cancellation.IsCancellationRequested &&
+        !IsDisposed &&
+        !Disposing &&
+        SelectedEnum<L2tpConnectionMode>(_mode) == L2tpConnectionMode.ExistingWindowsProfile;
+
+    private void CancelProfileLoad()
+    {
+        var cancellation = _profileLoadCancellation;
+        if (cancellation is not null && !cancellation.IsCancellationRequested)
+        {
+            cancellation.Cancel();
         }
     }
 
@@ -420,6 +466,10 @@ internal sealed class L2tpSettingsDialog : Form
         var existingMode = SelectedEnum<L2tpConnectionMode>(_mode) == L2tpConnectionMode.ExistingWindowsProfile;
         _existingGroup.Visible = existingMode;
         _customGroup.Visible = !existingMode;
+        if (!existingMode)
+        {
+            CancelProfileLoad();
+        }
     }
 
     private void RefreshKeepaliveVisibility()
