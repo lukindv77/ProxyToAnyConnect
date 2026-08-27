@@ -1,0 +1,53 @@
+name: dev-issue24-normalize
+
+on:
+  push:
+    branches: [ dev/issue24-rebuilt ]
+    paths:
+      - '.github/workflows/dev-issue24-normalize.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  normalize-and-validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Restore original line endings and patch fixture bytes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $test = 'tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs'
+          git checkout b0e01c6bd4173e29834250a156d1cfebfe43b210 -- $test
+          @'
+          from pathlib import Path
+          path = Path('tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs')
+          data = path.read_bytes()
+          old = b'            "GET http://example.test/a HTTP/1.1 extra-data"'
+          new = b'            "GET http://example.test/a HTTP/1.0"'
+          if data.count(old) != 1:
+              raise SystemExit(f'expected one obsolete request-line fixture, got {data.count(old)}')
+          path.write_bytes(data.replace(old, new))
+          '@ | python -
+          git diff HEAD --check
+          $changed = @(git diff HEAD --name-only)
+          if ($changed.Count -ne 1 -or $changed[0] -ne $test) {
+            throw "Unexpected normalization patch: $($changed -join ', ')"
+          }
+      - name: Run full aggregate self-tests
+        shell: pwsh
+        run: dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish normalized fixture blob
+        shell: pwsh
+        run: |
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs
+          git commit -m 'test: preserve parser fixture line endings'
+          git push origin HEAD:refs/heads/dev/issue24-rebuilt
