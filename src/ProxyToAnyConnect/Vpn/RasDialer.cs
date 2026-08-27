@@ -181,7 +181,20 @@ internal sealed class RasDialer
         nint handle = 0;
         try
         {
-            var initialResult = _native.Dial(phoneBook, dialParams, notifier, out handle);
+            uint initialResult;
+            try
+            {
+                initialResult = _native.Dial(phoneBook, dialParams, notifier, out handle);
+            }
+            finally
+            {
+                // RASDIALPARAMS is input to the native RasDial call. Once that
+                // handoff returns, asynchronous progress is owned by HRASCONN plus
+                // the rooted callback. Do not retain the DPAPI-unprotected password
+                // in our managed dial-parameter object throughout that callback wait.
+                dialParams.SzPassword = string.Empty;
+            }
+
             if (initialResult != RasNative.ErrorSuccess)
             {
                 if (handle != 0)
@@ -234,6 +247,9 @@ internal sealed class RasDialer
         }
         finally
         {
+            // Also covers implementations of IRasDialNative that throw before the
+            // inner handoff-finally executes in future refactors.
+            dialParams.SzPassword = string.Empty;
             GC.KeepAlive(notifier);
         }
     }
