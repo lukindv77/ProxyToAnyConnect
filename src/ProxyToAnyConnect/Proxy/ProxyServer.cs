@@ -971,7 +971,7 @@ internal sealed class ProxyServer
                     continue;
                 }
 
-                written += Encoding.Latin1.GetBytes(header.Name.AsSpan((), destination[written..]);
+                written += Encoding.Latin1.GetBytes(header.Name.AsSpan(), destination[written..]);
                ": "u8.CopyTo(destination[written..]);
                 written += 2;
                 written += Encoding.Latin1.GetBytes(header.Value.AsSpan(), destination[written..]);
