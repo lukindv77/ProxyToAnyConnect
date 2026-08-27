@@ -106,31 +106,23 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                runCancellation?.Cancel();
-                if (runTask is not null)
-                {
-                    await DrainFailedStartRunAsync(runTask);
-                }
+                var cleanupDefect = await CleanupRejectedStartOwnershipAsync(
+                    ex,
+                    runCancellation,
+                    runTask,
+                    lease);
 
-                runCancellation?.Dispose();
-                if (lease is not null)
+                if (cleanupDefect)
                 {
-                    try
-                    {
-                        await lease.DisposeAsync();
-                    }
-                    catch (Exception cleanupError)
-                    {
-                        AppLog.Warning(
-                            "proxy.start.cleanup_failed",
-                            "Proxy startup ownership cleanup failed after the start attempt was already rejected.",
-                            new
-                            {
-                                ProxyId = _options.Id,
-                                ProxyName = _options.Name,
-                                Error = cleanupError.Message
-                            });
-                    }
+                    AppLog.Warning(
+                        "proxy.start.cleanup_failed",
+                        "Proxy startup was already rejected and one or more secondary ownership cleanup steps also failed.",
+                        new
+                        {
+                            ProxyId = _options.Id,
+                            ProxyName = _options.Name,
+                            PrimaryError = ex.Message
+                        });
                 }
 
                 if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
@@ -156,25 +148,80 @@ internal sealed class ProxyInstanceRuntime : IAsyncDisposable
         }
     }
 
-    private static async Task DrainFailedStartRunAsync(Task runTask)
+    private static async Task<bool> CleanupRejectedStartOwnershipAsync(
+        Exception primaryFailure,
+        CancellationTokenSource? runCancellation,
+        Task? runTask,
+        IAsyncDisposable? lease)
     {
-        try
+        var cleanupDefect = false;
+
+        void Attach(Exception failure, string phase)
         {
-            await runTask;
+            cleanupDefect = true;
+            primaryFailure.Data[$"ProxyStartCleanup:{phase}"] =
+                $"{failure.GetType().FullName}: {failure.Message}";
         }
-        catch (Exception ex) when (ex is OperationCanceledException or IOException or System.Net.Sockets.SocketException)
+
+        if (runCancellation is not null)
         {
-            // The exact run task has been observed and drained. Its shutdown exception
-            // must not replace the readiness/caller-cancellation exception that rejected
-            // the startup transaction.
-            System.Diagnostics.Debug.WriteLine(ex);
+            try
+            {
+                runCancellation.Cancel();
+            }
+            catch (Exception ex)
+            {
+                // Cancellation callbacks are secondary cleanup work. Even when one
+                // throws, CancellationTokenSource has transitioned to cancelled and
+                // the exact run task must still be drained before its lease release.
+                Attach(ex, "run-cancel");
+            }
         }
-        catch (Exception ex)
+
+        if (runTask is not null)
         {
-            // Likewise observe an unexpected run failure while preserving the original
-            // startup rejection as the caller-visible failure.
-            System.Diagnostics.Debug.WriteLine(ex);
+            try
+            {
+                await runTask;
+            }
+            catch (OperationCanceledException) when (runCancellation?.IsCancellationRequested == true)
+            {
+            }
+            catch (Exception ex) when (ex is IOException or System.Net.Sockets.SocketException)
+            {
+                System.Diagnostics.Debug.WriteLine(ex);
+            }
+            catch (Exception ex)
+            {
+                Attach(ex, "run-drain");
+            }
         }
+
+        if (runCancellation is not null)
+        {
+            try
+            {
+                runCancellation.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Attach(ex, "run-token");
+            }
+        }
+
+        if (lease is not null)
+        {
+            try
+            {
+                await lease.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                Attach(ex, "vpn-lease");
+            }
+        }
+
+        return cleanupDefect;
     }
 
     public async Task PauseAsync(CancellationToken cancellationToken = default)
