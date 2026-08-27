@@ -1,0 +1,193 @@
+name: dev-issue26-final
+
+on:
+  push:
+    branches: [ dev/issue26-final ]
+    paths:
+      - '.github/workflows/dev-issue26-final.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Validate Connection options before routing and run aggregate tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = @{
+            'src/ProxyToAnyConnect/Proxy/ProxyServer.cs' = '8f8692442e84f779d04c282770acf6c622c0504e'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs' = '8d071b019ec3b6e29f01cc98e500835a9ef6e8a5'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyConnectionOptionSelfTests.cs' = '0b2cca1f4ec732c5e45130fa731dbdc0b44eb292'
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            if ((git rev-parse "HEAD:$($entry.Key)").Trim() -ne $entry.Value) {
+              throw "Unexpected #26 input blob: $($entry.Key)"
+            }
+          }
+
+          @'
+          from pathlib import Path
+
+          proxy = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = proxy.read_text(encoding='utf-8')
+          anchor = '''            if (!IsValidHeaderValue(rawValue))
+                      {
+                          throw new InvalidDataException("Invalid HTTP header field value.");
+                      }
+
+                      var value = rawValue.Trim();'''
+          replacement = '''            if (!IsValidHeaderValue(rawValue))
+                      {
+                          throw new InvalidDataException("Invalid HTTP header field value.");
+                      }
+
+                      if (name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                      {
+                          ValidateConnectionOptions(rawValue);
+                      }
+
+                      var value = rawValue.Trim();'''
+          if text.count(anchor) != 1:
+              raise SystemExit(f'expected one plain-HTTP header validation anchor, got {text.count(anchor)}')
+          text = text.replace(anchor, replacement)
+
+          marker = '''        private static bool IsValidHeaderValue(ReadOnlySpan<char> value)
+                  {
+                      foreach (var character in value)
+                      {
+                          if ((character < 0x20 && character != '\\t') || character == 0x7F)
+                          {
+                              return false;
+                          }
+                      }
+
+                      return true;
+                  }
+
+              private static void ValidateHeaderLines'''
+          helper = '''        private static bool IsValidHeaderValue(ReadOnlySpan<char> value)
+                  {
+                      foreach (var character in value)
+                      {
+                          if ((character < 0x20 && character != '\\t') || character == 0x7F)
+                          {
+                              return false;
+                          }
+                      }
+
+                      return true;
+                  }
+
+                  private static void ValidateConnectionOptions(ReadOnlySpan<char> value)
+                  {
+                      var segmentStart = 0;
+                      while (segmentStart <= value.Length)
+                      {
+                          var remaining = value[segmentStart..];
+                          var comma = remaining.IndexOf(',');
+                          var segment = comma < 0 ? remaining : remaining[..comma];
+                          var trimStart = 0;
+                          while (trimStart < segment.Length && segment[trimStart] is ' ' or '\\t')
+                          {
+                              trimStart++;
+                          }
+
+                          var trimEnd = segment.Length;
+                          while (trimEnd > trimStart && segment[trimEnd - 1] is ' ' or '\\t')
+                          {
+                              trimEnd--;
+                          }
+
+                          if (!IsValidHeaderName(segment[trimStart..trimEnd]))
+                          {
+                              throw new InvalidDataException("Invalid HTTP Connection option.");
+                          }
+
+                          if (comma < 0)
+                          {
+                              return;
+                          }
+
+                          segmentStart += comma + 1;
+                      }
+                  }
+
+              private static void ValidateHeaderLines'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'expected one Connection-option helper insertion point, got {text.count(marker)}')
+          proxy.write_text(text.replace(marker, helper), encoding='utf-8', newline='')
+
+          runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
+          text = runner.read_text(encoding='utf-8')
+          anchor = '        await RunAsync(nameof(ProxyHttpHeaderValueSelfTests), ProxyHttpHeaderValueSelfTests.RunAsync);\n'
+          addition = anchor + '        await RunAsync(nameof(ProxyConnectionOptionSelfTests), ProxyConnectionOptionSelfTests.RunAsync);\n'
+          if text.count(anchor) != 1:
+              raise SystemExit(f'expected one HTTP header-value runner anchor, got {text.count(anchor)}')
+          runner.write_text(text.replace(anchor, addition), encoding='utf-8', newline='')
+
+          # Bring older staging ancestry to the already-audited #24/#29 test contracts
+          # for this prototype run. These unrelated edits are intentionally not staged.
+          connect = Path('tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs')
+          text = connect.read_text(encoding='utf-8')
+          old_request = '''        var method = requestLine[requestParts[0]].ToString();
+                  var target = requestLine[requestParts[1]].ToString();
+                  var version = requestLine[requestParts[2]].ToString();'''
+          if text.count(old_request) == 1:
+              new_request = '''        var methodSpan = requestLine[requestParts[0]];
+                  var versionSpan = requestLine[requestParts[2]];
+                  if (!IsValidBaselineHeaderName(methodSpan))
+                  {
+                      throw new InvalidDataException("Invalid HTTP method token.");
+                  }
+                  if (!versionSpan.SequenceEqual("HTTP/1.0".AsSpan()) && !versionSpan.SequenceEqual("HTTP/1.1".AsSpan()))
+                  {
+                      throw new InvalidDataException("Unsupported HTTP request version.");
+                  }
+                  var method = methodSpan.ToString();
+                  var target = requestLine[requestParts[1]].ToString();
+                  var version = versionSpan.ToString();'''
+              connect.write_text(text.replace(old_request, new_request), encoding='utf-8', newline='')
+
+          old_pair = '''        var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(
+                      optimizedMedian,
+                      predecessorMedian,
+                      optimizedMedian / predecessorMedian);'''
+          new_pair = '''        var pairedRatios = new double[TimingRounds];
+                  for (var round = 0; round < TimingRounds; round++)
+                  {
+                      pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
+                  }
+                  var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(
+                      optimizedMedian,
+                      predecessorMedian,
+                      Median(pairedRatios));'''
+          for path in Path('tests').rglob('*.cs'):
+              source = path.read_text(encoding='utf-8')
+              if old_pair in source:
+                  source = source.replace(old_pair, new_pair)
+                  source = source.replace('double Ratio);', 'double PairedRatioMedian);')
+                  source = source.replace('.Ratio', '.PairedRatioMedian')
+                  path.write_text(source, encoding='utf-8', newline='')
+          '@ | python -
+
+          git diff --check
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs tests/ProxyToAnyConnect.SelfTests/ProxyConnectionOptionSelfTests.cs
+          git commit -m 'proxy: validate Connection options before outbound routing'
+          git push origin HEAD:refs/heads/dev/issue26-final
