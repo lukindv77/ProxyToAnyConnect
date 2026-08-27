@@ -1,0 +1,408 @@
+name: patch-gui-draft-lifecycle
+
+on:
+  push:
+    branches: [ automation/gui-draft-lifecycle ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply GUI draft and dialog lifetime changes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if text.count(old) != 1:
+                  raise SystemExit(f'Expected exact fragment once in {path}, found {text.count(old)}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          Path('src/ProxyToAnyConnect/Configuration/EditableConfigurationDraft.cs').write_text(r'''namespace ProxyToAnyConnect.Configuration;
+
+/// <summary>
+/// Owns the in-memory configuration being repaired/edited by the GUI. A draft may
+/// be temporarily invalid so multiple independent legacy/configuration defects can
+/// be repaired sequentially. Persistence/runtime publication remains gated on the
+/// complete draft validating successfully.
+/// </summary>
+internal sealed class EditableConfigurationDraft
+{
+    private AppOptions _current;
+
+    public EditableConfigurationDraft(AppOptions initial)
+    {
+        ArgumentNullException.ThrowIfNull(initial);
+        _current = initial;
+        ValidationError = GetValidationError(initial);
+    }
+
+    public AppOptions Current => _current;
+
+    public string? ValidationError { get; private set; }
+
+    public bool IsValid => ValidationError is null;
+
+    /// <summary>
+    /// True after an editor has changed the in-memory generation and until that exact
+    /// generation crosses the durable save boundary. This remains true for a valid
+    /// draft when persistence is cancelled/fails, so the GUI does not falsely report
+    /// the unsaved generation as authoritative.
+    /// </summary>
+    public bool HasUnpersistedChanges { get; private set; }
+
+    public bool Stage(AppOptions candidate)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        _current = candidate;
+        ValidationError = GetValidationError(candidate);
+        HasUnpersistedChanges = true;
+        return ValidationError is null;
+    }
+
+    public void MarkPersisted(AppOptions persisted)
+    {
+        ArgumentNullException.ThrowIfNull(persisted);
+        var validationError = GetValidationError(persisted);
+        if (validationError is not null)
+        {
+            throw new InvalidOperationException(
+                $"Persisted configuration unexpectedly failed validation: {validationError}");
+        }
+
+        _current = persisted;
+        ValidationError = null;
+        HasUnpersistedChanges = false;
+    }
+
+    internal static string? GetValidationError(AppOptions candidate)
+    {
+        try
+        {
+            candidate.Validate();
+            return null;
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ex.Message;
+        }
+    }
+}
+''', encoding='utf-8')
+
+          replace_once(
+              'src/ProxyToAnyConnect/Gui/MainForm.cs',
+              '''    private AppOptions _options;\n    private bool _allowExit;''',
+              '''    private readonly EditableConfigurationDraft _configurationDraft;\n    private AppOptions _options => _configurationDraft.Current;\n    private bool _allowExit;''')
+          replace_once(
+              'src/ProxyToAnyConnect/Gui/MainForm.cs',
+              '''        _options = options;\n        _configPath = configPath;''',
+              '''        _configurationDraft = new EditableConfigurationDraft(options);\n        _configPath = configPath;''')
+          replace_once(
+              'src/ProxyToAnyConnect/Gui/MainForm.cs',
+              '''        SetLabelText(\n            _configurationStatus,\n            string.IsNullOrWhiteSpace(_runtimeHost.ConfigurationError)\n                ? "Конфигурация runtime: OK"\n                : $"Конфигурация runtime: {_runtimeHost.ConfigurationError}");''',
+              '''        var draftStatus = _configurationDraft.ValidationError is { Length: > 0 } draftError\n            ? _configurationDraft.HasUnpersistedChanges\n                ? $"Черновик настроек не сохранён: {draftError}"\n                : $"Сохранённая конфигурация требует исправления: {draftError}"\n            : _configurationDraft.HasUnpersistedChanges\n                ? "Черновик настроек валиден, но ещё не сохранён/не применён."\n                : null;\n        SetLabelText(\n            _configurationStatus,\n            draftStatus ?? (string.IsNullOrWhiteSpace(_runtimeHost.ConfigurationError)\n                ? "Конфигурация runtime: OK"\n                : $"Конфигурация runtime: {_runtimeHost.ConfigurationError}"));''')
+          replace_once(
+              'src/ProxyToAnyConnect/Gui/MainForm.cs',
+              '''    private async Task ApplyConfigurationAsync(\n        AppOptions newOptions,\n        CancellationToken cancellationToken)\n    {\n        var persisted = false;\n        try\n        {\n            await PersistedDesiredConfiguration.SaveThenApplyAsync(\n                newOptions,\n                (desired, operationToken) => desired.SaveAsync(_configPath, operationToken),\n                desired =>\n                {\n                    _options = desired;\n                    RebuildVpnNameIndex();\n                    persisted = true;\n                },\n                (desired, operationToken) => _runtimeHost.ApplyOptionsAsync(desired, operationToken),\n                cancellationToken);\n        }\n        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)\n        {\n            // Exit cancellation may arrive before publication or after durable save.\n            // In the latter case the persisted desired state remains authoritative and\n            // will be reconciled on the next application start.\n        }\n        catch (Exception ex)\n        {\n            MessageBox.Show(\n                this,\n                ex.Message,\n                persisted\n                    ? "Настройки сохранены, runtime не применён"\n                    : "Не удалось применить настройки",\n                MessageBoxButtons.OK,\n                MessageBoxIcon.Error);\n        }\n        finally\n        {\n            if (persisted && Volatile.Read(ref _configurationCommandsStopping) == 0)\n            {\n                // Show the persisted desired settings through subsequent editors and\n                // refresh current runtime/Error state even when reconciliation failed.\n                RefreshRuntimeViews();\n            }\n        }\n    }''',
+              '''    private async Task ApplyConfigurationAsync(\n        AppOptions newOptions,\n        CancellationToken cancellationToken,\n        bool configureLoggingAfterPersist = false)\n    {\n        // Always retain the latest editor result as the repair draft, even when an\n        // unrelated field elsewhere is still invalid. This lets the user repair\n        // several independent defects sequentially. No disk/runtime publication is\n        // attempted until the complete accumulated draft validates.\n        if (!_configurationDraft.Stage(newOptions))\n        {\n            RebuildVpnNameIndex();\n            if (Volatile.Read(ref _configurationCommandsStopping) == 0)\n            {\n                RefreshRuntimeViews();\n                MessageBox.Show(\n                    this,\n                    "Изменение сохранено только в черновике окна. Файл настроек и runtime не изменены.\\n\\n" +\n                    $"Исправьте оставшуюся ошибку: {_configurationDraft.ValidationError}",\n                    "Черновик настроек требует исправления",\n                    MessageBoxButtons.OK,\n                    MessageBoxIcon.Warning);\n            }\n            return;\n        }\n\n        var persisted = false;\n        try\n        {\n            await PersistedDesiredConfiguration.SaveThenApplyAsync(\n                newOptions,\n                (desired, operationToken) => desired.SaveAsync(_configPath, operationToken),\n                desired =>\n                {\n                    _configurationDraft.MarkPersisted(desired);\n                    RebuildVpnNameIndex();\n                    if (configureLoggingAfterPersist)\n                    {\n                        AppLog.Configure(desired.Logging);\n                    }\n                    persisted = true;\n                },\n                (desired, operationToken) => _runtimeHost.ApplyOptionsAsync(desired, operationToken),\n                cancellationToken);\n        }\n        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)\n        {\n            // Exit cancellation may arrive before publication or after durable save.\n            // In the latter case the persisted desired state remains authoritative and\n            // will be reconciled on the next application start.\n        }\n        catch (Exception ex)\n        {\n            MessageBox.Show(\n                this,\n                ex.Message,\n                persisted\n                    ? "Настройки сохранены, runtime не применён"\n                    : "Не удалось применить настройки",\n                MessageBoxButtons.OK,\n                MessageBoxIcon.Error);\n        }\n        finally\n        {\n            if (Volatile.Read(ref _configurationCommandsStopping) == 0)\n            {\n                // Invalid drafts and persisted desired settings both stay visible so\n                // subsequent editors continue from the exact accumulated generation.\n                RefreshRuntimeViews();\n                if (persisted && configureLoggingAfterPersist)\n                {\n                    RefreshLoggingSettings();\n                }\n            }\n        }\n    }''')
+          replace_once(
+              'src/ProxyToAnyConnect/Gui/MainForm.cs',
+              '''        try\n        {\n            await newOptions.SaveAsync(_configPath, cancellationToken);\n            _options = newOptions;\n            AppLog.Configure(newLogging);\n            if (Volatile.Read(ref _configurationCommandsStopping) == 0)\n            {\n                RefreshLoggingSettings();\n            }\n        }\n        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)\n        {\n        }\n        catch (Exception ex)\n        {\n            MessageBox.Show(this, ex.Message, "Не удалось сохранить настройки", MessageBoxButtons.OK, MessageBoxIcon.Error);\n        }''',
+              '''        // A log-field repair may be the final fix that makes an accumulated proxy/VPN\n        // draft valid. Commit/apply the whole draft transactionally so earlier staged\n        // repairs cannot be persisted without the corresponding runtime reconciliation.\n        await ApplyConfigurationAsync(\n            newOptions,\n            cancellationToken,\n            configureLoggingAfterPersist: true);''')
+
+          Path('tests/ProxyToAnyConnect.SelfTests/EditableConfigurationDraftSelfTests.cs').write_text(r'''using ProxyToAnyConnect.Configuration;
+
+namespace ProxyToAnyConnect.SelfTests;
+
+internal static class EditableConfigurationDraftSelfTests
+{
+    public static int Run()
+    {
+        try
+        {
+            MultipleIndependentDefectsCanBeRepairedSequentially();
+            ValidDraftPublicationMarkerRejectsInvalidState();
+            Console.WriteLine(
+                "PASS: editable configuration draft preserves sequential repairs while publication remains validation-gated");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"FAIL: editable configuration draft regression: {ex}");
+            return 1;
+        }
+    }
+
+    private static void MultipleIndependentDefectsCanBeRepairedSequentially()
+    {
+        var initial = CreateOptions(proxyPort: 0, maxResponseBytes: 1);
+        var draft = new EditableConfigurationDraft(initial);
+        if (draft.IsValid || draft.ValidationError is null || draft.HasUnpersistedChanges)
+        {
+            throw new InvalidOperationException("Two-defect initial configuration unexpectedly validated.");
+        }
+
+        var proxyRepair = Clone(
+            draft.Current,
+            proxyPort: 18080,
+            maxResponseBytes: draft.Current.VpnConnections[0].Verification.MaxResponseBytes);
+        if (draft.Stage(proxyRepair))
+        {
+            throw new InvalidOperationException(
+                "Repairing only the proxy defect unexpectedly published a fully valid draft.");
+        }
+        if (draft.Current.Proxies[0].ListenPort != 18080 ||
+            !draft.HasUnpersistedChanges ||
+            draft.ValidationError is null ||
+            !draft.ValidationError.Contains("verification.maxResponseBytes", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "First repair was discarded instead of becoming the base for the next repair.");
+        }
+
+        var secondRepair = Clone(
+            draft.Current,
+            proxyPort: draft.Current.Proxies[0].ListenPort,
+            maxResponseBytes: VerificationOptions.DefaultResponseLimitBytes);
+        if (!draft.Stage(secondRepair) || !draft.IsValid || draft.ValidationError is not null ||
+            !draft.HasUnpersistedChanges)
+        {
+            throw new InvalidOperationException(
+                $"Second repair did not validate the accumulated draft: {draft.ValidationError}");
+        }
+        if (draft.Current.Proxies[0].ListenPort != 18080)
+        {
+            throw new InvalidOperationException("Second repair lost the first staged proxy repair.");
+        }
+    }
+
+    private static void ValidDraftPublicationMarkerRejectsInvalidState()
+    {
+        var draft = new EditableConfigurationDraft(CreateOptions(18080, VerificationOptions.DefaultResponseLimitBytes));
+        draft.MarkPersisted(draft.Current);
+        if (draft.HasUnpersistedChanges)
+        {
+            throw new InvalidOperationException("Persisted draft remained marked dirty.");
+        }
+
+        var invalid = Clone(draft.Current, proxyPort: 0, maxResponseBytes: VerificationOptions.DefaultResponseLimitBytes);
+        if (draft.Stage(invalid))
+        {
+            throw new InvalidOperationException("Invalid candidate unexpectedly validated.");
+        }
+
+        var currentBeforeRejectedPublication = draft.Current;
+        try
+        {
+            draft.MarkPersisted(invalid);
+            throw new InvalidOperationException("Invalid draft was marked as persisted.");
+        }
+        catch (InvalidOperationException ex) when (
+            ex.Message.Contains("Persisted configuration unexpectedly failed validation", StringComparison.Ordinal))
+        {
+        }
+
+        if (!ReferenceEquals(draft.Current, currentBeforeRejectedPublication) ||
+            !draft.HasUnpersistedChanges)
+        {
+            throw new InvalidOperationException(
+                "Rejected persisted marker mutated or falsely cleaned the active repair draft.");
+        }
+    }
+
+    private static AppOptions CreateOptions(int proxyPort, int maxResponseBytes) =>
+        Clone(new AppOptions(), proxyPort, maxResponseBytes);
+
+    private static AppOptions Clone(AppOptions source, int proxyPort, int maxResponseBytes)
+    {
+        var sourceProxy = source.Proxies[0];
+        var sourceVpn = source.VpnConnections[0];
+        return new AppOptions
+        {
+            Proxies =
+            [
+                new ProxyOptions
+                {
+                    Id = sourceProxy.Id,
+                    Name = "Repair proxy",
+                    Enabled = false,
+                    ListenAddress = "127.0.0.1",
+                    ListenPort = proxyPort,
+                    VpnConnectionId = sourceVpn.Id,
+                    MaxConcurrentConnections = 8,
+                    MaxHeaderBytes = 8192,
+                    ClientHeaderTimeoutSeconds = 5,
+                    OutboundConnectTimeoutSeconds = 5,
+                    DnsTimeoutMilliseconds = 1000
+                }
+            ],
+            VpnConnections =
+            [
+                new L2tpOptions
+                {
+                    Id = sourceVpn.Id,
+                    Name = "Repair VPN",
+                    Shared = false,
+                    Mode = L2tpConnectionMode.ExistingWindowsProfile,
+                    EntryName = "SelfTest-repair",
+                    Verification = new VerificationOptions
+                    {
+                        PublicAddress = "vpn.example.com",
+                        ProbeHost = "api.ipify.org",
+                        ProbePort = 443,
+                        ProbePath = "/",
+                        TimeoutSeconds = 5,
+                        MaxResponseBytes = maxResponseBytes
+                    },
+                    Keepalive = new KeepaliveOptions
+                    {
+                        Mode = L2tpKeepaliveMode.Off,
+                        IntervalSeconds = 10,
+                        TimeoutMilliseconds = 1000,
+                        FailureThreshold = 3
+                    }
+                }
+            ],
+            Logging = source.Logging
+        };
+    }
+}
+''', encoding='utf-8')
+
+          replace_once(
+              'src/ProxyToAnyConnect/Gui/L2tpSettingsDialog.cs',
+              '''    private readonly L2tpOptions? _existing;\n    private readonly WindowsVpnProfileInspector _profileInspector = new();\n    private CancellationTokenSource? _profileLoadCancellation;''',
+              '''    private readonly L2tpOptions? _existing;\n    private readonly Func<CancellationToken, Task<IReadOnlyList<VpnProfileInfo>>> _profileLoader;\n    private CancellationTokenSource? _profileLoadCancellation;''')
+          replace_once(
+              'src/ProxyToAnyConnect/Gui/L2tpSettingsDialog.cs',
+              '''    public L2tpSettingsDialog(L2tpOptions? existing)\n    {\n        _existing = existing;''',
+              '''    public L2tpSettingsDialog(L2tpOptions? existing)\n        : this(existing, null)\n    {\n    }\n\n    internal L2tpSettingsDialog(\n        L2tpOptions? existing,\n        Func<CancellationToken, Task<IReadOnlyList<VpnProfileInfo>>>? profileLoader)\n    {\n        _existing = existing;\n        _profileLoader = profileLoader ?? new WindowsVpnProfileInspector().ListL2tpProfilesAsync;''')
+          replace_once(
+              'src/ProxyToAnyConnect/Gui/L2tpSettingsDialog.cs',
+              '    private void StartWindowsProfileLoad()',
+              '    internal void StartWindowsProfileLoad()')
+          replace_once(
+              'src/ProxyToAnyConnect/Gui/L2tpSettingsDialog.cs',
+              '            var profiles = await _profileInspector.ListL2tpProfilesAsync(cancellation.Token);',
+              '            var profiles = await _profileLoader(cancellation.Token);')
+
+          Path('tests/ProxyToAnyConnect.SelfTests/L2tpSettingsDialogBackgroundSelfTests.cs').write_text(r'''using ProxyToAnyConnect.Gui;
+using ProxyToAnyConnect.Vpn;
+
+namespace ProxyToAnyConnect.SelfTests;
+
+internal static class L2tpSettingsDialogBackgroundSelfTests
+{
+    public static async Task<int> RunAsync()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("SKIP: L2TP dialog background ownership test requires Windows WinForms.");
+            return 0;
+        }
+
+        try
+        {
+            await StopWaitsForExactProfileLoadDrainAsync();
+            Console.WriteLine(
+                "PASS: L2TP settings dialog cancellation waits for exact profile-helper generation drain and becomes terminal");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"FAIL: L2TP settings dialog background ownership regression: {ex}");
+            return 1;
+        }
+    }
+
+    private static async Task StopWaitsForExactProfileLoadDrainAsync()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowDrain = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var loadCount = 0;
+
+        async Task<IReadOnlyList<VpnProfileInfo>> LoadAsync(CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref loadCount);
+            started.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                cancellationObserved.TrySetResult();
+                await allowDrain.Task;
+                throw;
+            }
+
+            return [];
+        }
+
+        using var dialog = new L2tpSettingsDialog(existing: null, profileLoader: LoadAsync);
+        dialog.StartWindowsProfileLoad();
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stopTask = dialog.StopBackgroundOperationsAsync();
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        if (stopTask.IsCompleted)
+        {
+            throw new InvalidOperationException(
+                "Dialog shutdown completed before its cancelled profile load finished helper drain.");
+        }
+
+        allowDrain.TrySetResult();
+        await stopTask.WaitAsync(TimeSpan.FromSeconds(2));
+        await dialog.StopBackgroundOperationsAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        dialog.StartWindowsProfileLoad();
+        await Task.Delay(50);
+        if (Volatile.Read(ref loadCount) != 1)
+        {
+            throw new InvalidOperationException(
+                $"Stopped dialog admitted {loadCount} profile-load generations; expected exactly one.");
+        }
+    }
+}
+''', encoding='utf-8')
+
+          replace_once(
+              'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs',
+              '        Run(nameof(SettingsValidationSelfTests), SettingsValidationSelfTests.Run);\n',
+              '        Run(nameof(SettingsValidationSelfTests), SettingsValidationSelfTests.Run);\n        Run(nameof(EditableConfigurationDraftSelfTests), EditableConfigurationDraftSelfTests.Run);\n')
+          replace_once(
+              'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs',
+              '        await RunAsync(nameof(ConfigurationDialogOwnerSelfTests), ConfigurationDialogOwnerSelfTests.RunAsync);\n',
+              '        await RunAsync(nameof(ConfigurationDialogOwnerSelfTests), ConfigurationDialogOwnerSelfTests.RunAsync);\n        await RunAsync(nameof(L2tpSettingsDialogBackgroundSelfTests), L2tpSettingsDialogBackgroundSelfTests.RunAsync);\n')
+          replace_once(
+              'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs',
+              'bounded-settings/secret-pruning, configuration-persistence',
+              'bounded-settings/secret-pruning/editable-draft-repair, configuration-persistence')
+          replace_once(
+              'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs',
+              'GUI-modal-ownership/application-shutdown-ordering',
+              'GUI-modal-ownership/L2TP-dialog-helper-drain/application-shutdown-ordering')
+
+      - name: Commit feature changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/patch-gui-draft-lifecycle.yml
+          git add src tests
+          git diff --cached --check
+          git commit -m 'feat: preserve sequential GUI repair drafts and helper ownership'
+          git push origin HEAD:automation/gui-draft-lifecycle
