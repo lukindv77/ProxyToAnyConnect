@@ -1,0 +1,214 @@
+diff --git a/src/ProxyToAnyConnect/Configuration/AppOptions.cs b/src/ProxyToAnyConnect/Configuration/AppOptions.cs
+--- a/src/ProxyToAnyConnect/Configuration/AppOptions.cs
++++ b/src/ProxyToAnyConnect/Configuration/AppOptions.cs
+@@ -312,10 +312,9 @@ internal sealed class AppOptions
+-        if (string.IsNullOrWhiteSpace(verification.ProbePath) ||
+-            !verification.ProbePath.StartsWith("/", StringComparison.Ordinal))
++        if (!VerificationOptions.IsValidProbePath(verification.ProbePath))
+         {
+-            throw new InvalidOperationException($"L2TP '{name}' verification.probePath must start with '/'.");
++            throw new InvalidOperationException(
++                $"L2TP '{name}' verification.probePath must be an ASCII HTTP origin-form request-target without a fragment.");
+         }
+@@ -566,6 +565,47 @@ internal sealed class VerificationOptions
+     [JsonPropertyName("maxResponseBytes")]
+     public int MaxResponseBytes { get; init; } = DefaultResponseLimitBytes;
++
++    internal static bool IsValidProbePath(string? value)
++    {
++        if (string.IsNullOrEmpty(value) || value[0] != '/')
++        {
++            return false;
++        }
++
++        for (var index = 0; index < value.Length; index++)
++        {
++            var current = value[index];
++            if (current is '/' or '?')
++            {
++                continue;
++            }
++
++            if (current == '%')
++            {
++                if (index > value.Length - 3 ||
++                    !IsAsciiHexDigit(value[index + 1]) ||
++                    !IsAsciiHexDigit(value[index + 2]))
++                {
++                    return false;
++                }
++
++                index += 2;
++                continue;
++            }
++
++            if (!IsAsciiPchar(current))
++            {
++                return false;
++            }
++        }
++
++        return true;
++    }
++
++    private static bool IsAsciiPchar(char value) =>
++        value is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or
++        '-' or '.' or '_' or '~' or
++        '!' or '$' or '&' or '\'' or '(' or ')' or '*' or '+' or ',' or ';' or '=' or ':' or '@';
++
++    private static bool IsAsciiHexDigit(char value) =>
++        value is >= '0' and <= '9' or >= 'A' and <= 'F' or >= 'a' and <= 'f';
+ }
+diff --git a/src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs b/src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs
+--- a/src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs
++++ b/src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs
+@@ -137,6 +137,12 @@ internal sealed class VpnConnectivityVerifier
+         host ??= string.Empty;
+         path ??= string.Empty;
++
++        if (!VerificationOptions.IsValidProbePath(path))
++        {
++            throw new ArgumentException(
++                "Verification probe path must be an ASCII HTTP origin-form request-target without a fragment.",
++                nameof(path));
++        }
+ 
+         ReadOnlySpan<byte> requestPrefix = "GET "u8;
+diff --git a/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs b/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs
+--- a/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs
++++ b/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs
+@@ -10,11 +10,12 @@ internal static class SettingsValidationSelfTests
+         try
+         {
+             VerificationResponseLimitIsBounded();
++            VerificationProbePathIsWireExactOriginForm();
+             InvalidNumericValuesAreRepairable();
+             UnusedProtectedSecretsAreDropped();
+ 
+             Console.WriteLine(
+-                "PASS: settings enforce bounded verification responses, repair numeric values and drop unused secrets");
++                "PASS: settings enforce bounded verification responses, byte-exact probe targets, repair numeric values and drop unused secrets");
+             return 0;
+@@ -44,6 +45,50 @@ internal static class SettingsValidationSelfTests
+             $"verification.maxResponseBytes={maxResponseBytes} escaped the bounded configuration contract.");
+     }
++
++    private static void VerificationProbePathIsWireExactOriginForm()
++    {
++        foreach (var valid in new[]
++                 {
++                     "/",
++                     "/?format=text",
++                     "/ip/check?x=1%202",
++                     "/caf%C3%A9?next=%2Fok&flag=true"
++                 })
++        {
++            CreateOptions(VerificationOptions.DefaultResponseLimitBytes, valid).Validate();
++        }
++
++        foreach (var invalid in new[]
++                 {
++                     string.Empty,
++                     "relative",
++                     "/contains space",
++                     "/tab\tvalue",
++                     "/line\r\nHost: injected.example",
++                     "/café",
++                     "/fragment#value",
++                     "/bad%2",
++                     "/bad%ZZ",
++                     "/back\\slash",
++                     "/raw[bracket]"
++                 })
++        {
++            try
++            {
++                CreateOptions(VerificationOptions.DefaultResponseLimitBytes, invalid).Validate();
++            }
++            catch (InvalidOperationException ex) when (
++                ex.Message.Contains("verification.probePath", StringComparison.Ordinal))
++            {
++                continue;
++            }
++
++            throw new InvalidOperationException(
++                $"verification.probePath '{EscapeForDiagnostic(invalid)}' escaped the byte-exact origin-form contract.");
++        }
++    }
++
++    private static string EscapeForDiagnostic(string value) =>
++        value.Replace("\r", "\\r", StringComparison.Ordinal)
++            .Replace("\n", "\\n", StringComparison.Ordinal)
++            .Replace("\t", "\\t", StringComparison.Ordinal);
+@@ -99,7 +144,7 @@ internal static class SettingsValidationSelfTests
+-    private static AppOptions CreateOptions(int maxResponseBytes) =>
++    private static AppOptions CreateOptions(int maxResponseBytes, string probePath = "/") =>
+         new()
+@@ -135,7 +180,7 @@ internal static class SettingsValidationSelfTests
+                         PublicAddress = "vpn.example.com",
+                         ProbeHost = "api.ipify.org",
+                         ProbePort = 443,
+-                        ProbePath = "/",
++                        ProbePath = probePath,
+                         TimeoutSeconds = 5,
+diff --git a/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs b/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs
+--- a/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs
++++ b/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs
+@@ -16,6 +16,7 @@ internal static class VerificationProbeRequestSelfTests
+         try
+         {
+             RequestWireBytesRemainEquivalent();
++            InvalidRequestTargetsAreRejectedByBuilder();
+ 
+             for (var i = 0; i < WarmupIterations; i++)
+@@ -71,9 +72,8 @@ internal static class VerificationProbeRequestSelfTests
+         [
+             (RepresentativeHost, RepresentativePath),
+             ("example.com", "/"),
+-            (string.Empty, string.Empty),
+-            (null, null),
+-            ("münich.example", "/café/😀")
++            ("example.com", "/ip/check?x=1%202"),
++            ("example.com", "/caf%C3%A9?next=%2Fok&flag=true")
+         ];
+@@ -89,6 +89,41 @@ internal static class VerificationProbeRequestSelfTests
+         }
+     }
++
++    private static void InvalidRequestTargetsAreRejectedByBuilder()
++    {
++        foreach (var invalid in new string?[]
++                 {
++                     null,
++                     string.Empty,
++                     "relative",
++                     "/contains space",
++                     "/line\r\nHost: injected.example",
++                     "/café",
++                     "/fragment#value",
++                     "/bad%2",
++                     "/bad%GG"
++                 })
++        {
++            try
++            {
++                _ = VpnConnectivityVerifier.BuildProbeRequest("example.com", invalid);
++            }
++            catch (ArgumentException ex) when (ex.ParamName == "path")
++            {
++                continue;
++            }
++
++            throw new InvalidOperationException(
++                $"Verification request builder accepted unsafe/lossy target '{EscapeForDiagnostic(invalid)}'.");
++        }
++    }
++
++    private static string EscapeForDiagnostic(string? value) =>
++        value is null
++            ? "<null>"
++            : value.Replace("\r", "\\r", StringComparison.Ordinal)
++                .Replace("\n", "\\n", StringComparison.Ordinal)
++                .Replace("\t", "\\t", StringComparison.Ordinal);
+ 
+     private static byte[] LegacyBuildProbeRequest(string? host, string? path)
