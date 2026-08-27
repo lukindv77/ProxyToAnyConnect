@@ -1,5 +1,4 @@
 using System.Text.Json;
-using ProxyToAnyConnect.Configuration;
 
 namespace ProxyToAnyConnect.Diagnostics;
 
@@ -21,34 +20,65 @@ internal static class AppLog
 
     public static void Configure(string? rootDirectory, int retentionDays, bool consoleJson)
     {
-        var resolvedRoot = string.IsNullOrWhiteSpace(rootDirectory)
-            ? AppContext.BaseDirectory
-            : Path.GetFullPath(rootDirectory, AppContext.BaseDirectory);
-
-        DailyJsonlLogStore? newStore = null;
+        DailyJsonlLogStore? newStore;
         try
         {
+            var resolvedRoot = string.IsNullOrWhiteSpace(rootDirectory)
+                ? AppContext.BaseDirectory
+                : Path.GetFullPath(rootDirectory, AppContext.BaseDirectory);
             newStore = new DailyJsonlLogStore(resolvedRoot, retentionDays);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception ex) when (
+            ex is IOException or
+                UnauthorizedAccessException or
+                ArgumentException or
+                NotSupportedException or
+                System.Security.SecurityException)
         {
-            Interlocked.Exchange(ref _fileDisabled, 1);
-            System.Diagnostics.Debug.WriteLine($"Structured file logging disabled: {ex.Message}");
+            // Configuration is deliberately loaded for editing before full runtime
+            // validation. A malformed or inaccessible log root must therefore not
+            // terminate startup before the repair UI is available. If logging was
+            // already healthy, keep the previous store transactionally rather than
+            // disabling diagnostics because a replacement could not be created.
+            lock (Gate)
+            {
+                _consoleJson = consoleJson;
+                if (_store is null)
+                {
+                    Interlocked.Exchange(ref _fileDisabled, 1);
+                }
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"Structured file logging configuration was rejected: {ex.Message}");
+            return;
         }
 
+        DailyJsonlLogStore? previous;
         lock (Gate)
         {
-            var previous = _store;
+            previous = _store;
             _store = newStore;
             _consoleJson = consoleJson;
-            Interlocked.Exchange(ref _fileDisabled, newStore is null ? 1 : 0);
-            previous?.Dispose();
+            Interlocked.Exchange(ref _fileDisabled, 0);
         }
 
-        if (newStore is not null)
+        previous?.Dispose();
+        _ = CleanupRetentionSafelyAsync(newStore);
+    }
+
+    public static void Shutdown()
+    {
+        DailyJsonlLogStore? previous;
+        lock (Gate)
         {
-            _ = CleanupRetentionSafelyAsync(newStore);
+            previous = _store;
+            _store = null;
+            _consoleJson = false;
+            Interlocked.Exchange(ref _fileDisabled, 1);
         }
+
+        previous?.Dispose();
     }
 
     public static void Info(string eventName, string message, object? data = null) =>
@@ -138,8 +168,14 @@ internal static class AppLog
         {
             await store.CleanupRetentionAsync();
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException)
+        catch (Exception ex) when (
+            ex is IOException or
+                UnauthorizedAccessException or
+                OperationCanceledException or
+                ObjectDisposedException)
         {
+            // A concurrent reconfiguration/shutdown may dispose this exact store
+            // before its best-effort startup cleanup begins.
             System.Diagnostics.Debug.WriteLine($"Log retention cleanup failed: {ex.Message}");
         }
     }
