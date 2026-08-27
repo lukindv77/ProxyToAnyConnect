@@ -50,31 +50,31 @@ jobs:
           if text.count(old_signature) != 1:
               raise SystemExit(f'expected one ExecutePowerShellAsync signature, got {text.count(old_signature)}')
           text = text.replace(old_signature, new_signature)
-          old_timeout = '        timeout.CancelAfter(InspectionTimeout);'
-          new_timeout = '        timeout.CancelAfter(effectiveOperationTimeout);'
-          if text.count(old_timeout) != 1:
-              raise SystemExit(f'expected one production inspection timeout arm, got {text.count(old_timeout)}')
-          production.write_text(text.replace(old_timeout, new_timeout), encoding='utf-8', newline='')
+          timeout_arm = '        timeout.CancelAfter(InspectionTimeout);'
+          if text.count(timeout_arm) != 1:
+              raise SystemExit(f'expected one production inspection timeout arm, got {text.count(timeout_arm)}')
+          production.write_text(
+              text.replace(timeout_arm, '        timeout.CancelAfter(effectiveOperationTimeout);'),
+              encoding='utf-8', newline='')
 
           test = Path('tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs')
           text = test.read_text(encoding='utf-8')
           timeout_anchor = '    private static readonly TimeSpan HelperStartupObservationTimeout = TimeSpan.FromSeconds(15);\n'
-          timeout_addition = timeout_anchor + '    private static readonly TimeSpan HelperExecutionTimeout = TimeSpan.FromSeconds(30);\n'
           if text.count(timeout_anchor) != 1:
               raise SystemExit(f'expected one helper startup timeout anchor, got {text.count(timeout_anchor)}')
-          text = text.replace(timeout_anchor, timeout_addition)
-          old_call = '''            var inspection = WindowsVpnProfileInspector.ExecutePowerShellAsync(
-                      script,
-                      "exercise cancellation ownership",
-                      cancellation.Token);'''
-          new_call = '''            var inspection = WindowsVpnProfileInspector.ExecutePowerShellAsync(
-                      script,
-                      "exercise cancellation ownership",
-                      cancellation.Token,
-                      HelperExecutionTimeout);'''
-          if text.count(old_call) != 1:
-              raise SystemExit(f'expected one synthetic helper call, got {text.count(old_call)}')
-          test.write_text(text.replace(old_call, new_call), encoding='utf-8', newline='')
+          text = text.replace(
+              timeout_anchor,
+              timeout_anchor + '    private static readonly TimeSpan HelperExecutionTimeout = TimeSpan.FromSeconds(30);\n')
+          call_tail = '''                cancellation.Token);
+
+                      // Hosted Windows images can have highly variable cold PowerShell/process'''
+          replacement_tail = '''                cancellation.Token,
+                      HelperExecutionTimeout);
+
+                      // Hosted Windows images can have highly variable cold PowerShell/process'''
+          if text.count(call_tail) != 1:
+              raise SystemExit(f'expected one synthetic helper call tail, got {text.count(call_tail)}')
+          test.write_text(text.replace(call_tail, replacement_tail), encoding='utf-8', newline='')
           '@ | python -
           git diff --check
 
@@ -88,7 +88,6 @@ jobs:
                   await WindowsVpnProfileInspectorLifetimeSelfTests.RunAsync();
           }
           '@ | Set-Content -LiteralPath $runner -Encoding utf8
-
           dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
           git checkout -- $runner
           git diff --check
@@ -130,12 +129,11 @@ jobs:
           if text.count(old_signature) != 1:
               raise SystemExit('unexpected ExecutePowerShellAsync signature')
           text = text.replace(old_signature, new_signature)
-          if text.count('        timeout.CancelAfter(InspectionTimeout);') != 1:
+          timeout_arm = '        timeout.CancelAfter(InspectionTimeout);'
+          if text.count(timeout_arm) != 1:
               raise SystemExit('unexpected production timeout arm')
           production.write_text(
-              text.replace(
-                  '        timeout.CancelAfter(InspectionTimeout);',
-                  '        timeout.CancelAfter(effectiveOperationTimeout);'),
+              text.replace(timeout_arm, '        timeout.CancelAfter(effectiveOperationTimeout);'),
               encoding='utf-8', newline='')
 
           test = Path('tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs')
@@ -146,23 +144,20 @@ jobs:
           text = text.replace(
               timeout_anchor,
               timeout_anchor + '    private static readonly TimeSpan HelperExecutionTimeout = TimeSpan.FromSeconds(30);\n')
-          old_call = '''            var inspection = WindowsVpnProfileInspector.ExecutePowerShellAsync(
-                      script,
-                      "exercise cancellation ownership",
-                      cancellation.Token);'''
-          new_call = '''            var inspection = WindowsVpnProfileInspector.ExecutePowerShellAsync(
-                      script,
-                      "exercise cancellation ownership",
-                      cancellation.Token,
-                      HelperExecutionTimeout);'''
-          if text.count(old_call) != 1:
-              raise SystemExit('unexpected synthetic helper call')
-          test.write_text(text.replace(old_call, new_call), encoding='utf-8', newline='')
+          call_tail = '''                cancellation.Token);
+
+                      // Hosted Windows images can have highly variable cold PowerShell/process'''
+          replacement_tail = '''                cancellation.Token,
+                      HelperExecutionTimeout);
+
+                      // Hosted Windows images can have highly variable cold PowerShell/process'''
+          if text.count(call_tail) != 1:
+              raise SystemExit('unexpected synthetic helper call tail')
+          test.write_text(text.replace(call_tail, replacement_tail), encoding='utf-8', newline='')
           '@ | python -
           git diff --check
 
           $runner = 'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
-          $runnerBackup = Get-Content -LiteralPath $runner -Raw
           @'
           namespace ProxyToAnyConnect.SelfTests;
 
@@ -173,7 +168,6 @@ jobs:
           }
           '@ | Set-Content -LiteralPath $runner -Encoding utf8
           dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
-          Set-Content -LiteralPath $runner -Value $runnerBackup -NoNewline -Encoding utf8
           git checkout -- $runner
 
           git config user.name 'ProxyToAnyConnect CI'
