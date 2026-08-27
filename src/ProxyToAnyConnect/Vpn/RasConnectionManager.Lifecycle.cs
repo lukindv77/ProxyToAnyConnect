@@ -7,7 +7,9 @@ namespace ProxyToAnyConnect.Vpn;
 
 internal sealed partial class RasConnectionManager
 {
-    private async Task CleanupFailedConnectionAsync(ConnectionResult? result)
+    private async Task CleanupFailedConnectionAsync(
+        ConnectionResult? result,
+        Exception primaryFailure)
     {
         if (result is null)
         {
@@ -22,18 +24,40 @@ internal sealed partial class RasConnectionManager
         }
         catch (Exception ex)
         {
-            // Cleanup must not replace the foreground dial/verification failure or
-            // caller cancellation that caused this path. Keep the cleanup defect
-            // visible in diagnostics while preserving the primary control flow.
+            // A rejected dial/verification still owns its exact HRASCONN until RAS
+            // proves terminal invalid-handle. Retain that handle for a later cleanup
+            // attempt rather than losing it while preserving the foreground failure.
+            _ = Interlocked.CompareExchange(ref _rasConnection, result.Handle, 0);
+            primaryFailure.Data["RasCleanup:rejected-connection-hangup"] =
+                $"{ex.GetType().FullName}: {ex.Message}";
+
             AppLog.Warning(
                 "vpn.ras.cleanup_incomplete",
-                "RAS teardown after a rejected connection did not drain cleanly.",
+                "RAS teardown after a rejected connection did not drain cleanly; exact handle ownership was retained for retry.",
                 new
                 {
                     VpnId = _options.Id,
                     VpnName = _options.Name,
-                    Error = ex.Message
+                    Error = ex.Message,
+                    PendingHandleRetained = Volatile.Read(ref _rasConnection) == result.Handle
                 });
+        }
+    }
+
+    private void RetainEphemeralPhonebookForPendingRas(
+        ref EphemeralRasPhonebook? localEphemeralPhonebook)
+    {
+        if (localEphemeralPhonebook is null || Volatile.Read(ref _rasConnection) == 0)
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(
+                ref _ephemeralPhonebook,
+                localEphemeralPhonebook,
+                null) is null)
+        {
+            localEphemeralPhonebook = null;
         }
     }
 
@@ -91,6 +115,46 @@ internal sealed partial class RasConnectionManager
         }
     }
 
+    private async Task HangUpClaimedRasHandleAsync(nint handle)
+    {
+        if (handle == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await _dialer.HangUpAndDrainAsync(handle);
+        }
+        catch
+        {
+            // The caller claimed this exact generation by moving the shared slot to
+            // zero. Restore ownership only if nobody has published another handle in
+            // the meantime; never overwrite a newer generation.
+            _ = Interlocked.CompareExchange(ref _rasConnection, handle, 0);
+            throw;
+        }
+    }
+
+    private async Task<nint> DrainPendingRasOwnershipLockedAsync()
+    {
+        var handle = Interlocked.Exchange(ref _rasConnection, 0);
+        if (handle != 0)
+        {
+            await HangUpClaimedRasHandleAsync(handle);
+        }
+
+        // The private phonebook is dependent on terminal RAS ownership. It is only
+        // safe to delete after no non-terminal handle remains in the manager slot.
+        if (Volatile.Read(ref _rasConnection) == 0)
+        {
+            var ephemeral = Interlocked.Exchange(ref _ephemeralPhonebook, null);
+            ephemeral?.Dispose();
+        }
+
+        return handle;
+    }
+
     private void SetState(VpnConnectionState state)
     {
         var previous = (VpnConnectionState)Interlocked.Exchange(ref _state, (int)state);
@@ -132,9 +196,10 @@ internal sealed partial class RasConnectionManager
                 CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "context-disconnect");
             }
 
-            // Remove the current handle before cancelling the old monitor. Even if
-            // the monitor was already entering fail-closed cleanup, its compare-
-            // exchange cannot act on a future/replacement RAS session.
+            // Claim the currently published handle before cancelling the monitor so
+            // explicit disconnect owns this generation. If the monitor had already
+            // claimed it, StopMonitorLockedAsync waits for that cleanup and a failed
+            // monitor hangup restores the handle for the second claim below.
             var handle = Interlocked.Exchange(ref _rasConnection, 0);
 
             try
@@ -146,11 +211,16 @@ internal sealed partial class RasConnectionManager
                 CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "monitor-stop");
             }
 
+            if (handle == 0)
+            {
+                handle = Interlocked.Exchange(ref _rasConnection, 0);
+            }
+
             if (handle != 0)
             {
                 try
                 {
-                    await _dialer.HangUpAndDrainAsync(handle);
+                    await HangUpClaimedRasHandleAsync(handle);
                     AppLog.Info(
                         "vpn.ras.hangup",
                         "RAS connection was disconnected.",
@@ -168,16 +238,19 @@ internal sealed partial class RasConnectionManager
                 }
             }
 
-            var ephemeral = Interlocked.Exchange(ref _ephemeralPhonebook, null);
-            if (ephemeral is not null)
+            if (Volatile.Read(ref _rasConnection) == 0)
             {
-                try
+                var ephemeral = Interlocked.Exchange(ref _ephemeralPhonebook, null);
+                if (ephemeral is not null)
                 {
-                    ephemeral.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "ephemeral-phonebook");
+                    try
+                    {
+                        ephemeral.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "ephemeral-phonebook");
+                    }
                 }
             }
 
@@ -207,6 +280,22 @@ internal sealed partial class RasConnectionManager
             catch (Exception ex)
             {
                 CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "disconnect");
+            }
+
+            // A transient RasHangUp failure must not automatically strand the exact
+            // handle until process exit. Make one bounded immediate retry while this
+            // manager still owns its lifecycle gate; preserve the first cleanup error
+            // as the caller-visible diagnostic even if the retry succeeds.
+            if (Volatile.Read(ref _rasConnection) != 0)
+            {
+                try
+                {
+                    await DisconnectAsync();
+                }
+                catch (Exception ex)
+                {
+                    CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "disconnect-retry");
+                }
             }
         }
         finally
