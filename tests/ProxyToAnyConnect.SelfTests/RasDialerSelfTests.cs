@@ -14,13 +14,14 @@ internal static class RasDialerSelfTests
             await NativeThrowStillClearsManagedPasswordAsync();
             await ConnectedNotificationReturnsExactHandleAsync();
             await CallerCancellationHangsUpAndDrainsAsync();
+            await CallerCancellationSurvivesHangupFailureAsync();
             await InitialFailureWithHandleStillDrainsAsync();
             await TerminalDialFailureHangsUpAndDrainsAsync();
             await DisconnectedBeforeConnectedHangsUpAndDrainsAsync();
             await RepeatedCancellationDoesNotDuplicateOwnershipAsync();
 
             Console.WriteLine(
-                "PASS: asynchronous RAS dial ownership clears managed passwords, cancels and drains exact connection handles");
+                "PASS: asynchronous RAS dial ownership clears managed passwords, preserves cancellation and drains exact connection handles");
             return 0;
         }
         catch (Exception ex)
@@ -138,6 +139,43 @@ internal static class RasDialerSelfTests
         }
 
         throw new InvalidOperationException("Caller cancellation was not propagated by RasDialer.");
+    }
+
+    private static async Task CallerCancellationSurvivesHangupFailureAsync()
+    {
+        const uint hangUpFailure = 632;
+        var native = new FakeRasDialNative(hangUpResult: hangUpFailure);
+        var dialer = new RasDialer(native);
+        using var cancellation = new CancellationTokenSource();
+        var dialTask = dialer.DialAsync(null, CreateDialParams(), cancellation.Token);
+
+        await native.WaitUntilDialStartedAsync();
+        cancellation.Cancel();
+
+        try
+        {
+            _ = await dialTask;
+        }
+        catch (OperationCanceledException ex) when (cancellation.IsCancellationRequested)
+        {
+            if (native.HangUpCount != 1 || native.StatusCount != 0)
+            {
+                throw new InvalidOperationException(
+                    "Cancellation teardown did not stop at the synthetic RasHangUp failure.");
+            }
+
+            if (ex.Data["RasTeardownError"] is not string teardownError ||
+                !teardownError.Contains("RasHangUp failed", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Cancellation preserved its type but lost the secondary RAS teardown diagnostic.");
+            }
+
+            return;
+        }
+
+        throw new InvalidOperationException(
+            "A RasHangUp cleanup failure replaced or swallowed caller cancellation.");
     }
 
     private static async Task InitialFailureWithHandleStillDrainsAsync()
@@ -269,16 +307,19 @@ internal static class RasDialerSelfTests
             TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly uint _initialResult;
         private readonly int _statusSuccessesBeforeInvalid;
+        private readonly uint _hangUpResult;
         private RasDialCallback? _notifier;
         private int _statusCount;
 
         public FakeRasDialNative(
             uint initialResult = RasNative.ErrorSuccess,
             int statusSuccessesBeforeInvalid = 0,
-            nint? handle = null)
+            nint? handle = null,
+            uint hangUpResult = RasNative.ErrorSuccess)
         {
             _initialResult = initialResult;
             _statusSuccessesBeforeInvalid = statusSuccessesBeforeInvalid;
+            _hangUpResult = hangUpResult;
             Handle = handle ?? (nint)0x12345;
         }
 
@@ -306,7 +347,7 @@ internal static class RasDialerSelfTests
         {
             HangUpCount++;
             LastHungUpHandle = rasConnection;
-            return RasNative.ErrorSuccess;
+            return _hangUpResult;
         }
 
         public uint GetConnectStatus(nint rasConnection)
