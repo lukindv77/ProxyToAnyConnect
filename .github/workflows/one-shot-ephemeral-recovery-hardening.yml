@@ -1,0 +1,542 @@
+name: one-shot-ephemeral-recovery-hardening
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/one-shot-ephemeral-recovery-hardening.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Harden managed ephemeral session recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('src/ProxyToAnyConnect/Vpn/EphemeralRasPhonebook.cs')
+          text = source.read_text(encoding='utf-8')
+
+          text = text.replace(
+              '    internal const string OwnershipLockFileName = ".owner.lock";\n',
+              '    internal const string OwnershipLockFileName = ".owner.lock";\n'
+              '    internal const string PhoneBookFileName = "session.pbk";\n'
+              '    private const long MaxOwnershipMarkerBytes = 1024;\n',
+              1)
+
+          old_root = '''        var rasRoot = SessionRootDirectory;\n        Directory.CreateDirectory(rasRoot);\n        var sanitizedId = SanitizeId(options.Id);\n'''
+          new_root = '''        var productTempRoot = Path.Combine(Path.GetTempPath(), "ProxyToAnyConnect");\n        Directory.CreateDirectory(productTempRoot);\n        EnsureRegularDirectory(productTempRoot, "ProxyToAnyConnect temporary root");\n\n        var rasRoot = SessionRootDirectory;\n        Directory.CreateDirectory(rasRoot);\n        EnsureRegularDirectory(rasRoot, "ProxyToAnyConnect RAS session root");\n        var sanitizedId = SanitizeId(options.Id);\n'''
+          if text.count(old_root) != 1:
+              raise SystemExit('Expected Create root fragment was not found exactly once.')
+          text = text.replace(old_root, new_root, 1)
+
+          text = text.replace(
+              '            var phoneBookPath = Path.Combine(sessionRoot, "session.pbk");\n',
+              '            var phoneBookPath = Path.Combine(sessionRoot, PhoneBookFileName);\n',
+              1)
+          text = text.replace(
+              '                TryDeleteSessionDirectory(sessionRoot);\n',
+              '                _ = TryDeleteOwnedSessionDirectory(sessionRoot);\n',
+              1)
+
+          start = text.index('    internal static void CleanupOrphanedSessionDirectories()\n')
+          end = text.index('    public RasNative.RasDialParams CreateDialParams', start)
+          replacement = r'''    internal static void CleanupOrphanedSessionDirectories()
+    {
+        var root = SessionRootDirectory;
+        if (!Directory.Exists(root) || !IsRegularDirectory(root))
+        {
+            return;
+        }
+
+        var productTempRoot = Path.GetDirectoryName(root);
+        if (string.IsNullOrWhiteSpace(productTempRoot) || !IsRegularDirectory(productTempRoot))
+        {
+            return;
+        }
+
+        string[] sessionDirectories;
+        try
+        {
+            sessionDirectories = Directory
+                .EnumerateDirectories(root, "*", SearchOption.TopDirectoryOnly)
+                .ToArray();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        foreach (var sessionDirectory in sessionDirectories)
+        {
+            if (!TryGetExpectedEntryName(sessionDirectory, out var expectedEntryName) ||
+                !TryValidateManagedLeafSet(sessionDirectory))
+            {
+                // A non-canonical directory, reparse point or unexpected child is not
+                // an exact owner. Preserve it rather than traversing/deleting content
+                // that may have been introduced by another process.
+                continue;
+            }
+
+            var markerPath = Path.Combine(sessionDirectory, OwnershipMarkerFileName);
+            if (!TryReadValidOwnershipMarker(markerPath, expectedEntryName))
+            {
+                continue;
+            }
+
+            var lockPath = Path.Combine(sessionDirectory, OwnershipLockFileName);
+            if (HasLiveOwner(lockPath))
+            {
+                continue;
+            }
+
+            // Re-check the bounded leaf set after probing the lock. Another process
+            // must not be able to race an unexpected/reparse child into a recursive
+            // cleanup operation. Deletion below is non-recursive in all cases.
+            if (!TryValidateManagedLeafSet(sessionDirectory))
+            {
+                continue;
+            }
+
+            TryDeleteRecoveredRasEntry(sessionDirectory, expectedEntryName);
+            _ = TryDeleteOwnedSessionDirectory(sessionDirectory);
+        }
+    }
+
+    private static bool TryGetExpectedEntryName(string sessionDirectory, out string entryName)
+    {
+        entryName = string.Empty;
+        try
+        {
+            var fullSessionPath = Path.GetFullPath(sessionDirectory);
+            var fullRoot = Path.GetFullPath(SessionRootDirectory);
+            var parent = Path.GetDirectoryName(fullSessionPath);
+            if (!string.Equals(parent, fullRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var directoryName = Path.GetFileName(Path.TrimEndingDirectorySeparator(fullSessionPath));
+            var separator = directoryName.LastIndexOf('-');
+            if (separator <= 0 || separator == directoryName.Length - 1)
+            {
+                return false;
+            }
+
+            var sanitizedId = directoryName[..separator];
+            var generation = directoryName[(separator + 1)..];
+            if (!Guid.TryParseExact(generation, "N", out _) ||
+                sanitizedId.Any(character => !char.IsLetterOrDigit(character) && character is not ('-' or '_')))
+            {
+                return false;
+            }
+
+            entryName = $"ProxyToAnyConnect-{sanitizedId}";
+            if (entryName.Length > RasNative.RasMaxEntryName)
+            {
+                entryName = entryName[..RasNative.RasMaxEntryName];
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryValidateManagedLeafSet(string sessionDirectory)
+    {
+        try
+        {
+            if (!IsRegularDirectory(sessionDirectory))
+            {
+                return false;
+            }
+
+            foreach (var child in Directory.EnumerateFileSystemEntries(
+                         sessionDirectory,
+                         "*",
+                         SearchOption.TopDirectoryOnly))
+            {
+                var name = Path.GetFileName(child);
+                if (name is not (OwnershipMarkerFileName or OwnershipLockFileName or PhoneBookFileName))
+                {
+                    return false;
+                }
+
+                var attributes = File.GetAttributes(child);
+                if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadValidOwnershipMarker(string markerPath, string expectedEntryName)
+    {
+        try
+        {
+            var attributes = File.GetAttributes(markerPath);
+            if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                return false;
+            }
+
+            using var stream = new FileStream(
+                markerPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 256,
+                FileOptions.SequentialScan);
+            if (stream.Length is <= 0 or > MaxOwnershipMarkerBytes)
+            {
+                return false;
+            }
+
+            using var reader = new StreamReader(stream);
+            var markerEntryName = reader.ReadToEnd().Trim();
+            return markerEntryName.Equals(expectedEntryName, StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static void TryDeleteRecoveredRasEntry(string sessionDirectory, string entryName)
+    {
+        try
+        {
+            var phoneBookPath = Path.Combine(sessionDirectory, PhoneBookFileName);
+            if (IsRegularFile(phoneBookPath))
+            {
+                _ = RasNative.RasDeleteEntryW(phoneBookPath, entryName);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Native entry cleanup is best effort. Filesystem removal below remains
+            // bounded to the already-proven managed leaf set.
+        }
+    }
+
+    private static bool HasLiveOwner(string lockPath)
+    {
+        if (!File.Exists(lockPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var probe = new FileStream(
+                lockPath,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                FileOptions.None);
+            return false;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A sharing violation means another live process owns the session. An
+            // access-denied result is treated the same way: cleanup must fail safe
+            // and preserve a directory whose ownership cannot be proven stale.
+            return true;
+        }
+    }
+
+    private static bool IsRegularDirectory(string path)
+    {
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            return (attributes & FileAttributes.Directory) != 0 &&
+                   (attributes & FileAttributes.ReparsePoint) == 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsRegularFile(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            return (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static void EnsureRegularDirectory(string path, string description)
+    {
+        if (!IsRegularDirectory(path))
+        {
+            throw new IOException($"{description} is not a regular directory: {path}");
+        }
+    }
+
+    private static bool TryDeleteOwnedSessionDirectory(string path)
+    {
+        if (!TryGetExpectedEntryName(path, out _) || !TryValidateManagedLeafSet(path))
+        {
+            return false;
+        }
+
+        // Delete the durable ownership marker last. If an earlier exact-leaf removal
+        // fails, a later process can still recognize and retry this managed residue.
+        foreach (var leafName in new[] { PhoneBookFileName, OwnershipLockFileName, OwnershipMarkerFileName })
+        {
+            var leafPath = Path.Combine(path, leafName);
+            if (!File.Exists(leafPath))
+            {
+                continue;
+            }
+
+            try
+            {
+                var attributes = File.GetAttributes(leafPath);
+                if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                {
+                    return false;
+                }
+
+                File.Delete(leafPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+
+        try
+        {
+            Directory.Delete(path, recursive: false);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A child inserted after validation makes non-recursive removal fail safe.
+            // Never widen this to recursive deletion.
+            return false;
+        }
+    }
+
+'''
+          text = text[:start] + replacement + text[end:]
+
+          old_delete = '''    private static void TryDeleteSessionDirectory(string path)\n    {\n        try\n        {\n            if (Directory.Exists(path))\n            {\n                Directory.Delete(path, recursive: true);\n            }\n        }\n        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)\n        {\n        }\n    }\n\n'''
+          if text.count(old_delete) != 1:
+              raise SystemExit('Expected legacy recursive deletion helper was not found exactly once.')
+          text = text.replace(old_delete, '', 1)
+
+          old_dispose_native = '''        try\n        {\n            if (File.Exists(PhoneBookPath))\n            {\n                _ = RasNative.RasDeleteEntryW(PhoneBookPath, EntryName);\n            }\n        }\n        catch\n        {\n        }\n'''
+          new_dispose_native = '''        try\n        {\n            if (TryValidateManagedLeafSet(_sessionDirectory) && IsRegularFile(PhoneBookPath))\n            {\n                _ = RasNative.RasDeleteEntryW(PhoneBookPath, EntryName);\n            }\n        }\n        catch\n        {\n        }\n'''
+          if text.count(old_dispose_native) != 1:
+              raise SystemExit('Expected Dispose native cleanup fragment was not found exactly once.')
+          text = text.replace(old_dispose_native, new_dispose_native, 1)
+
+          old_dispose_dir = '''        try\n        {\n            if (Directory.Exists(_sessionDirectory))\n            {\n                Directory.Delete(_sessionDirectory, recursive: true);\n            }\n        }\n        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)\n        {\n            AppLog.Warning(\n                "vpn.ephemeral.cleanup_failed",\n                "Unable to remove a temporary private RAS phonebook directory.",\n                new { SessionDirectory = _sessionDirectory, Error = ex.Message });\n        }\n'''
+          new_dispose_dir = '''        if (Directory.Exists(_sessionDirectory) && !TryDeleteOwnedSessionDirectory(_sessionDirectory))\n        {\n            AppLog.Warning(\n                "vpn.ephemeral.cleanup_preserved_ambiguous",\n                "Temporary private RAS session directory was preserved because exact filesystem ownership could not be proven for every leaf.",\n                new { SessionDirectory = _sessionDirectory });\n        }\n'''
+          if text.count(old_dispose_dir) != 1:
+              raise SystemExit('Expected Dispose recursive directory cleanup fragment was not found exactly once.')
+          text = text.replace(old_dispose_dir, new_dispose_dir, 1)
+
+          source.write_text(text, encoding='utf-8')
+
+          tests = Path('tests/ProxyToAnyConnect.SelfTests/EphemeralRasPhonebookSelfTests.cs')
+          text = tests.read_text(encoding='utf-8')
+          text = text.replace(
+              '            OrphanRecoveryRespectsCrossProcessOwnership();\n            HappyPathCreateAndCleanup();\n',
+              '            OrphanRecoveryRespectsCrossProcessOwnership();\n            OrphanRecoveryPreservesAmbiguousFilesystemContent();\n            HappyPathCreateAndCleanup();\n',
+              1)
+          text = text.replace(
+              '$"PASS: private ephemeral L2TP RAS phonebook ownership/orphan recovery/create/PSK/cleanup and {PartialFailureChurnCycles}-cycle failure churn tests"',
+              '$"PASS: private ephemeral L2TP RAS phonebook exact-leaf/reparse-safe orphan recovery/create/PSK/cleanup and {PartialFailureChurnCycles}-cycle failure churn tests"',
+              1)
+
+          old_marker = '''    private static void CreateManagedMarker(string directory)\n    {\n        Directory.CreateDirectory(directory);\n        File.WriteAllText(\n            Path.Combine(directory, EphemeralRasPhonebook.OwnershipMarkerFileName),\n            "self-test managed session");\n    }\n\n'''
+          new_marker = r'''    private static void CreateManagedMarker(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(
+            Path.Combine(directory, EphemeralRasPhonebook.OwnershipMarkerFileName),
+            ExpectedEntryNameForManagedDirectory(directory));
+    }
+
+    private static string ExpectedEntryNameForManagedDirectory(string directory)
+    {
+        var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(directory));
+        var separator = name.LastIndexOf('-');
+        if (separator <= 0)
+        {
+            throw new InvalidOperationException($"Self-test managed directory is not canonical: {directory}");
+        }
+
+        var sanitizedId = name[..separator];
+        var entryName = $"ProxyToAnyConnect-{sanitizedId}";
+        return entryName.Length <= RasNative.RasMaxEntryName
+            ? entryName
+            : entryName[..RasNative.RasMaxEntryName];
+    }
+
+    private static void OrphanRecoveryPreservesAmbiguousFilesystemContent()
+    {
+        var root = EphemeralRasPhonebook.SessionRootDirectory;
+        Directory.CreateDirectory(root);
+        var malformedMarker = Path.Combine(root, $"selftest-malformed-{Guid.NewGuid():N}");
+        var oversizedMarker = Path.Combine(root, $"selftest-oversized-{Guid.NewGuid():N}");
+        var unexpectedChild = Path.Combine(root, $"selftest-unexpected-{Guid.NewGuid():N}");
+        var nonCanonical = Path.Combine(root, "selftest-noncanonical-owned-looking");
+        var externalTarget = Path.Combine(Path.GetTempPath(), $"ProxyToAnyConnect-external-target-{Guid.NewGuid():N}");
+        var reparseSession = Path.Combine(root, $"selftest-reparse-{Guid.NewGuid():N}");
+        var reparseCreated = false;
+
+        try
+        {
+            CreateManagedMarker(malformedMarker);
+            File.WriteAllText(
+                Path.Combine(malformedMarker, EphemeralRasPhonebook.OwnershipMarkerFileName),
+                "ProxyToAnyConnect-wrong-entry");
+            File.WriteAllText(Path.Combine(malformedMarker, EphemeralRasPhonebook.PhoneBookFileName), "keep");
+
+            CreateManagedMarker(oversizedMarker);
+            File.WriteAllText(
+                Path.Combine(oversizedMarker, EphemeralRasPhonebook.OwnershipMarkerFileName),
+                new string('x', 2048));
+
+            CreateManagedMarker(unexpectedChild);
+            var unknownPath = Path.Combine(unexpectedChild, "unexpected-child.txt");
+            File.WriteAllText(unknownPath, "must survive managed cleanup");
+
+            Directory.CreateDirectory(nonCanonical);
+            File.WriteAllText(
+                Path.Combine(nonCanonical, EphemeralRasPhonebook.OwnershipMarkerFileName),
+                "ProxyToAnyConnect-selftest-noncanonical-owned-looking");
+
+            try
+            {
+                Directory.CreateDirectory(externalTarget);
+                var externalSentinel = Path.Combine(externalTarget, "sentinel.txt");
+                File.WriteAllText(externalSentinel, "external");
+                Directory.CreateSymbolicLink(reparseSession, externalTarget);
+                reparseCreated = true;
+                File.WriteAllText(
+                    Path.Combine(externalTarget, EphemeralRasPhonebook.OwnershipMarkerFileName),
+                    ExpectedEntryNameForManagedDirectory(reparseSession));
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+            {
+                reparseCreated = false;
+            }
+
+            EphemeralRasPhonebook.CleanupOrphanedSessionDirectories();
+
+            foreach (var preserved in new[] { malformedMarker, oversizedMarker, unexpectedChild, nonCanonical })
+            {
+                if (!Directory.Exists(preserved))
+                {
+                    throw new InvalidOperationException(
+                        $"Orphan cleanup removed ambiguous managed-looking directory: {preserved}");
+                }
+            }
+
+            if (!File.Exists(Path.Combine(unexpectedChild, "unexpected-child.txt")) ||
+                !File.Exists(Path.Combine(unexpectedChild, EphemeralRasPhonebook.OwnershipMarkerFileName)))
+            {
+                throw new InvalidOperationException(
+                    "Orphan cleanup partially consumed an ambiguous directory containing an unexpected child.");
+            }
+
+            if (reparseCreated)
+            {
+                if (!Directory.Exists(reparseSession) ||
+                    !File.Exists(Path.Combine(externalTarget, "sentinel.txt")))
+                {
+                    throw new InvalidOperationException(
+                        "Orphan cleanup traversed/deleted a reparse-point session or its external target.");
+                }
+            }
+        }
+        finally
+        {
+            BestEffortDelete(malformedMarker);
+            BestEffortDelete(oversizedMarker);
+            BestEffortDelete(unexpectedChild);
+            BestEffortDelete(nonCanonical);
+            if (reparseCreated)
+            {
+                BestEffortDelete(reparseSession);
+            }
+            BestEffortDelete(externalTarget);
+        }
+    }
+
+'''
+          if text.count(old_marker) != 1:
+              raise SystemExit('Expected test marker helper was not found exactly once.')
+          text = text.replace(old_marker, new_marker, 1)
+
+          old_best_effort = '''    private static void BestEffortDelete(string? path)\n    {\n        try\n        {\n            if (!string.IsNullOrWhiteSpace(path) && Directory.Exists(path))\n            {\n                Directory.Delete(path, recursive: true);\n            }\n        }\n        catch\n        {\n        }\n    }\n'''
+          new_best_effort = r'''    private static void BestEffortDelete(string? path)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+            {
+                return;
+            }
+
+            var attributes = File.GetAttributes(path);
+            Directory.Delete(
+                path,
+                recursive: (attributes & FileAttributes.ReparsePoint) == 0);
+        }
+        catch
+        {
+        }
+    }
+'''
+          if text.count(old_best_effort) != 1:
+              raise SystemExit('Expected test recursive cleanup helper was not found exactly once.')
+          text = text.replace(old_best_effort, new_best_effort, 1)
+          tests.write_text(text, encoding='utf-8')
+          PY
+
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/ProxyToAnyConnect/Vpn/EphemeralRasPhonebook.cs tests/ProxyToAnyConnect.SelfTests/EphemeralRasPhonebookSelfTests.cs
+          git commit -m 'fix: bound CustomEphemeral orphan filesystem ownership'
+          git push origin HEAD:main
