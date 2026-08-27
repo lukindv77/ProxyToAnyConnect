@@ -11,7 +11,7 @@ internal static class DnsAResultStorageSelfTests
     private const ushort TransactionId = 0x3456;
     private const int WarmupIterations = 4096;
     private const int AllocationIterations = 1000;
-    private const int TimingRounds = 9;
+    private const int TimingRounds = 15;
     private const int IterationsPerRound = 65536;
     private const double MaxMedianSlowdownRatio = 1.25;
     private static readonly IPAddress RepresentativeAddress = IPAddress.Parse("203.0.113.7");

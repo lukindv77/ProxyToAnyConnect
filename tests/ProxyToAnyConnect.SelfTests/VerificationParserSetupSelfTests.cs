@@ -8,7 +8,7 @@ internal static class VerificationParserSetupSelfTests
 {
     private const int WarmupIterations = 4096;
     private const int AllocationIterations = 1000;
-    private const int TimingRounds = 9;
+    private const int TimingRounds = 15;
     // This parser is sub-microsecond to low-microsecond on hosted runners. Long
     // warmup/rounds keep tiered JIT and scheduler noise from dominating the
     // unchanged 1.25x relative policy.
@@ -50,12 +50,12 @@ internal static class VerificationParserSetupSelfTests
                 GC.KeepAlive(VpnConnectivityVerifier.ParseHttpSuccessBody(response));
             Action predecessor = () => GC.KeepAlive(SplitLinqPredecessor(response));
             var timing = MeasurePaired(optimized, predecessor);
-            if (timing.Ratio > MaxMedianSlowdownRatio)
+            if (timing.PairedRatioMedian > MaxMedianSlowdownRatio)
             {
                 throw new InvalidOperationException(
                     $"Verification text-span parser median was {timing.OptimizedMedianNs:F0} ns/op versus " +
                     $"{timing.PredecessorMedianNs:F0} ns/op for Split/LINQ " +
-                    $"({timing.Ratio:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
+                    $"({timing.PairedRatioMedian:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
             }
 
             Console.WriteLine(
@@ -63,7 +63,7 @@ internal static class VerificationParserSetupSelfTests
                 $"(alloc {optimizedBytes / (double)AllocationIterations:F0} vs " +
                 $"{predecessorBytes / (double)AllocationIterations:F0} bytes/response; " +
                 $"timing {timing.OptimizedMedianNs:F0} vs {timing.PredecessorMedianNs:F0} ns/op, " +
-                $"{timing.Ratio:F2}x)");
+                $"{timing.PairedRatioMedian:F2}x)");
             return 0;
         }
         catch (Exception ex)
@@ -275,12 +275,14 @@ internal static class VerificationParserSetupSelfTests
             }
         }
 
+        var pairedRatios = new double[TimingRounds];
+        for (var round = 0; round < TimingRounds; round++)
+        {
+            pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
+        }
         var optimizedMedian = Median(optimizedRounds);
         var predecessorMedian = Median(predecessorRounds);
-        return new TimingResult(
-            optimizedMedian,
-            predecessorMedian,
-            optimizedMedian / predecessorMedian);
+        return new TimingResult(optimizedMedian, predecessorMedian, Median(pairedRatios));
     }
 
     private static double MeasureNanosecondsPerOperation(Action action)
@@ -305,5 +307,5 @@ internal static class VerificationParserSetupSelfTests
     private readonly record struct TimingResult(
         double OptimizedMedianNs,
         double PredecessorMedianNs,
-        double Ratio);
+        double PairedRatioMedian);
 }

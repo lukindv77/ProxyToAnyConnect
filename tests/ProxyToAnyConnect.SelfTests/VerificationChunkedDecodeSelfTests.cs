@@ -9,7 +9,7 @@ internal static class VerificationChunkedDecodeSelfTests
 {
     private const int WarmupIterations = 4096;
     private const int AllocationIterations = 1000;
-    private const int TimingRounds = 9;
+    private const int TimingRounds = 15;
     private const int IterationsPerRound = 65536;
     private const double MaxMedianSlowdownRatio = 1.25;
 
@@ -51,12 +51,12 @@ internal static class VerificationChunkedDecodeSelfTests
                 GC.KeepAlive(VpnConnectivityVerifier.DecodeChunkedBody(body));
             Action predecessor = () => GC.KeepAlive(LegacyDecodeChunkedBody(body));
             var timing = MeasurePaired(optimized, predecessor);
-            if (timing.Ratio > MaxMedianSlowdownRatio)
+            if (timing.PairedRatioMedian > MaxMedianSlowdownRatio)
             {
                 throw new InvalidOperationException(
                     $"Exact-size chunk decoder median was {timing.OptimizedMedianNs:F0} ns/op versus " +
                     $"{timing.PredecessorMedianNs:F0} ns/op for MemoryStream/string " +
-                    $"({timing.Ratio:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
+                    $"({timing.PairedRatioMedian:F2}x, limit {MaxMedianSlowdownRatio:F2}x).");
             }
 
             Console.WriteLine(
@@ -64,7 +64,7 @@ internal static class VerificationChunkedDecodeSelfTests
                 $"(alloc {optimizedBytes / (double)AllocationIterations:F0} vs " +
                 $"{predecessorBytes / (double)AllocationIterations:F0} bytes/response; " +
                 $"timing {timing.OptimizedMedianNs:F0} vs {timing.PredecessorMedianNs:F0} ns/op, " +
-                $"{timing.Ratio:F2}x)");
+                $"{timing.PairedRatioMedian:F2}x)");
             return 0;
         }
         catch (Exception ex)
@@ -239,12 +239,14 @@ internal static class VerificationChunkedDecodeSelfTests
             }
         }
 
+        var pairedRatios = new double[TimingRounds];
+        for (var round = 0; round < TimingRounds; round++)
+        {
+            pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
+        }
         var optimizedMedian = Median(optimizedRounds);
         var predecessorMedian = Median(predecessorRounds);
-        return new TimingResult(
-            optimizedMedian,
-            predecessorMedian,
-            optimizedMedian / predecessorMedian);
+        return new TimingResult(optimizedMedian, predecessorMedian, Median(pairedRatios));
     }
 
     private static double MeasureNanosecondsPerOperation(Action action)
@@ -269,5 +271,5 @@ internal static class VerificationChunkedDecodeSelfTests
     private readonly record struct TimingResult(
         double OptimizedMedianNs,
         double PredecessorMedianNs,
-        double Ratio);
+        double PairedRatioMedian);
 }

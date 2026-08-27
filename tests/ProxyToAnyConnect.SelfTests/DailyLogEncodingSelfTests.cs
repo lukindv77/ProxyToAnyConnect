@@ -8,7 +8,7 @@ internal static class DailyLogEncodingSelfTests
 {
     private const int WarmupIterations = 4096;
     private const int AllocationIterations = 1000;
-    private const int TimingRounds = 9;
+    private const int TimingRounds = 15;
     private const int IterationsPerRound = 65536;
     private const double MaxMedianSlowdownRatio = 1.25;
 
