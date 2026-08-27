@@ -107,12 +107,12 @@ internal sealed class ProxySettingsDialog : Form
     {
         _name.Text = existing?.Name ?? $"Proxy {vpnConnections.Count + 1}";
         _enabled.Checked = existing?.Enabled ?? true;
-        _listenPort.Value = existing?.ListenPort ?? 18080;
-        _maxConcurrentConnections.Value = existing?.MaxConcurrentConnections ?? 512;
-        _maxHeaderBytes.Value = existing?.MaxHeaderBytes ?? 65536;
-        _clientHeaderTimeout.Value = existing?.ClientHeaderTimeoutSeconds ?? 15;
-        _outboundConnectTimeout.Value = existing?.OutboundConnectTimeoutSeconds ?? 15;
-        _dnsTimeout.Value = existing?.DnsTimeoutMilliseconds ?? 3000;
+        SetNumericValue(_listenPort, existing?.ListenPort ?? 18080);
+        SetNumericValue(_maxConcurrentConnections, existing?.MaxConcurrentConnections ?? 512);
+        SetNumericValue(_maxHeaderBytes, existing?.MaxHeaderBytes ?? 65536);
+        SetNumericValue(_clientHeaderTimeout, existing?.ClientHeaderTimeoutSeconds ?? 15);
+        SetNumericValue(_outboundConnectTimeout, existing?.OutboundConnectTimeoutSeconds ?? 15);
+        SetNumericValue(_dnsTimeout, existing?.DnsTimeoutMilliseconds ?? 3000);
 
         SelectComboText(_listenAddress, existing?.ListenAddress ?? IPAddress.Loopback.ToString());
 
@@ -221,6 +221,17 @@ internal sealed class ProxySettingsDialog : Form
         Width = 140,
         ThousandsSeparator = true
     };
+
+    internal static int ClampNumericValue(int value, int minimum, int maximum) =>
+        Math.Clamp(value, minimum, maximum);
+
+    private static void SetNumericValue(NumericUpDown control, int value)
+    {
+        control.Value = ClampNumericValue(
+            value,
+            decimal.ToInt32(control.Minimum),
+            decimal.ToInt32(control.Maximum));
+    }
 
     private static void SelectComboText(ComboBox combo, string value)
     {
