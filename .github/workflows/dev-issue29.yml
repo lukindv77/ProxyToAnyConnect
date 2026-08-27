@@ -28,11 +28,12 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           @'
           from pathlib import Path
+          import math
           import re
 
           WARMUP_FLOOR = 4096
           ROUND_FLOOR = 15
-          ITERATION_FLOOR = 16384
+          OPERATIONS_PER_ROUND_FLOOR = 16384
           old_pair = '''        var optimizedMedian = Median(optimizedRounds);
                   var predecessorMedian = Median(predecessorRounds);
                   return new TimingResult(
@@ -51,11 +52,11 @@ jobs:
                       optimizedMedian,
                       predecessorMedian,
                       Median(pairedRatios));'''
-          patterns = {
-              'warmup': (re.compile(r'private const int WarmupIterations = (\d+);'), WARMUP_FLOOR),
-              'rounds': (re.compile(r'private const int TimingRounds = (\d+);'), ROUND_FLOOR),
-              'iterations': (re.compile(r'private const int IterationsPerRound = (\d+);'), ITERATION_FLOOR),
-          }
+          warmup_pattern = re.compile(r'private const int WarmupIterations = (\d+);')
+          rounds_pattern = re.compile(r'private const int TimingRounds = (\d+);')
+          iterations_pattern = re.compile(r'private const int IterationsPerRound = (\d+);')
+          pair_samples_pattern = re.compile(r'private const int PairSamplesPerRound = (\d+);')
+          batch_iterations_pattern = re.compile(r'private const int IterationsPerBatch = (\d+);')
 
           paired_changed = []
           floor_changes = []
@@ -74,16 +75,52 @@ jobs:
                   paired_changed.append(display)
 
               if 'MaxMedianSlowdownRatio' in text:
+                  warmup = warmup_pattern.search(text)
+                  rounds = rounds_pattern.search(text)
                   missing = []
-                  for name, (pattern, floor) in patterns.items():
-                      match = pattern.search(text)
-                      if match is None:
-                          missing.append(name)
-                          continue
-                      current = int(match.group(1))
-                      if current < floor:
-                          text = text[:match.start(1)] + str(floor) + text[match.end(1):]
-                          floor_changes.append(f'{display}: {name} {current} -> {floor}')
+                  if warmup is None:
+                      missing.append('warmup')
+                  else:
+                      current = int(warmup.group(1))
+                      if current < WARMUP_FLOOR:
+                          text = text[:warmup.start(1)] + str(WARMUP_FLOOR) + text[warmup.end(1):]
+                          floor_changes.append(f'{display}: warmup {current} -> {WARMUP_FLOOR}')
+
+                  rounds = rounds_pattern.search(text)
+                  if rounds is None:
+                      missing.append('rounds')
+                  else:
+                      current = int(rounds.group(1))
+                      if current < ROUND_FLOOR:
+                          text = text[:rounds.start(1)] + str(ROUND_FLOOR) + text[rounds.end(1):]
+                          floor_changes.append(f'{display}: rounds {current} -> {ROUND_FLOOR}')
+
+                  iterations = iterations_pattern.search(text)
+                  if iterations is not None:
+                      current = int(iterations.group(1))
+                      if current < OPERATIONS_PER_ROUND_FLOOR:
+                          text = text[:iterations.start(1)] + str(OPERATIONS_PER_ROUND_FLOOR) + text[iterations.end(1):]
+                          floor_changes.append(
+                              f'{display}: iterations/round {current} -> {OPERATIONS_PER_ROUND_FLOOR}')
+                  else:
+                      pair_samples = pair_samples_pattern.search(text)
+                      batch_iterations = batch_iterations_pattern.search(text)
+                      if pair_samples is None or batch_iterations is None:
+                          missing.append('operations-per-round')
+                      else:
+                          pairs = int(pair_samples.group(1))
+                          batch = int(batch_iterations.group(1))
+                          if pairs <= 0 or batch <= 0:
+                              raise SystemExit(f'invalid batched timing constants in {display}')
+                          operations = pairs * batch
+                          if operations < OPERATIONS_PER_ROUND_FLOOR:
+                              new_batch = math.ceil(OPERATIONS_PER_ROUND_FLOOR / pairs)
+                              text = (
+                                  text[:batch_iterations.start(1)] + str(new_batch) +
+                                  text[batch_iterations.end(1):])
+                              floor_changes.append(
+                                  f'{display}: batched operations/round {operations} -> {pairs * new_batch}')
+
                   if missing:
                       missing_sampling.append(f'{display}: {",".join(missing)}')
 
@@ -125,11 +162,12 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           @'
           from pathlib import Path
+          import math
           import re
 
           WARMUP_FLOOR = 4096
           ROUND_FLOOR = 15
-          ITERATION_FLOOR = 16384
+          OPERATIONS_PER_ROUND_FLOOR = 16384
           old_pair = '''        var optimizedMedian = Median(optimizedRounds);
                   var predecessorMedian = Median(predecessorRounds);
                   return new TimingResult(
@@ -148,11 +186,11 @@ jobs:
                       optimizedMedian,
                       predecessorMedian,
                       Median(pairedRatios));'''
-          patterns = {
-              'warmup': (re.compile(r'private const int WarmupIterations = (\d+);'), WARMUP_FLOOR),
-              'rounds': (re.compile(r'private const int TimingRounds = (\d+);'), ROUND_FLOOR),
-              'iterations': (re.compile(r'private const int IterationsPerRound = (\d+);'), ITERATION_FLOOR),
-          }
+          warmup_pattern = re.compile(r'private const int WarmupIterations = (\d+);')
+          rounds_pattern = re.compile(r'private const int TimingRounds = (\d+);')
+          iterations_pattern = re.compile(r'private const int IterationsPerRound = (\d+);')
+          pair_samples_pattern = re.compile(r'private const int PairSamplesPerRound = (\d+);')
+          batch_iterations_pattern = re.compile(r'private const int IterationsPerBatch = (\d+);')
 
           paired_changed = []
           floor_changes = []
@@ -171,16 +209,52 @@ jobs:
                   paired_changed.append(display)
 
               if 'MaxMedianSlowdownRatio' in text:
+                  warmup = warmup_pattern.search(text)
+                  rounds = rounds_pattern.search(text)
                   missing = []
-                  for name, (pattern, floor) in patterns.items():
-                      match = pattern.search(text)
-                      if match is None:
-                          missing.append(name)
-                          continue
-                      current = int(match.group(1))
-                      if current < floor:
-                          text = text[:match.start(1)] + str(floor) + text[match.end(1):]
-                          floor_changes.append(f'{display}: {name} {current} -> {floor}')
+                  if warmup is None:
+                      missing.append('warmup')
+                  else:
+                      current = int(warmup.group(1))
+                      if current < WARMUP_FLOOR:
+                          text = text[:warmup.start(1)] + str(WARMUP_FLOOR) + text[warmup.end(1):]
+                          floor_changes.append(f'{display}: warmup {current} -> {WARMUP_FLOOR}')
+
+                  rounds = rounds_pattern.search(text)
+                  if rounds is None:
+                      missing.append('rounds')
+                  else:
+                      current = int(rounds.group(1))
+                      if current < ROUND_FLOOR:
+                          text = text[:rounds.start(1)] + str(ROUND_FLOOR) + text[rounds.end(1):]
+                          floor_changes.append(f'{display}: rounds {current} -> {ROUND_FLOOR}')
+
+                  iterations = iterations_pattern.search(text)
+                  if iterations is not None:
+                      current = int(iterations.group(1))
+                      if current < OPERATIONS_PER_ROUND_FLOOR:
+                          text = text[:iterations.start(1)] + str(OPERATIONS_PER_ROUND_FLOOR) + text[iterations.end(1):]
+                          floor_changes.append(
+                              f'{display}: iterations/round {current} -> {OPERATIONS_PER_ROUND_FLOOR}')
+                  else:
+                      pair_samples = pair_samples_pattern.search(text)
+                      batch_iterations = batch_iterations_pattern.search(text)
+                      if pair_samples is None or batch_iterations is None:
+                          missing.append('operations-per-round')
+                      else:
+                          pairs = int(pair_samples.group(1))
+                          batch = int(batch_iterations.group(1))
+                          if pairs <= 0 or batch <= 0:
+                              raise SystemExit(f'invalid batched timing constants in {display}')
+                          operations = pairs * batch
+                          if operations < OPERATIONS_PER_ROUND_FLOOR:
+                              new_batch = math.ceil(OPERATIONS_PER_ROUND_FLOOR / pairs)
+                              text = (
+                                  text[:batch_iterations.start(1)] + str(new_batch) +
+                                  text[batch_iterations.end(1):])
+                              floor_changes.append(
+                                  f'{display}: batched operations/round {operations} -> {pairs * new_batch}')
+
                   if missing:
                       missing_sampling.append(f'{display}: {",".join(missing)}')
 
