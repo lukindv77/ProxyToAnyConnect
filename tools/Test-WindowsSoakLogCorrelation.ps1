@@ -47,13 +47,25 @@ if ($soakEnd -lt $soakStart) {
     throw 'Soak evidence completion timestamp precedes its start timestamp.'
 }
 
-$records = [System.Collections.Generic.List[object]]::new()
+# Long-run evidence may span many daily JSONL files. Retain only scalar aggregates
+# plus the timestamp-extreme records rather than materializing/sorting every matching
+# process.memory entry. Memory use is therefore independent of soak/log duration.
+$memoryRecordCount = 0
+$first = $null
+$last = $null
+$maxWorkingSetBytes = [long]0
+$maxPrivateBytes = [long]0
+$maxHandleCount = 0
+$maxThreadCount = 0
+$applicationLogCount = 0
+
 foreach ($logPathInput in $ApplicationLogPath) {
     $logPath = [IO.Path]::GetFullPath($logPathInput)
     if (-not (Test-Path -LiteralPath $logPath -PathType Leaf)) {
         throw "Application JSONL log is missing: $logPath"
     }
 
+    $applicationLogCount++
     $lineNumber = 0
     foreach ($line in Get-Content -LiteralPath $logPath) {
         $lineNumber++
@@ -111,26 +123,42 @@ foreach ($logPathInput in $ApplicationLogPath) {
             }
         }
 
-        $records.Add([pscustomobject]@{
+        $record = [pscustomobject]@{
             TimestampUtc = $timestamp
-            Event = $eventName
             ManagedHeapBytes = [long]$entry.Data.ManagedHeapBytes
             TotalAllocatedBytes = [long]$entry.Data.TotalAllocatedBytes
-            WorkingSetBytes = [long]$entry.Data.WorkingSetBytes
-            PrivateBytes = [long]$entry.Data.PrivateBytes
-            HandleCount = [int]$entry.Data.HandleCount
-            ThreadCount = [int]$entry.Data.ThreadCount
-        })
+        }
+        $workingSetBytes = [long]$entry.Data.WorkingSetBytes
+        $privateBytes = [long]$entry.Data.PrivateBytes
+        $handleCount = [int]$entry.Data.HandleCount
+        $threadCount = [int]$entry.Data.ThreadCount
+
+        $memoryRecordCount++
+        if ($null -eq $first -or $timestamp -lt $first.TimestampUtc) {
+            $first = $record
+        }
+        if ($null -eq $last -or $timestamp -gt $last.TimestampUtc) {
+            $last = $record
+        }
+        if ($workingSetBytes -gt $maxWorkingSetBytes) {
+            $maxWorkingSetBytes = $workingSetBytes
+        }
+        if ($privateBytes -gt $maxPrivateBytes) {
+            $maxPrivateBytes = $privateBytes
+        }
+        if ($handleCount -gt $maxHandleCount) {
+            $maxHandleCount = $handleCount
+        }
+        if ($threadCount -gt $maxThreadCount) {
+            $maxThreadCount = $threadCount
+        }
     }
 }
 
-$ordered = @($records | Sort-Object TimestampUtc)
-if ($ordered.Count -lt $MinimumMemoryRecords) {
-    throw "Found $($ordered.Count) process.memory record(s) for the exact soak process lifetime; at least $MinimumMemoryRecords are required."
+if ($memoryRecordCount -lt $MinimumMemoryRecords) {
+    throw "Found $memoryRecordCount process.memory record(s) for the exact soak process lifetime; at least $MinimumMemoryRecords are required."
 }
 
-$first = $ordered[0]
-$last = $ordered[-1]
 $result = [ordered]@{
     schemaVersion = 1
     correlated = $true
@@ -138,7 +166,8 @@ $result = [ordered]@{
     processStartTimeUtc = $expectedProcessStart.ToString('O')
     soakStartedAtUtc = $soakStart.ToString('O')
     soakCompletedAtUtc = $soakEnd.ToString('O')
-    memoryRecordCount = $ordered.Count
+    applicationLogCount = $applicationLogCount
+    memoryRecordCount = $memoryRecordCount
     firstMemoryRecordUtc = $first.TimestampUtc.ToString('O')
     lastMemoryRecordUtc = $last.TimestampUtc.ToString('O')
     firstManagedHeapBytes = $first.ManagedHeapBytes
@@ -146,11 +175,11 @@ $result = [ordered]@{
     managedHeapDeltaBytes = $last.ManagedHeapBytes - $first.ManagedHeapBytes
     firstTotalAllocatedBytes = $first.TotalAllocatedBytes
     lastTotalAllocatedBytes = $last.TotalAllocatedBytes
-    maxWorkingSetBytes = [long](($ordered | Measure-Object WorkingSetBytes -Maximum).Maximum)
-    maxPrivateBytes = [long](($ordered | Measure-Object PrivateBytes -Maximum).Maximum)
-    maxHandleCount = [int](($ordered | Measure-Object HandleCount -Maximum).Maximum)
-    maxThreadCount = [int](($ordered | Measure-Object ThreadCount -Maximum).Maximum)
-    assessment = 'External soak process identity and application managed-memory records are correlated. Leak acceptance remains workload-aware and is not inferred from one delta.'
+    maxWorkingSetBytes = $maxWorkingSetBytes
+    maxPrivateBytes = $maxPrivateBytes
+    maxHandleCount = $maxHandleCount
+    maxThreadCount = $maxThreadCount
+    assessment = 'External soak process identity and application managed-memory records are correlated with bounded retained validator state. Leak acceptance remains workload-aware and is not inferred from one delta.'
 }
 
 ConvertTo-Json -InputObject $result -Depth 4
