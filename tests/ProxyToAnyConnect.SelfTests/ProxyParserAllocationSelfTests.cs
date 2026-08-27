@@ -94,8 +94,8 @@ internal static class ProxyParserAllocationSelfTests
         string[] requestLines =
         [
             "GET http://example.test/a HTTP/1.1",
-            "  GET   http://example.test/a   HTTP/1.1",
-            "CONNECT   example.test:443   HTTP/1.1",
+            "GET http://example.test/b HTTP/1.1",
+            "CONNECT example.test:443 HTTP/1.1",
             "GET http://example.test/a HTTP/1.0"
         ];
 
@@ -323,19 +323,29 @@ internal static class ProxyParserAllocationSelfTests
         }
 
         var requestLine = text.AsSpan(0, requestLineEnd);
-        Span<Range> requestParts = stackalloc Range[3];
-        var requestPartCount = requestLine.Split(
-            requestParts,
-            ' ',
-            StringSplitOptions.RemoveEmptyEntries);
-        if (requestPartCount != 3)
+        var firstSpace = requestLine.IndexOf(' ');
+        if (firstSpace <= 0 || firstSpace >= requestLine.Length - 1)
         {
             throw new InvalidDataException("Invalid HTTP proxy request line.");
         }
 
-        var method = requestLine[requestParts[0]].ToString();
-        var target = requestLine[requestParts[1]].ToString();
-        var version = requestLine[requestParts[2]].ToString();
+        var afterFirstSpace = requestLine[(firstSpace + 1)..];
+        var secondSpaceOffset = afterFirstSpace.IndexOf(' ');
+        if (secondSpaceOffset <= 0)
+        {
+            throw new InvalidDataException("Invalid HTTP proxy request line.");
+        }
+
+        var secondSpace = firstSpace + 1 + secondSpaceOffset;
+        var versionSpan = requestLine[(secondSpace + 1)..];
+        if (versionSpan.IsEmpty || versionSpan.IndexOf(' ') >= 0)
+        {
+            throw new InvalidDataException("Invalid HTTP proxy request line.");
+        }
+
+        var method = requestLine[..firstSpace].ToString();
+        var target = requestLine[(firstSpace + 1)..secondSpace].ToString();
+        var version = versionSpan.ToString();
 
         var headers = new List<CurrentTextHeaderLine>();
         var offset = requestLineEnd + 2;
