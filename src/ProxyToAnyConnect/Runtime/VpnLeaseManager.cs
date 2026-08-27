@@ -78,6 +78,10 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             try
             {
                 await _connectionManager.ConnectAsync(operationToken);
+                // A controller can complete at the same instant owner shutdown is
+                // requested. The lease must not escape after its manager lifetime
+                // has ended even if the lower layer returned a context successfully.
+                operationToken.ThrowIfCancellationRequested();
             }
             catch
             {
