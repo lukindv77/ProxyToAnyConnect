@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using ProxyToAnyConnect.Diagnostics;
 
 namespace ProxyToAnyConnect.SelfTests;
@@ -11,7 +12,7 @@ internal static class RetentionCleanupSchedulerSelfTests
         {
             await SchedulingIsBoundedAndCoalescedAsync();
             await WorkerCancelsOnDisposeAsync();
-            Console.WriteLine("PASS: JSONL retention scheduling is single-worker, coalesced and dispose-cancellable");
+            Console.WriteLine("PASS: JSONL retention scheduling is single-worker, coalesced, dispose-cancellable and releases token ownership");
             return 0;
         }
         catch (Exception ex)
@@ -93,11 +94,20 @@ internal static class RetentionCleanupSchedulerSelfTests
     {
         using var entered = new ManualResetEventSlim(false);
         var cancellationObserved = 0;
+        var callbackInvoked = 0;
         var scheduler = new RetentionCleanupScheduler((_, cancellationToken) =>
         {
+            using var throwingRegistration = cancellationToken.Register(() =>
+            {
+                Interlocked.Exchange(ref callbackInvoked, 1);
+                throw new SyntheticCleanupException("retention cancellation callback failed");
+            });
+
             entered.Set();
             try
             {
+                // Intentionally materialize the token's native wait handle. Scheduler
+                // disposal must not dispose its CTS until this callback has unwound.
                 cancellationToken.WaitHandle.WaitOne();
                 cancellationToken.ThrowIfCancellationRequested();
             }
@@ -107,6 +117,7 @@ internal static class RetentionCleanupSchedulerSelfTests
                 throw;
             }
         });
+        var lifetime = GetPrivateLifetime(scheduler);
 
         var task = scheduler.Schedule(new DateOnly(2026, 8, 26));
         if (!entered.Wait(TimeSpan.FromSeconds(5)))
@@ -115,11 +126,23 @@ internal static class RetentionCleanupSchedulerSelfTests
             throw new TimeoutException("Retention cleanup worker did not enter cancellable work.");
         }
 
+        // The registered callback throws synchronously from CancellationTokenSource.Cancel.
+        // Scheduler.Dispose is diagnostics cleanup and must absorb that secondary fault,
+        // while still allowing the worker to observe cancellation and drain.
         scheduler.Dispose();
         await task.WaitAsync(TimeSpan.FromSeconds(5));
-        if (Volatile.Read(ref cancellationObserved) != 1 || scheduler.ActiveWorkers != 0)
+        if (Volatile.Read(ref callbackInvoked) != 1 ||
+            Volatile.Read(ref cancellationObserved) != 1 ||
+            scheduler.ActiveWorkers != 0)
         {
-            throw new InvalidOperationException("Disposing the log scheduler did not cancel its active cleanup worker.");
+            throw new InvalidOperationException(
+                "Disposing the log scheduler did not drain its active worker through a throwing cancellation callback.");
+        }
+
+        if (!CancellationSourceWasDisposed(lifetime))
+        {
+            throw new InvalidOperationException(
+                "Retention scheduler did not dispose its CancellationTokenSource after the final worker exited.");
         }
 
         try
@@ -129,6 +152,29 @@ internal static class RetentionCleanupSchedulerSelfTests
         }
         catch (ObjectDisposedException)
         {
+        }
+    }
+
+    private static CancellationTokenSource GetPrivateLifetime(RetentionCleanupScheduler scheduler)
+    {
+        var field = typeof(RetentionCleanupScheduler).GetField(
+            "_lifetime",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingFieldException(typeof(RetentionCleanupScheduler).FullName, "_lifetime");
+        return field.GetValue(scheduler) as CancellationTokenSource
+            ?? throw new InvalidOperationException("Retention scheduler lifetime source was unavailable.");
+    }
+
+    private static bool CancellationSourceWasDisposed(CancellationTokenSource source)
+    {
+        try
+        {
+            _ = source.Token;
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            return true;
         }
     }
 
@@ -146,6 +192,14 @@ internal static class RetentionCleanupSchedulerSelfTests
             {
                 return;
             }
+        }
+    }
+
+    private sealed class SyntheticCleanupException : Exception
+    {
+        public SyntheticCleanupException(string message)
+            : base(message)
+        {
         }
     }
 }
