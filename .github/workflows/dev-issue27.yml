@@ -28,24 +28,22 @@ jobs:
             throw 'Unexpected VPN profile lifetime test blob.'
           }
 
-          $text = Get-Content -LiteralPath $test -Raw
-          $old = @'
-            $child = Start-Process `
-                -FilePath (Join-Path $PSHOME 'powershell.exe') `
-                -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') `
-                -PassThru
-'@
-          $new = @'
-            $child = Start-Process `
-                -FilePath (Join-Path $env:SystemRoot 'System32\ping.exe') `
-                -ArgumentList @('-n','31','127.0.0.1') `
-                -PassThru
-'@
-          if (-not $text.Contains($old)) {
-            throw 'Nested PowerShell child anchor was not found exactly once.'
-          }
-          $text = $text.Replace($old, $new)
-          Set-Content -LiteralPath $test -Value $text -Encoding utf8 -NoNewline
+          @'
+          from pathlib import Path
+          path = Path('tests/ProxyToAnyConnect.SelfTests/WindowsVpnProfileInspectorLifetimeSelfTests.cs')
+          text = path.read_text(encoding='utf-8')
+          old = """            $child = Start-Process `
+                          -FilePath (Join-Path $PSHOME 'powershell.exe') `
+                          -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') `
+                          -PassThru"""
+          new = """            $child = Start-Process `
+                          -FilePath (Join-Path $env:SystemRoot 'System32\\ping.exe') `
+                          -ArgumentList @('-n','31','127.0.0.1') `
+                          -PassThru"""
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one nested PowerShell child, got {text.count(old)}')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='')
+          '@ | python -
 
           git diff --check
           $changed = @(git diff --name-only)
