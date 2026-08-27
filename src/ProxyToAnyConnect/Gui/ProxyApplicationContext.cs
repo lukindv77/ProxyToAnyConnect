@@ -135,29 +135,75 @@ internal sealed class ProxyApplicationContext : ApplicationContext
 
         try
         {
-            await _runtimeHost.DisposeAsync();
-        }
-        catch (Exception ex)
-        {
-            AppLog.Error("application.shutdown.failed", "Runtime cleanup failed during application exit.", ex);
-        }
+            var failures = await ApplicationShutdownSequence.DrainAsync(
+                _mainForm.StopConfigurationCommandsAsync,
+                _runtimeHost.DisposeAsync,
+                _memoryHealthMonitor.DisposeAsync);
 
-        try
-        {
-            await _memoryHealthMonitor.DisposeAsync();
+            foreach (var failure in failures)
+            {
+                LogShutdownFailure(failure);
+            }
         }
         catch (Exception ex)
         {
-            AppLog.Warning(
-                "process.memory.monitor_shutdown_failed",
-                "Process memory health monitor cleanup failed during application exit.",
-                new { Error = ex.Message });
+            // DrainAsync is designed to collect owner failures rather than throw.
+            // Keep this final boundary so an unexpected sequencing defect can never
+            // strand the tray/UI after explicit Exit.
+            AppLog.Error(
+                "application.shutdown.sequence_failed",
+                "Application shutdown sequencing failed unexpectedly.",
+                ex);
         }
         finally
         {
             _mainForm.AllowExit();
             _notifyIcon.Dispose();
             _mainForm.Close();
+        }
+    }
+
+    private static void LogShutdownFailure(ApplicationShutdownFailure failure)
+    {
+        switch (failure.Phase)
+        {
+            case "configuration-command-queue":
+                AppLog.Warning(
+                    "configuration.command_queue.shutdown_failed",
+                    "Configuration command queue cleanup failed during application exit.",
+                    new
+                    {
+                        ErrorType = failure.Exception.GetType().FullName,
+                        failure.Exception.Message
+                    });
+                break;
+            case "runtime-host":
+                AppLog.Error(
+                    "application.shutdown.failed",
+                    "Runtime cleanup failed during application exit.",
+                    failure.Exception);
+                break;
+            case "memory-monitor":
+                AppLog.Warning(
+                    "process.memory.monitor_shutdown_failed",
+                    "Process memory health monitor cleanup failed during application exit.",
+                    new
+                    {
+                        ErrorType = failure.Exception.GetType().FullName,
+                        failure.Exception.Message
+                    });
+                break;
+            default:
+                AppLog.Warning(
+                    "application.shutdown.owner_failed",
+                    "An application shutdown owner failed cleanup.",
+                    new
+                    {
+                        failure.Phase,
+                        ErrorType = failure.Exception.GetType().FullName,
+                        failure.Exception.Message
+                    });
+                break;
         }
     }
 }
