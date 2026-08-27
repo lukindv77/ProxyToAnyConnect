@@ -41,8 +41,8 @@ internal static class WindowsVpnProfileInspectorLifetimeSelfTests
         var script = $$"""
             $ErrorActionPreference = 'Stop'
             $child = Start-Process `
-                -FilePath (Join-Path $PSHOME 'powershell.exe') `
-                -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') `
+                -FilePath (Join-Path $env:SystemRoot 'System32\ping.exe') `
+                -ArgumentList @('-n','31','127.0.0.1') `
                 -PassThru
             [System.IO.File]::WriteAllText('{{escapedPidPath}}', "$PID`n$($child.Id)")
             Start-Sleep -Seconds 30
