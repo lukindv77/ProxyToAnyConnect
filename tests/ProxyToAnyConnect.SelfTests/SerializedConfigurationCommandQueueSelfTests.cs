@@ -10,9 +10,10 @@ internal static class SerializedConfigurationCommandQueueSelfTests
         {
             await PreservesStrictGenerationOrderAndSingleOwnershipAsync();
             await FailureAndCancellationDoNotWedgeSuccessorsAsync();
+            await StopCancelsActiveAndQueuedGenerationsAsync();
 
             Console.WriteLine(
-                "PASS: GUI configuration commands serialize strict generations and recover after failure/cancellation");
+                "PASS: GUI configuration commands serialize strict generations, recover after failure/cancellation and drain on shutdown");
             return 0;
         }
         catch (Exception ex)
@@ -161,6 +162,77 @@ internal static class SerializedConfigurationCommandQueueSelfTests
         if (!successorRan)
         {
             throw new InvalidOperationException("Successor did not run after cancelled/failed GUI configuration generations.");
+        }
+    }
+
+    private static async Task StopCancelsActiveAndQueuedGenerationsAsync()
+    {
+        var queue = new SerializedConfigurationCommandQueue();
+        var activeEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var activeSawCancellation = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var queuedRan = false;
+
+        var active = queue.RunAsync(async (_, cancellationToken) =>
+        {
+            activeEntered.TrySetResult(true);
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                activeSawCancellation.TrySetResult(true);
+                throw;
+            }
+        });
+        await activeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var queued = queue.RunAsync((_, _) =>
+        {
+            queuedRan = true;
+            return Task.CompletedTask;
+        });
+
+        var stop = queue.StopAsync();
+        var repeatedStop = queue.StopAsync();
+        if (!ReferenceEquals(stop, repeatedStop))
+        {
+            throw new InvalidOperationException("Repeated queue StopAsync calls did not share one shutdown task.");
+        }
+
+        await activeSawCancellation.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await stop.WaitAsync(TimeSpan.FromSeconds(2));
+
+        try
+        {
+            await active;
+            throw new InvalidOperationException("Active configuration command ignored queue shutdown cancellation.");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        try
+        {
+            await queued;
+            throw new InvalidOperationException("Queued configuration command did not observe queue shutdown cancellation.");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        if (queuedRan)
+        {
+            throw new InvalidOperationException("Queued configuration command executed after queue shutdown began.");
+        }
+
+        try
+        {
+            _ = queue.RunAsync((_, _) => Task.CompletedTask);
+            throw new InvalidOperationException("Stopped configuration queue accepted a new generation.");
+        }
+        catch (ObjectDisposedException)
+        {
         }
     }
 }
