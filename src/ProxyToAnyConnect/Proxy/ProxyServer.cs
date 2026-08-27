@@ -247,11 +247,12 @@ internal sealed class ProxyServer
         var host = uri.IdnHost;
         var port = uri.IsDefaultPort ? 80 : uri.Port;
         var pathAndQuery = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+        var authority = BuildHttpHostAuthority(uri);
 
         await using var upstream = await _socketFactory.ConnectAsync(host, port, cancellationToken);
         await using var upstreamStream = new NetworkStream(upstream.Socket, ownsSocket: false);
 
-        var originHeader = request.BuildOriginHeader(pathAndQuery);
+        var originHeader = request.BuildOriginHeader(pathAndQuery, authority);
         await upstreamStream.WriteAsync(originHeader, cancellationToken);
         RecordSent(originHeader.Length);
 
@@ -557,6 +558,25 @@ internal sealed class ProxyServer
         }
 
         return uri;
+    }
+
+    internal static string BuildHttpHostAuthority(Uri uri)
+    {
+        ArgumentNullException.ThrowIfNull(uri);
+        if (!uri.IsAbsoluteUri ||
+            !uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(uri.Host))
+        {
+            throw new InvalidDataException("A valid absolute HTTP URI is required to generate Host.");
+        }
+
+        if (uri.HostNameType == UriHostNameType.IPv6)
+        {
+            throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+        }
+
+        var host = uri.IdnHost;
+        return uri.IsDefaultPort ? host : $"{host}:{uri.Port}";
     }
 
     private static async Task TryWriteErrorAsync(
@@ -873,6 +893,103 @@ internal sealed class ProxyServer
             HashSet<string>? overflowConnectionTokens)
         {
             if (header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+                FixedHopByHopHeaders.Contains(header.Name))
+            {
+                return true;
+            }
+
+            if (overflowConnectionTokens is not null)
+            {
+                return overflowConnectionTokens.Contains(header.Name);
+            }
+
+            var headerName = header.Name.AsSpan();
+            foreach (var tokenRef in stackConnectionTokens)
+            {
+                var token = GetConnectionTokenSpan(tokenRef);
+                if (token.Equals(headerName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        public byte[] BuildOriginHeader(string pathAndQuery, string authority)
+        {
+            if (string.IsNullOrWhiteSpace(authority))
+            {
+                throw new ArgumentException("Origin authority is required.", nameof(authority));
+            }
+            Span<ConnectionTokenRef> stackConnectionTokens =
+                stackalloc ConnectionTokenRef[StackConnectionTokenCapacity];
+            var stackConnectionTokenCount = CollectConnectionTokens(
+                stackConnectionTokens,
+                out var overflowConnectionTokens);
+            var connectionTokens = stackConnectionTokens[..stackConnectionTokenCount];
+
+            var byteCount = checked(
+                Encoding.Latin1.GetByteCount(Method) + 1 +
+                Encoding.Latin1.GetByteCount(pathAndQuery) + 1 +
+                Encoding.Latin1.GetByteCount(Version) + 2 +
+                "Host: "u8.Length + Encoding.Latin1.GetByteCount(authority) + 2);
+
+            foreach (var header in Headers)
+            {
+                if (ShouldSkipOriginHeaderWithGeneratedHost(header, connectionTokens, overflowConnectionTokens))
+                {
+                    continue;
+                }
+
+                byteCount = checked(
+                    byteCount +
+                    Encoding.Latin1.GetByteCount(header.Name) + 2 +
+                    Encoding.Latin1.GetByteCount(header.Value) + 2);
+            }
+
+            byteCount = checked(byteCount + "Connection: close\r\n\r\n"u8.Length);
+            var result = GC.AllocateUninitializedArray<byte>(byteCount);
+            var destination = result.AsSpan();
+            var written = 0;
+
+            written += Encoding.Latin1.GetBytes(Method.AsSpan(), destination[written..]);
+            destination[written++] = (byte)' ';
+            written += Encoding.Latin1.GetBytes(pathAndQuery.AsSpan(), destination[written..]);
+            destination[written++] = (byte)' ';
+            written += Encoding.Latin1.GetBytes(Version.AsSpan(), destination[written..]);
+            "\r\nHost: "u8.CopyTo(destination[written..]);
+            written += "\r\nHost: "u8.Length;
+            written += Encoding.Latin1.GetBytes(authority.AsSpan(), destination[written..]);
+            "\r\n"u8.CopyTo(destination[written..]);
+            written += 2;
+
+            foreach (var header in Headers)
+            {
+                if (ShouldSkipOriginHeaderWithGeneratedHost(header, connectionTokens, overflowConnectionTokens))
+                {
+                    continue;
+                }
+
+                written += Encoding.Latin1.GetBytes(header.Name.AsSpan((), destination[written..]);
+               ": "u8.CopyTo(destination[written..]);
+                written += 2;
+                written += Encoding.Latin1.GetBytes(header.Value.AsSpan(), destination[written..]);
+                "\r\n"u8.CopyTo(destination[written..]);
+                written += 2;
+            }
+
+            "Connection: close\r\n\r\n"u8.CopyTo(destination[written..]);
+            return result;
+        }
+
+        private bool ShouldSkipOriginHeaderWithGeneratedHost(
+            HeaderLine header,
+            ReadOnlySpan<ConnectionTokenRef> stackConnectionTokens,
+            HashSet<string>? overflowConnectionTokens)
+        {
+            if (header.Name.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
+                header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
                 FixedHopByHopHeaders.Contains(header.Name))
             {
                 return true;
