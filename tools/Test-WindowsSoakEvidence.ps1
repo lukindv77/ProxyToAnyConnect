@@ -60,13 +60,14 @@ if (-not $summary.completed -or -not $resultFile.completed) {
 }
 
 if (-not ([string]$metadata.executableSha256).Equals($expectedHash, [StringComparison]::Ordinal) -or
+    -not ([string]$metadata.expectedExecutableSha256).Equals($expectedHash, [StringComparison]::Ordinal) -or
     -not ([string]$summary.executableSha256).Equals($expectedHash, [StringComparison]::Ordinal) -or
     -not ([string]$resultFile.executableSha256).Equals($expectedHash, [StringComparison]::Ordinal)) {
     throw 'Soak evidence executable SHA-256 does not match the expected release binary.'
 }
 
-# Every emitted payload except the manifest itself must be covered by the manifest.
-# This makes the directory portable and tamper-evident without embedding any host path.
+# Every payload emitted by the collector except the manifest itself must be covered
+# by exactly one bundle-relative manifest entry.
 $requiredManifestNames = @('metadata.json', 'process-samples.jsonl', 'summary.json', 'result.json')
 $manifestEntries = @($manifest.files)
 if ($manifestEntries.Count -ne $requiredManifestNames.Count) {
@@ -105,38 +106,60 @@ if (-not (Test-Path -LiteralPath $samplesPath -PathType Leaf)) {
     throw "Required soak sample stream is missing: $samplesPath"
 }
 
-$sampleLines = @(Get-Content -LiteralPath $samplesPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-if ($sampleLines.Count -lt $MinimumSamples) {
-    throw "Soak evidence contains $($sampleLines.Count) sample(s); at least $MinimumSamples are required."
-}
-if ($sampleLines.Count -ne [int]$summary.sampleCount -or
-    $sampleLines.Count -ne [int]$resultFile.sampleCount) {
-    throw 'Soak sample count does not match summary/result metadata.'
-}
-
+# Validate the JSONL stream in one pass. A release soak may be deliberately sampled
+# more frequently than the recommended 5-minute cadence; validation must therefore
+# remain O(1) in retained memory instead of materializing every line in an array.
+$sampleCount = 0
 $previousTimestamp = $null
-for ($index = 0; $index -lt $sampleLines.Count; $index++) {
-    $sample = $sampleLines[$index] | ConvertFrom-Json
-    if ($sample.schemaVersion -ne 1 -or [int]$sample.index -ne $index) {
-        throw "Soak sample index/schema mismatch at position $index."
+$firstTimestamp = $null
+$lastTimestamp = $null
+foreach ($line in Get-Content -LiteralPath $samplesPath) {
+    if ([string]::IsNullOrWhiteSpace($line)) {
+        continue
+    }
+
+    try {
+        $sample = $line | ConvertFrom-Json
+    }
+    catch {
+        throw "Soak sample JSON parse failure at logical sample $sampleCount: $($_.Exception.Message)"
+    }
+
+    if ($sample.schemaVersion -ne 1 -or [int]$sample.index -ne $sampleCount) {
+        throw "Soak sample index/schema mismatch at position $sampleCount."
     }
     if ([int]$sample.processId -ne [int]$metadata.processId -or
         -not ([string]$sample.processName).Equals(([string]$metadata.processName), [StringComparison]::OrdinalIgnoreCase) -or
         -not ([string]$sample.processStartTimeUtc).Equals(([string]$metadata.processStartTimeUtc), [StringComparison]::Ordinal)) {
-        throw "Soak process identity drift detected at sample $index."
+        throw "Soak process identity drift detected at sample $sampleCount."
     }
 
     foreach ($propertyName in @('workingSetBytes', 'privateBytes', 'handleCount', 'threadCount')) {
-        if ([long]$sample.$propertyName -lt 0) {
-            throw "Soak sample $index contains negative '$propertyName'."
+        $property = $sample.PSObject.Properties[$propertyName]
+        if ($null -eq $property -or [long]$property.Value -lt 0) {
+            throw "Soak sample $sampleCount contains invalid '$propertyName'."
         }
     }
 
-    $timestamp = [DateTimeOffset]::Parse([string]$sample.timestampUtc)
+    $timestamp = [DateTimeOffset]::Parse([string]$sample.timestampUtc).ToUniversalTime()
     if ($null -ne $previousTimestamp -and $timestamp -lt $previousTimestamp) {
-        throw "Soak sample timestamps are not monotonic at sample $index."
+        throw "Soak sample timestamps are not monotonic at sample $sampleCount."
     }
+
+    if ($sampleCount -eq 0) {
+        $firstTimestamp = $timestamp
+    }
+    $lastTimestamp = $timestamp
     $previousTimestamp = $timestamp
+    $sampleCount++
+}
+
+if ($sampleCount -lt $MinimumSamples) {
+    throw "Soak evidence contains $sampleCount sample(s); at least $MinimumSamples are required."
+}
+if ($sampleCount -ne [int]$summary.sampleCount -or
+    $sampleCount -ne [int]$resultFile.sampleCount) {
+    throw 'Soak sample count does not match summary/result metadata.'
 }
 
 if ([double]$summary.observedDurationSeconds -lt $MinimumObservedDurationSeconds) {
@@ -146,13 +169,24 @@ if ([Math]::Abs([double]$summary.observedDurationSeconds - [double]$resultFile.o
     throw 'Soak result observedDurationSeconds does not match summary.json.'
 }
 
+$computedObservedDurationSeconds = if ($null -ne $firstTimestamp -and $null -ne $lastTimestamp) {
+    [Math]::Max(0.0, ($lastTimestamp - $firstTimestamp).TotalSeconds)
+}
+else {
+    0.0
+}
+if ([Math]::Abs($computedObservedDurationSeconds - [double]$summary.observedDurationSeconds) -gt 0.050) {
+    throw 'Soak summary observedDurationSeconds does not match the validated sample timestamp span.'
+}
+
 $result = [ordered]@{
     schemaVersion = 1
     validated = $true
     processId = [int]$metadata.processId
     processName = [string]$metadata.processName
+    processStartTimeUtc = [string]$metadata.processStartTimeUtc
     executableSha256 = [string]$metadata.executableSha256
-    sampleCount = $sampleLines.Count
+    sampleCount = $sampleCount
     observedDurationSeconds = [double]$summary.observedDurationSeconds
     workingSetDeltaBytes = [long]$summary.workingSetDeltaBytes
     privateBytesDeltaBytes = [long]$summary.privateBytesDeltaBytes
@@ -161,6 +195,7 @@ $result = [ordered]@{
     maxHandleCount = [int]$summary.maxHandleCount
     maxThreadCount = [int]$summary.maxThreadCount
     manifestFileCount = $manifestEntries.Count
+    validationMemoryModel = 'streaming-o1'
     assessment = 'Integrity, portability and process identity validated. Memory-leak acceptance still requires workload-aware review of the series and application managed-heap logs.'
 }
 
