@@ -11,6 +11,7 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
         try
         {
             await DisconnectContinuesAfterMonitorFailureAsync();
+            await DisconnectDrainsMonitorWhenCancellationCallbackThrowsAsync();
             await DisposeReleasesShutdownOwnerAndRetriesResidualHandleAsync();
 
             Console.WriteLine(
@@ -90,6 +91,60 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
         {
             throw new InvalidOperationException(
                 "Successful retry did not drain the retained RAS handle to terminal invalid-handle state.");
+        }
+
+        await manager.DisposeAsync();
+    }
+
+    private static async Task DisconnectDrainsMonitorWhenCancellationCallbackThrowsAsync()
+    {
+        var native = new CleanupRasNative(RasNative.ErrorSuccess);
+        var manager = CreateManager(native);
+        var monitorCancellation = new CancellationTokenSource();
+        using var registration = monitorCancellation.Token.Register(
+            static () => throw new SyntheticCleanupException("monitor cancellation callback failed"));
+        var monitorTask = Task.Delay(
+            System.Threading.Timeout.InfiniteTimeSpan,
+            monitorCancellation.Token);
+        var expectedHandle = (nint)0x7003;
+
+        SetPrivateField(manager, "_monitorCancellation", monitorCancellation);
+        SetPrivateField(manager, "_monitorTask", monitorTask);
+        SetPrivateField(manager, "_rasConnection", expectedHandle);
+
+        try
+        {
+            await manager.DisconnectAsync();
+            throw new InvalidOperationException(
+                "Throwing monitor cancellation callback was not surfaced as a cleanup defect.");
+        }
+        catch (AggregateException ex) when (
+            ex.InnerExceptions.Any(inner =>
+                inner is SyntheticCleanupException synthetic &&
+                synthetic.Message == "monitor cancellation callback failed"))
+        {
+        }
+
+        if (!monitorTask.IsCompleted || !CancellationSourceWasDisposed(monitorCancellation))
+        {
+            throw new InvalidOperationException(
+                "Throwing monitor cancellation callback prevented exact task drain or CTS disposal.");
+        }
+
+        if (GetPrivateField<CancellationTokenSource?>(manager, "_monitorCancellation") is not null ||
+            GetPrivateField<Task?>(manager, "_monitorTask") is not null)
+        {
+            throw new InvalidOperationException(
+                "Throwing monitor cancellation callback retained published monitor ownership.");
+        }
+
+        if (native.HangUpCount != 1 ||
+            native.LastHungUpHandle != expectedHandle ||
+            native.GetConnectStatusCount == 0 ||
+            GetPrivateField<nint>(manager, "_rasConnection") != 0)
+        {
+            throw new InvalidOperationException(
+                "Throwing monitor cancellation callback prevented exact RAS handle drain.");
         }
 
         await manager.DisposeAsync();
