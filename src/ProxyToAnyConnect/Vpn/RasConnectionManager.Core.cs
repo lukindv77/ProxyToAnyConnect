@@ -13,7 +13,7 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
     private readonly WindowsVpnProfileInspector _profileInspector;
     private readonly WindowsDefaultRouteInspector _routeInspector;
     private readonly VpnConnectivityVerifier _connectivityVerifier;
-    private readonly RasDialer _dialer = new();
+    private readonly RasDialer _dialer;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly CancellationTokenSource _shutdown = new();
 
@@ -28,12 +28,21 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
     private int _disposed;
 
     public RasConnectionManager(L2tpOptions options, L2tpRuntimeMetrics? metrics = null)
+        : this(options, metrics, null)
     {
-        _options = options;
+    }
+
+    internal RasConnectionManager(
+        L2tpOptions options,
+        L2tpRuntimeMetrics? metrics,
+        RasDialer? dialer)
+    {
+        _options = options ?? throw new ArgumentNullException(nameof(options));
         _metrics = metrics;
         _profileInspector = new WindowsVpnProfileInspector();
         _routeInspector = new WindowsDefaultRouteInspector();
         _connectivityVerifier = new VpnConnectivityVerifier(options.Verification);
+        _dialer = dialer ?? new RasDialer();
     }
 
     public VpnContext? Current => Volatile.Read(ref _current);
