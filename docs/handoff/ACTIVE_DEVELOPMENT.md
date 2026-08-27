@@ -1,71 +1,90 @@
-# Active development — 2026-08-26
+# Active development — 2026-08-27
 
-Live `main` remains authoritative. This file records the currently active multi-block development stream; exact-head GitHub Actions is required before an item is called accepted.
+Live protected `main` is authoritative. Exact-head GitHub Actions is required before a source block is called accepted. The repository is public; the `main` ruleset restricts updates/deletions/force-pushes and permits bypass only through repository administration and the OpenAI ChatGPT Codex Connector used for this development stream.
 
-## Current source head before this note
+## Last fully accepted checkpoint
 
-- `9df03fedd74e52efe17110250057284cd1627520` — `fix: make accepted client close bounded and response-safe`.
-- Timing methodology fix: `ceb591cf5bf62c43dc08a4611744acf445fa7286`.
-- Framing response-before-close test: `d1f9edd7dbbaaeba2ebd858b9565507f159754e4`.
+`a922ba0a8406515b36edb88a6ade749e171f42e5` — `test: cover bounded RAS hangup drain timeout`.
 
-## Exact CI evidence that drove the current work
+Windows build #417 (`33038130831`) completed successfully on `windows-latest`:
 
-Build #276 on `a0d5e71a905d2fe18e66747233182db62fd2416d`:
+- PowerShell tool AST validation: PASS;
+- hosted `Baseline -> Ready -> Final` evidence lifecycle smoke: PASS;
+- restore/build: PASS;
+- aggregate self-tests: PASS;
+- self-contained win-x64 publish: PASS;
+- ZIP and artifact upload: PASS.
 
-- restore/build succeeded with 0 warnings and 0 errors;
-- corrected proxy setup timing guard passed with unchanged 1.25x policy: parser paired `0.93x`, origin paired `0.93x`;
-- CONNECT setup passed;
-- `ProxyHttpFramingSelfTests` still failed on Windows with WSAECONNRESET 10054 while `ReadFramedResponseAsync` was still reading the response header. This proves the defect is not merely a clean-EOF expectation after a complete response.
+Artifact `9632821353`, GitHub artifact digest:
+`sha256:2b8d8095b53f26ddc7c6019f3d0246bae102b9846167087433dccc3ddf29f4e2`.
 
-The Windows close-path fix in `9df03f...` changes only accepted-client teardown. When unread bytes are already queued locally, it performs send-side shutdown, discards only already-buffered client bytes locally with a hard 64 KiB cap, then closes. It never forwards those bytes to origin, never waits for more attacker data, and does not alter L2TP DNS/socket routing, CONNECT pumps, parser semantics or 32 KiB transfer buffers.
+Issues #14 (HTTP framing/request-smuggling boundary) and #15 (transactional proxy startup ownership) are closed as completed and must not be treated as pending work.
 
-Issue #14 remains open until exact-head Windows CI passes the timing and HTTP-framing suites.
+## Runtime/lifecycle blocks completed before the current head
 
-## Transactional startup block (#15)
+Major deterministic ownership/fail-closed hardening now includes:
 
-A deterministic orchestration-only patch is being prepared. The production network chain remains:
+- asynchronous RAS dial with exact `HRASCONN` ownership and caller cancellation;
+- callback delegate roots retained until Connected or proven `ERROR_INVALID_HANDLE` teardown;
+- failed RAS teardown keeps residual exact handle retryable instead of losing native ownership;
+- one RAS hangup/status-drain attempt is bounded to 10 seconds; timeout does not falsely declare the handle terminal;
+- RAS monitor, VPN maintenance, runtime host and coordinator teardown continue draining owners even if cancellation callbacks throw;
+- first cleanup failure remains primary while secondary cleanup defects are attached diagnostically;
+- `ProxyInstanceRuntime` start and pause/shutdown are transactional: exact run task drains before VPN lease release;
+- initial desired enabled starts remain pending after transient/cancelled startup and can reconcile on the same config;
+- same-config reconfigure detects missing runtime topology and recreates missing proxy/VPN generations;
+- shared/dedicated VPN lease ownership, last-lease disconnect, shared fail-closed invalidation and reconnect cooldown are deterministic;
+- reconnect maintenance waits out known cooldown instead of repeatedly invoking `ConnectAsync` and emitting failure/log churn;
+- Windows profile enumeration owns and terminates its PowerShell helper process tree on cancellation;
+- CustomEphemeral private RAS sessions use live exclusive ownership locks and recover only proven stale managed session directories;
+- managed dial password and PSK carriers are cleared immediately after their native handoff boundaries;
+- accepted-client HTTP transport has one terminal socket owner and strict request-framing boundaries;
+- logging replacement is fail-soft/transactional, and process/static diagnostic owners are explicitly shut down.
 
-`VpnLeaseManager -> L2tpDnsResolver -> L2tpSocketFactory -> ProxyServer`.
+## Current unaccepted source head — binary evidence and settings durability
 
-The stronger ownership model is to keep a start attempt's lease, CTS and run task local until listener readiness succeeds. A rejected attempt therefore never publishes stale runtime ownership. Required cleanup is:
+The following commits are newer than the last fully accepted checkpoint and require a new exact-head Windows verdict:
 
-`cancel exact run CTS -> await exact run task drain -> dispose CTS -> release exact lease once`.
+- `f6e35e7...` — integration process evidence captures SHA-256 of the running `ProxyToAnyConnect.exe` without persisting its path;
+- `0e492b7...` — aggregate acceptance can require an expected executable SHA-256 and process lifecycle;
+- `f3e0cbe...` — CI publishes `ProxyToAnyConnect.exe.sha256` plus `build-identity.json` and smoke-tests exact-binary validation;
+- `962c754...` — configuration saving uses a unique sibling temp file, a final cancellation publication boundary and best-effort owned-temp cleanup;
+- `470756d...` / `460b365...` — deterministic configuration-persistence regressions and aggregate runner wiring;
+- `fc7d06b...` — fixes empty process-array materialization exposed by Windows build #423;
+- `4255902...` — documents exact executable identity as part of release-grade Windows acceptance.
 
-Caller cancellation must remain cancellation and leave the runtime retryable. Listener/readiness failure must leave coherent Error state. Successful Running behavior, Pause/Dispose idempotence, shared-L2TP accounting and observer behavior must remain unchanged.
+Build #423 on `460b365...` failed before .NET only because PowerShell function output converted an empty process array into `$null`; StrictMode then rejected `.Count`. AST validation and all three raw stage captures passed. `fc7d06b...` fixes that exact shape by materializing each process set through `@(...)` and passing scalar counts to stage summaries.
 
-Planned deterministic tests cover:
+## Release-critical real Windows acceptance (#2, #4, #5, #6, #7)
 
-- caller cancellation after run creation;
-- readiness/listener failure;
-- blocked run drain proving the VPN lease is not released early;
-- stale-field absence after rejection;
-- safe retry to Running;
-- Pause twice / Dispose after pause without double lease release;
-- repeated rejected-start collectability cycles, with forced GC only in tests.
+Synthetic/hosted CI cannot close these product acceptance boundaries. The next real Windows 11 x64 run must use a real L2TP endpoint and the exact self-contained CI artifact.
 
-## Performance / memory block (#11, #13)
+Required high-level evidence:
 
-The lifecycle work is also a long-run retention boundary:
+1. Baseline before application start: no ProxyToAnyConnect process, route/profile fingerprints captured.
+2. Ready: exactly one process whose executable SHA-256 matches the artifact `build-identity.json`; HTTP/HTTPS proxy egress uses the expected L2TP public IPv4; direct host egress remains independent; default routes remain unchanged.
+3. Multi-proxy: shared lease remains connected while any dependent proxy runs; last release disconnects; dedicated unrelated group is isolated.
+4. Keepalive: internal-server and CustomIPv4 targets, threshold invalidation, active tunnel cancellation, hangup/cooldown/reconnect/full verification, and no reconnect after last lease.
+5. CustomEphemeral: no persistent Windows VPN profile, private PBK cleanup on normal exit, stale-session recovery after abnormal termination, no plaintext credential material in config/logs.
+6. Final after explicit application Exit: no process remains; route/profile state returns to baseline as required.
+7. Aggregate `Complete-WindowsIntegrationEvidence.ps1` must pass with `-ExpectedExecutableSha256` and `-RequireProcessLifecycle` in addition to real proxy probes.
+
+## Performance and long-run stability (#11, #13)
+
+Permanent constraints remain:
 
 - no production forced GC;
-- no unbounded client close drain;
-- no session-history/task registry;
-- no transfer-buffer reduction or extra steady-state data-path copy;
-- rejected start attempts must not retain lease/CTS/run/observer/server objects;
-- ProcessMemoryHealthMonitor remains latest-snapshot-only in memory with periodic append-only JSONL for history.
-
-## Product/runtime acceptance blocks (#4, #5, #6, #7, #2)
-
-Source audit confirms the major UI/runtime mechanisms are already present: independent proxy Start/Pause controls and state snapshots, shared/dedicated lease accounting, selectable local bind IPv4, interactive Windows L2TP profile list/refresh, CustomEphemeral configuration, and keepalive modes. After #14/#15 lifecycle correctness is green, these issues should be driven by their remaining exact Windows/real-endpoint acceptance rather than reimplementing existing mechanisms.
+- no unbounded queues/history/task registries;
+- 32 KiB pooled transfer buffers remain unchanged;
+- no optimization may weaken source-IP bind, `IP_UNICAST_IF`, custom DNS or fail-closed routing;
+- cleanup hardening must not add work to steady-state packet/buffer forwarding;
+- hosted timing/allocation gates remain required;
+- real 12–24+ hour soak should track working set/private bytes, managed heap, handles, threads, reconnect cycles, Pause/Resume and selective reconfigure.
 
 ## Immediate order
 
-1. Obtain exact-head Windows CI for the bounded close-path fix and finish/close #14 only on green evidence.
-2. Land transactional startup ownership plus deterministic lifecycle/collectability tests for #15/#13.
-3. Run exact-head full Windows CI and fix any later suite exposed after framing/startup gates.
-4. Continue performance/memory hardening (#11/#13) and close implementation-complete product blocks only when their remaining Windows acceptance is evidenced.
-5. Keep issue threads and handoff docs synchronized after each material source/CI result.
-
-## Repository protection validation — 2026-08-27
-
-The repository is public and the default branch is protected by an active branch ruleset. Direct updates, deletions and force pushes are restricted; repository administrators and the OpenAI ChatGPT Codex Connector integration are configured as always-allowed bypass actors. This documentation-only change is intentionally used as a live write-path validation for the protected `main` workflow before continuing runtime development.
+1. Obtain exact-head Windows CI after `fc7d06b...` / `4255902...`; fix any evidence/build/self-test failure before declaring the new blocks accepted.
+2. Finish settings desired-state consistency: after durable save succeeds, the GUI must show the persisted desired config even if runtime apply fails; do not silently present the previous in-memory settings as if the write rolled back.
+3. Update issues #2/#5/#11/#13 with exact commits and CI evidence.
+4. Run release-grade Windows 11 + real L2TP acceptance using the artifact executable SHA-256 contract.
+5. Continue residual-resource/reconfigure soak hardening while preserving hot-path latency constraints.
