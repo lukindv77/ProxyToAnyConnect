@@ -1,0 +1,174 @@
+name: dev-issue28
+
+on:
+  push:
+    branches: [ dev/issue28-http-canonical-host ]
+    paths:
+      - '.github/workflows/dev-issue28.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  canonicalize-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Canonicalize plain HTTP routing host and run aggregate tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = @{
+            'src/ProxyToAnyConnect/Proxy/ProxyServer.cs' = '8f8692442e84f779d04c282770acf6c622c0504e'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs' = '8d071b019ec3b6e29f01cc98e500835a9ef6e8a5'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyHttpCanonicalHostSelfTests.cs' = '0b5c14ad82ae7ab4c40d9328d7a53301afb73704'
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            if ((git rev-parse "HEAD:$($entry.Key)").Trim() -ne $entry.Value) {
+              throw "Unexpected #28 input blob: $($entry.Key)"
+            }
+          }
+
+          @'
+          from pathlib import Path
+
+          proxy = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = proxy.read_text(encoding='utf-8')
+          old = '''        var uri = ParseAbsoluteHttpUri(request.Target);
+                  var host = uri.IdnHost;
+                  var port = uri.IsDefaultPort ? 80 : uri.Port;
+                  var pathAndQuery = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+                  var authority = BuildHttpHostAuthority(uri);'''
+          new = '''        var target = ParseHttpTarget(request.Target);
+                  var host = target.Host;
+                  var port = target.Port;
+                  var pathAndQuery = target.PathAndQuery;
+                  var authority = target.Authority;'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one plain HTTP routing block, got {text.count(old)}')
+          text = text.replace(old, new)
+
+          marker = '''    internal static string BuildHttpHostAuthority(Uri uri)
+              {
+                  ArgumentNullException.ThrowIfNull(uri);
+                  if (!uri.IsAbsoluteUri ||
+                      !uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+                      string.IsNullOrWhiteSpace(uri.Host))
+                  {
+                      throw new InvalidDataException("A valid absolute HTTP URI is required to generate Host.");
+                  }
+
+                  if (uri.HostNameType == UriHostNameType.IPv6)
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  var host = uri.IdnHost;
+                  return uri.IsDefaultPort ? host : $"{host}:{uri.Port}";
+              }'''
+          replacement = '''    internal static (string Host, int Port, string Authority, string PathAndQuery) ParseHttpTarget(string target)
+              {
+                  var uri = ParseAbsoluteHttpUri(target);
+                  var (host, port, authority) = CanonicalizeHttpUri(uri);
+                  var pathAndQuery = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+                  return (host, port, authority, pathAndQuery);
+              }
+
+              private static (string Host, int Port, string Authority) CanonicalizeHttpUri(Uri uri)
+              {
+                  ArgumentNullException.ThrowIfNull(uri);
+                  if (!uri.IsAbsoluteUri ||
+                      !uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+                      string.IsNullOrWhiteSpace(uri.Host))
+                  {
+                      throw new InvalidDataException("A valid absolute HTTP URI is required to generate Host.");
+                  }
+
+                  if (uri.HostNameType == UriHostNameType.IPv6)
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  string host;
+                  var uriHost = uri.IdnHost;
+                  if (IPAddress.TryParse(uriHost, out var literal))
+                  {
+                      if (literal.AddressFamily != AddressFamily.InterNetwork)
+                      {
+                          throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                      }
+
+                      host = literal.ToString();
+                  }
+                  else
+                  {
+                      try
+                      {
+                          host = L2tpDnsResolver.NormalizeDnsHostStrict(uriHost);
+                      }
+                      catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+                      {
+                          throw new InvalidDataException($"Invalid plain HTTP target host '{uri.Host}'.", ex);
+                      }
+                  }
+
+                  var port = uri.IsDefaultPort ? 80 : uri.Port;
+                  var authority = port == 80 ? host : $"{host}:{port}";
+                  return (host, port, authority);
+              }
+
+              internal static string BuildHttpHostAuthority(Uri uri) =>
+                  CanonicalizeHttpUri(uri).Authority;'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'expected one HTTP Host authority helper, got {text.count(marker)}')
+          proxy.write_text(text.replace(marker, replacement), encoding='utf-8', newline='')
+
+          runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
+          text = runner.read_text(encoding='utf-8')
+          anchor = '        await RunAsync(nameof(ProxyHttpRequestLineSelfTests), ProxyHttpRequestLineSelfTests.RunAsync);\n'
+          addition = anchor + '        await RunAsync(nameof(ProxyHttpCanonicalHostSelfTests), ProxyHttpCanonicalHostSelfTests.RunAsync);\n'
+          if text.count(anchor) != 1:
+              raise SystemExit(f'expected one HTTP request-line runner anchor, got {text.count(anchor)}')
+          runner.write_text(text.replace(anchor, addition), encoding='utf-8', newline='')
+
+          # #28 is prototyped on the #25 staging lineage. Bring the CONNECT comparator
+          # to the same #24 semantic contract for this aggregate run without including
+          # that unrelated test change in the #28 functional commit.
+          connect = Path('tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs')
+          text = connect.read_text(encoding='utf-8')
+          old = '''        var method = requestLine[requestParts[0]].ToString();
+                  var target = requestLine[requestParts[1]].ToString();
+                  var version = requestLine[requestParts[2]].ToString();'''
+          if text.count(old) == 1:
+              new = '''        var methodSpan = requestLine[requestParts[0]];
+                  var versionSpan = requestLine[requestParts[2]];
+                  if (!IsValidBaselineHeaderName(methodSpan))
+                  {
+                      throw new InvalidDataException("Invalid HTTP method token.");
+                  }
+
+                  if (!versionSpan.SequenceEqual("HTTP/1.0".AsSpan()) &&
+                      !versionSpan.SequenceEqual("HTTP/1.1".AsSpan()))
+                  {
+                      throw new InvalidDataException("Unsupported HTTP request version.");
+                  }
+
+                  var method = methodSpan.ToString();
+                  var target = requestLine[requestParts[1]].ToString();
+                  var version = versionSpan.ToString();'''
+              connect.write_text(text.replace(old, new), encoding='utf-8', newline='')
+          '@ | python -
+
+          git diff --check
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs tests/ProxyToAnyConnect.SelfTests/ProxyHttpCanonicalHostSelfTests.cs
+          git commit -m 'proxy: canonicalize plain HTTP host before routing'
+          git push origin HEAD:refs/heads/dev/issue28-http-canonical-host
