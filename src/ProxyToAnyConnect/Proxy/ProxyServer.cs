@@ -713,7 +713,13 @@ internal sealed class ProxyServer
                     throw new InvalidDataException("Invalid HTTP header name.");
                 }
 
-                var value = line[(separator + 1)..].Trim();
+                var rawValue = line[(separator + 1)..];
+                if (!IsValidHeaderValue(rawValue))
+                {
+                    throw new InvalidDataException("Invalid HTTP header field value.");
+                }
+
+                var value = rawValue.Trim();
                 var header = new HeaderLine(name.ToString(), value.ToString());
                 headers.Add(header);
 
@@ -803,6 +809,19 @@ internal sealed class ProxyServer
             return true;
         }
 
+        private static bool IsValidHeaderValue(ReadOnlySpan<char> value)
+        {
+            foreach (var character in value)
+            {
+                if ((character < 0x20 && character != '\t') || character == 0x7F)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         private static void ValidateHeaderLines(string text, int offset)
         {
             while (offset < text.Length)
@@ -819,9 +838,22 @@ internal sealed class ProxyServer
                     return;
                 }
 
-                if (remaining[..lineEnd].IndexOf(':') <= 0)
+                var line = remaining[..lineEnd];
+                var separator = line.IndexOf(':');
+                if (separator <= 0 || char.IsWhiteSpace(line[separator - 1]))
                 {
                     throw new InvalidDataException("Invalid HTTP header line.");
+                }
+
+                var name = line[..separator];
+                if (!IsValidHeaderName(name))
+                {
+                    throw new InvalidDataException("Invalid HTTP header name.");
+                }
+
+                if (!IsValidHeaderValue(line[(separator + 1)..]))
+                {
+                    throw new InvalidDataException("Invalid HTTP header field value.");
                 }
 
                 offset += lineEnd + 2;
@@ -876,7 +908,7 @@ internal sealed class ProxyServer
                 }
 
                 written += Encoding.Latin1.GetBytes(header.Name.AsSpan(), destination[written..]);
-                ": "u8.CopyTo(destination[written..]);
+                 ": "u8.CopyTo(destination[written..]);
                 written += 2;
                 written += Encoding.Latin1.GetBytes(header.Value.AsSpan(), destination[written..]);
                 "\r\n"u8.CopyTo(destination[written..]);
@@ -972,7 +1004,7 @@ internal sealed class ProxyServer
                 }
 
                 written += Encoding.Latin1.GetBytes(header.Name.AsSpan(), destination[written..]);
-               ": "u8.CopyTo(destination[written..]);
+                ": "u8.CopyTo(destination[written..]);
                 written += 2;
                 written += Encoding.Latin1.GetBytes(header.Value.AsSpan(), destination[written..]);
                 "\r\n"u8.CopyTo(destination[written..]);
