@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Apply and verify issues 49 and 50 patch
+      - name: Apply and verify issues 49 and 50 transform
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -28,8 +28,8 @@ jobs:
           $expectedBase = '2e56f8f76efda9047ec83f3cd0e58aee395de322'
           git merge-base --is-ancestor $expectedBase HEAD
 
-          if ((git rev-parse HEAD:.github/validation/issue49.patch).Trim() -ne 'fb9bfa2328cbd352b10514e975b1a0c809873974') {
-            throw 'Unexpected issue49/50 patch blob.'
+          if ((git rev-parse HEAD:.github/validation/issue49-transform.ps1).Trim() -ne '8986e4461c3a2098be6a4519b1b42e9ad124c7d5') {
+            throw 'Unexpected issue49/50 transform blob.'
           }
 
           $expectedBlobs = [ordered]@{
@@ -43,10 +43,7 @@ jobs:
             if ($actual -ne $entry.Value) { throw "Unexpected base blob for $($entry.Key): $actual" }
           }
 
-          Write-Host "UNICODE_DNS_CLASSIFICATION=$([Uri]::CheckHostName('münich.example'))"
-
-          git apply --recount --check .github/validation/issue49.patch
-          git apply --recount .github/validation/issue49.patch
+          & ./.github/validation/issue49-transform.ps1
           $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
           git add -- $expectedPaths
           git config core.whitespace cr-at-eol
