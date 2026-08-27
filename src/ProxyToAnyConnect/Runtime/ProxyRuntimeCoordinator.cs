@@ -185,6 +185,29 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                              !ConfigurationEquals(oldValue, newValue))
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+            // A previous selective cleanup can legitimately remove an affected owner
+            // before one of its teardown steps reports a failure. In that degraded
+            // state the persisted/desired options may be byte-for-byte unchanged on
+            // the next Apply, so configuration diff alone is insufficient. Treat
+            // missing runtime objects as actual topology drift and rebuild only those
+            // owners through the same dependency-ordered selective path.
+            HashSet<string> missingProxyIds;
+            lock (_collectionGate)
+            {
+                foreach (var vpnId in newVpnOptions.Keys)
+                {
+                    if (!_vpnById.ContainsKey(vpnId))
+                    {
+                        changedVpnIds.Add(vpnId);
+                    }
+                }
+
+                missingProxyIds = newProxyOptions.Keys
+                    .Where(id => !_proxyById.ContainsKey(id))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                affectedProxyIds.UnionWith(missingProxyIds);
+            }
+
             foreach (var proxy in oldProxyOptions.Values)
             {
                 if (changedVpnIds.Contains(proxy.VpnConnectionId))
@@ -308,11 +331,13 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 oldProxyOptions.TryGetValue(proxyId, out var oldProxy);
                 previousStates.TryGetValue(proxyId, out var previousState);
 
-                var shouldStart = oldProxy is null
+                var shouldStart = missingProxyIds.Contains(proxyId)
                     ? newProxy.Enabled
-                    : !oldProxy.Enabled && newProxy.Enabled ||
-                      previousState is ProxyInstanceState.Running or ProxyInstanceState.Starting ||
-                      previousState == ProxyInstanceState.Error && newProxy.Enabled;
+                    : oldProxy is null
+                        ? newProxy.Enabled
+                        : !oldProxy.Enabled && newProxy.Enabled ||
+                          previousState is ProxyInstanceState.Running or ProxyInstanceState.Starting ||
+                          previousState == ProxyInstanceState.Error && newProxy.Enabled;
 
                 if (oldProxy is not null && oldProxy.Enabled && !newProxy.Enabled)
                 {
