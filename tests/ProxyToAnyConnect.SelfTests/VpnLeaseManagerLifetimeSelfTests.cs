@@ -12,11 +12,13 @@ internal static class VpnLeaseManagerLifetimeSelfTests
         try
         {
             await DisposeCancelsPendingAcquireAsync();
+            await DisposeRejectsSuccessfulConnectRacingShutdownAsync();
             await SharedLeaseDisconnectsOnlyAfterLastReleaseAsync();
             await DedicatedLeaseRejectsConcurrentConsumerAsync();
+            await RepeatedLeaseManagerCyclesBecomeCollectibleAsync();
 
             Console.WriteLine(
-                "PASS: VPN lease manager owner cancellation, shared last-release and dedicated exclusivity");
+                "PASS: VPN lease manager owner cancellation, shutdown race barrier, shared last-release, dedicated exclusivity and collection churn");
             return 0;
         }
         catch (Exception ex)
@@ -64,6 +66,44 @@ internal static class VpnLeaseManagerLifetimeSelfTests
         {
             throw new InvalidOperationException(
                 $"VPN controller dispose count was {controller.DisposeCount}; expected exactly one.");
+        }
+    }
+
+    private static async Task DisposeRejectsSuccessfulConnectRacingShutdownAsync()
+    {
+        var controller = new StubbornSuccessfulVpnConnectionController();
+        var manager = new VpnLeaseManager(CreateOptions(shared: true), controller);
+
+        var acquireTask = manager.AcquireAsync("proxy-race", CancellationToken.None);
+        await controller.ConnectStarted.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var disposeTask = manager.DisposeAsync().AsTask();
+        await controller.OwnerCancellationObserved.WaitAsync(TimeSpan.FromSeconds(2));
+
+        controller.AllowSuccessfulReturn();
+
+        try
+        {
+            _ = await acquireTask.WaitAsync(TimeSpan.FromSeconds(2));
+            throw new InvalidOperationException(
+                "Acquire returned a lease after owner shutdown even though its linked lifetime token was cancelled.");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(2));
+
+        if (manager.ActiveProxyCount != 0)
+        {
+            throw new InvalidOperationException(
+                $"Shutdown-racing successful connect retained {manager.ActiveProxyCount} consumer(s).");
+        }
+
+        if (controller.DisposeCount != 1 || controller.Current is not null)
+        {
+            throw new InvalidOperationException(
+                "Shutdown-racing controller was not deterministically disposed after the rejected acquire.");
         }
     }
 
@@ -139,6 +179,66 @@ internal static class VpnLeaseManagerLifetimeSelfTests
         }
     }
 
+    private static async Task RepeatedLeaseManagerCyclesBecomeCollectibleAsync()
+    {
+        const int cycleCount = 256;
+        var references = await CreateAndDisposeLeaseManagersAsync(cycleCount);
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        var managerAlive = references.ManagerReferences.Count(reference => reference.IsAlive);
+        var controllerAlive = references.ControllerReferences.Count(reference => reference.IsAlive);
+        var contextAlive = references.ContextReferences.Count(reference => reference.IsAlive);
+
+        if (managerAlive != 0 || controllerAlive != 0 || contextAlive != 0)
+        {
+            throw new InvalidOperationException(
+                $"Released lease churn retained manager/controller/context objects: " +
+                $"{managerAlive}/{controllerAlive}/{contextAlive} of {cycleCount}.");
+        }
+    }
+
+    private static async Task<LeaseManagerWeakReferences> CreateAndDisposeLeaseManagersAsync(int count)
+    {
+        var managers = new WeakReference[count];
+        var controllers = new WeakReference[count];
+        var contexts = new WeakReference[count];
+
+        for (var index = 0; index < count; index++)
+        {
+            var controller = BlockingVpnConnectionController.CreateReady();
+            var manager = new VpnLeaseManager(
+                new L2tpOptions
+                {
+                    Id = $"vpn-churn-{index}",
+                    Name = $"VPN churn {index}",
+                    Shared = true
+                },
+                controller);
+
+            var lease = await manager.AcquireAsync($"proxy-{index}", CancellationToken.None);
+            var context = controller.Current
+                ?? throw new InvalidOperationException($"Cycle {index} did not create a VPN context.");
+
+            managers[index] = new WeakReference(manager);
+            controllers[index] = new WeakReference(controller);
+            contexts[index] = new WeakReference(context);
+
+            await lease.DisposeAsync();
+            await manager.DisposeAsync();
+
+            if (manager.ActiveProxyCount != 0 || !context.IsDisposed)
+            {
+                throw new InvalidOperationException(
+                    $"Cycle {index} did not deterministically release lease/context resources.");
+            }
+        }
+
+        return new LeaseManagerWeakReferences(managers, controllers, contexts);
+    }
+
     private static L2tpOptions CreateOptions(bool shared) =>
         new()
         {
@@ -146,6 +246,11 @@ internal static class VpnLeaseManagerLifetimeSelfTests
             Name = shared ? "Shared self-test VPN" : "Dedicated self-test VPN",
             Shared = shared
         };
+
+    private readonly record struct LeaseManagerWeakReferences(
+        WeakReference[] ManagerReferences,
+        WeakReference[] ControllerReferences,
+        WeakReference[] ContextReferences);
 
     private sealed class BlockingVpnConnectionController : IVpnConnectionController
     {
@@ -199,14 +304,7 @@ internal static class VpnLeaseManagerLifetimeSelfTests
                 return current;
             }
 
-            var created = new VpnContext(
-                "self-test",
-                IPAddress.Loopback,
-                new VpnInterfaceInfo(
-                    "self-test",
-                    "self-test",
-                    1,
-                    Array.Empty<IPAddress>()));
+            var created = CreateContext("self-test", 1);
             Volatile.Write(ref _current, created);
             return created;
         }
@@ -231,4 +329,67 @@ internal static class VpnLeaseManagerLifetimeSelfTests
             return ValueTask.CompletedTask;
         }
     }
+
+    private sealed class StubbornSuccessfulVpnConnectionController : IVpnConnectionController
+    {
+        private readonly TaskCompletionSource _connectStarted = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _ownerCancellationObserved = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _allowSuccessfulReturn = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private VpnContext? _current;
+        private int _disposeCount;
+
+        public Task ConnectStarted => _connectStarted.Task;
+        public Task OwnerCancellationObserved => _ownerCancellationObserved.Task;
+        public int DisposeCount => Volatile.Read(ref _disposeCount);
+        public VpnContext? Current => Volatile.Read(ref _current);
+        public VpnConnectionState State => Current is { IsAlive: true }
+            ? VpnConnectionState.Ready
+            : VpnConnectionState.Disconnected;
+
+        public async Task<VpnContext> ConnectAsync(CancellationToken cancellationToken)
+        {
+            _connectStarted.TrySetResult();
+            using var registration = cancellationToken.Register(
+                () => _ownerCancellationObserved.TrySetResult());
+
+            // Deliberately ignore cancellation after observing it. This models a
+            // lower layer completing concurrently with owner shutdown and proves
+            // the lease layer has its own post-connect lifetime barrier.
+            await _allowSuccessfulReturn.Task;
+
+            var created = CreateContext("stubborn-success", 2);
+            Volatile.Write(ref _current, created);
+            return created;
+        }
+
+        public void AllowSuccessfulReturn() => _allowSuccessfulReturn.TrySetResult();
+
+        public Task DisconnectAsync()
+        {
+            var current = Interlocked.Exchange(ref _current, null);
+            current?.MarkDisconnected();
+            return Task.CompletedTask;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            Interlocked.Increment(ref _disposeCount);
+            var current = Interlocked.Exchange(ref _current, null);
+            current?.MarkDisconnected();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private static VpnContext CreateContext(string entryName, int interfaceIndex) =>
+        new(
+            entryName,
+            IPAddress.Loopback,
+            new VpnInterfaceInfo(
+                entryName,
+                entryName,
+                interfaceIndex,
+                Array.Empty<IPAddress>()));
 }
