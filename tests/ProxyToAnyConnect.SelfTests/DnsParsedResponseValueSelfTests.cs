@@ -9,7 +9,9 @@ internal static class DnsParsedResponseValueSelfTests
     private const int WarmupIterations = 4096;
     private const int AllocationIterations = 1000;
     private const int TimingRounds = 15;
-    private const int IterationsPerRound = 65536;
+    private const int InitialIterationsPerRound = 65536;
+    private const int MaxIterationsPerRound = 4 * 1024 * 1024;
+    private const double MinimumTimingWindowMilliseconds = 20;
     private const double MaxMedianSlowdownRatio = 1.25;
     private static int _sink;
 
@@ -35,6 +37,14 @@ internal static class DnsParsedResponseValueSelfTests
             }
 
             var timing = MeasurePaired(RunOptimized, RunReferencePredecessor);
+            if (timing.MinimumRoundMilliseconds < MinimumTimingWindowMilliseconds)
+            {
+                throw new InvalidOperationException(
+                    $"DNS parsed-response timing window was only {timing.MinimumRoundMilliseconds:F1} ms " +
+                    $"at {timing.IterationsPerRound:N0} iterations; minimum is " +
+                    $"{MinimumTimingWindowMilliseconds:F0} ms.");
+            }
+
             if (timing.Ratio > MaxMedianSlowdownRatio)
             {
                 throw new InvalidOperationException(
@@ -48,7 +58,8 @@ internal static class DnsParsedResponseValueSelfTests
                 $"(alloc {optimizedBytes / (double)AllocationIterations:F0} vs " +
                 $"{predecessorBytes / (double)AllocationIterations:F0} bytes/result; " +
                 $"timing {timing.OptimizedMedianNs:F0} vs {timing.PredecessorMedianNs:F0} ns/op, " +
-                $"paired {timing.Ratio:F2}x)");
+                $"paired {timing.Ratio:F2}x, {timing.IterationsPerRound:N0} iterations/side, " +
+                $"minimum round {timing.MinimumRoundMilliseconds:F1} ms)");
             return 0;
         }
         catch (Exception ex)
@@ -119,41 +130,104 @@ internal static class DnsParsedResponseValueSelfTests
 
     private static TimingResult MeasurePaired(Action optimized, Action predecessor)
     {
-        var optimizedRounds = new double[TimingRounds];
-        var predecessorRounds = new double[TimingRounds];
-        var ratioRounds = new double[TimingRounds];
-        for (var round = 0; round < TimingRounds; round++)
+        var iterationsPerRound = CalibrateIterations(optimized, predecessor);
+
+        while (true)
         {
-            if ((round & 1) == 0)
+            var optimizedRounds = new double[TimingRounds];
+            var predecessorRounds = new double[TimingRounds];
+            var ratioRounds = new double[TimingRounds];
+            var minimumRoundMilliseconds = double.MaxValue;
+
+            for (var round = 0; round < TimingRounds; round++)
             {
-                optimizedRounds[round] = MeasureNanosecondsPerOperation(optimized);
-                predecessorRounds[round] = MeasureNanosecondsPerOperation(predecessor);
-            }
-            else
-            {
-                predecessorRounds[round] = MeasureNanosecondsPerOperation(predecessor);
-                optimizedRounds[round] = MeasureNanosecondsPerOperation(optimized);
+                TimingSample optimizedSample;
+                TimingSample predecessorSample;
+                if ((round & 1) == 0)
+                {
+                    optimizedSample = MeasureTimingSample(optimized, iterationsPerRound);
+                    predecessorSample = MeasureTimingSample(predecessor, iterationsPerRound);
+                }
+                else
+                {
+                    predecessorSample = MeasureTimingSample(predecessor, iterationsPerRound);
+                    optimizedSample = MeasureTimingSample(optimized, iterationsPerRound);
+                }
+
+                optimizedRounds[round] = optimizedSample.NanosecondsPerOperation;
+                predecessorRounds[round] = predecessorSample.NanosecondsPerOperation;
+                ratioRounds[round] =
+                    optimizedSample.NanosecondsPerOperation / predecessorSample.NanosecondsPerOperation;
+                minimumRoundMilliseconds = Math.Min(
+                    minimumRoundMilliseconds,
+                    Math.Min(optimizedSample.ElapsedMilliseconds, predecessorSample.ElapsedMilliseconds));
             }
 
-            ratioRounds[round] = optimizedRounds[round] / predecessorRounds[round];
+            if (minimumRoundMilliseconds >= MinimumTimingWindowMilliseconds)
+            {
+                return new TimingResult(
+                    Median(optimizedRounds),
+                    Median(predecessorRounds),
+                    Median(ratioRounds),
+                    iterationsPerRound,
+                    minimumRoundMilliseconds);
+            }
+
+            if (iterationsPerRound >= MaxIterationsPerRound)
+            {
+                throw new InvalidOperationException(
+                    $"DNS timing calibration reached {MaxIterationsPerRound:N0} iterations while a " +
+                    $"measured round was only {minimumRoundMilliseconds:F1} ms.");
+            }
+
+            iterationsPerRound = Math.Min(MaxIterationsPerRound, checked(iterationsPerRound * 2));
         }
-
-        return new TimingResult(
-            Median(optimizedRounds),
-            Median(predecessorRounds),
-            Median(ratioRounds));
     }
 
-    private static double MeasureNanosecondsPerOperation(Action action)
+    private static int CalibrateIterations(Action optimized, Action predecessor)
+    {
+        var iterations = InitialIterationsPerRound;
+        while (true)
+        {
+            var optimizedSample = MeasureTimingSample(optimized, iterations);
+            var predecessorSample = MeasureTimingSample(predecessor, iterations);
+            var minimumMilliseconds = Math.Min(
+                optimizedSample.ElapsedMilliseconds,
+                predecessorSample.ElapsedMilliseconds);
+            if (minimumMilliseconds >= MinimumTimingWindowMilliseconds)
+            {
+                return iterations;
+            }
+
+            if (iterations >= MaxIterationsPerRound)
+            {
+                throw new InvalidOperationException(
+                    $"DNS timing calibration could not reach a {MinimumTimingWindowMilliseconds:F0} ms " +
+                    $"window within {MaxIterationsPerRound:N0} iterations.");
+            }
+
+            var safeElapsed = Math.Max(minimumMilliseconds, 0.001);
+            var requiredScale = Math.Max(
+                2,
+                (int)Math.Ceiling(MinimumTimingWindowMilliseconds / safeElapsed));
+            var requestedIterations = (long)iterations * requiredScale;
+            iterations = (int)Math.Min(MaxIterationsPerRound, requestedIterations);
+        }
+    }
+
+    private static TimingSample MeasureTimingSample(Action action, int iterations)
     {
         var started = Stopwatch.GetTimestamp();
-        for (var i = 0; i < IterationsPerRound; i++)
+        for (var i = 0; i < iterations; i++)
         {
             action();
         }
 
         var elapsedTicks = Stopwatch.GetTimestamp() - started;
-        return elapsedTicks * (1_000_000_000.0 / Stopwatch.Frequency) / IterationsPerRound;
+        var elapsedMilliseconds = elapsedTicks * (1000.0 / Stopwatch.Frequency);
+        var nanosecondsPerOperation =
+            elapsedTicks * (1_000_000_000.0 / Stopwatch.Frequency) / iterations;
+        return new TimingSample(nanosecondsPerOperation, elapsedMilliseconds);
     }
 
     private static double Median(double[] values)
@@ -169,8 +243,14 @@ internal static class DnsParsedResponseValueSelfTests
         bool Truncated,
         uint? MinimumTtlSeconds);
 
+    private readonly record struct TimingSample(
+        double NanosecondsPerOperation,
+        double ElapsedMilliseconds);
+
     private readonly record struct TimingResult(
         double OptimizedMedianNs,
         double PredecessorMedianNs,
-        double Ratio);
+        double Ratio,
+        int IterationsPerRound,
+        double MinimumRoundMilliseconds);
 }

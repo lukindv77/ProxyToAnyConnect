@@ -1,0 +1,47 @@
+name: dev-issue41-dns-timing
+
+on:
+  push:
+    branches: [ dev/issue41-dns-timing ]
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Verify issue 41 patch surface
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $parent = (git rev-parse 'HEAD^').Trim()
+          if ($parent -ne '159e5797deca5455aa38ccbb177003a4184d832d') {
+            throw "Unexpected #41 base: $parent"
+          }
+          git -c core.whitespace=cr-at-eol diff HEAD^ --check
+          $changed = @(git diff --name-only HEAD^ HEAD)
+          $expected = @(
+            '.github/workflows/dev-issue41-dns-timing.yml',
+            'tests/ProxyToAnyConnect.SelfTests/DnsParsedResponseValueSelfTests.cs'
+          )
+          if ($changed.Count -ne $expected.Count) {
+            throw "Unexpected #41 staging patch surface: $($changed -join ', ')"
+          }
+          foreach ($path in $expected) {
+            if ($changed -notcontains $path) { throw "#41 omitted expected path: $path" }
+          }
+      - name: Full aggregate pass 1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Full aggregate pass 2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
