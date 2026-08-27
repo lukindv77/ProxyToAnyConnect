@@ -1,6 +1,20 @@
 diff --git a/src/ProxyToAnyConnect/Configuration/AppOptions.cs b/src/ProxyToAnyConnect/Configuration/AppOptions.cs
 --- a/src/ProxyToAnyConnect/Configuration/AppOptions.cs
 +++ b/src/ProxyToAnyConnect/Configuration/AppOptions.cs
+@@ -1,3 +1,4 @@
++using System.Globalization;
+ using System.Net;
+ using System.Net.NetworkInformation;
+ using System.Net.Sockets;
+@@ -299,10 +300,9 @@ internal sealed class AppOptions
+-        if (string.IsNullOrWhiteSpace(verification.ProbeHost) ||
+-            Uri.CheckHostName(verification.ProbeHost) != UriHostNameType.Dns)
++        if (!VerificationOptions.TryGetCanonicalProbeHost(verification.ProbeHost, out _))
+         {
+-            throw new InvalidOperationException($"L2TP '{name}' verification.probeHost must be a DNS host name.");
++            throw new InvalidOperationException(
++                $"L2TP '{name}' verification.probeHost must be a valid DNS host name that can be canonicalized with IDNA.");
+         }
 @@ -312,10 +312,9 @@ internal sealed class AppOptions
 -        if (string.IsNullOrWhiteSpace(verification.ProbePath) ||
 -            !verification.ProbePath.StartsWith("/", StringComparison.Ordinal))
@@ -10,9 +24,61 @@ diff --git a/src/ProxyToAnyConnect/Configuration/AppOptions.cs b/src/ProxyToAnyC
 +            throw new InvalidOperationException(
 +                $"L2TP '{name}' verification.probePath must be an ASCII HTTP origin-form request-target without a fragment.");
          }
-@@ -566,6 +565,47 @@ internal sealed class VerificationOptions
+@@ -566,6 +565,89 @@ internal sealed class VerificationOptions
      [JsonPropertyName("maxResponseBytes")]
      public int MaxResponseBytes { get; init; } = DefaultResponseLimitBytes;
++
++    internal static bool TryGetCanonicalProbeHost(string? value, out string canonicalHost)
++    {
++        canonicalHost = string.Empty;
++        if (string.IsNullOrWhiteSpace(value))
++        {
++            return false;
++        }
++
++        var isAscii = true;
++        foreach (var current in value)
++        {
++            if (current > 0x7f)
++            {
++                isAscii = false;
++                break;
++            }
++        }
++
++        if (isAscii)
++        {
++            if (Uri.CheckHostName(value) != UriHostNameType.Dns)
++            {
++                return false;
++            }
++
++            canonicalHost = value;
++            return true;
++        }
++
++        try
++        {
++            canonicalHost = new IdnMapping
++            {
++                UseStd3AsciiRules = true
++            }.GetAscii(value).ToLowerInvariant();
++        }
++        catch (ArgumentException)
++        {
++            canonicalHost = string.Empty;
++            return false;
++        }
++
++        if (Uri.CheckHostName(canonicalHost) != UriHostNameType.Dns ||
++            canonicalHost.Any(character => character > 0x7f))
++        {
++            canonicalHost = string.Empty;
++            return false;
++        }
++
++        return true;
++    }
 +
 +    internal static bool IsValidProbePath(string? value)
 +    {
@@ -52,19 +118,73 @@ diff --git a/src/ProxyToAnyConnect/Configuration/AppOptions.cs b/src/ProxyToAnyC
 +    }
 +
 +    private static bool IsAsciiPchar(char value) =>
-+        value is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or
-+        '-' or '.' or '_' or '~' or
-+        '!' or '$' or '&' or '\'' or '(' or ')' or '*' or '+' or ',' or ';' or '=' or ':' or '@';
++        (value >= 'A' && value <= 'Z') ||
++        (value >= 'a' && value <= 'z') ||
++        (value >= '0' && value <= '9') ||
++        value is '-' or '.' or '_' or '~' or
++            '!' or '$' or '&' or '\'' or '(' or ')' or '*' or '+' or ',' or ';' or '=' or ':' or '@';
 +
 +    private static bool IsAsciiHexDigit(char value) =>
-+        value is >= '0' and <= '9' or >= 'A' and <= 'F' or >= 'a' and <= 'f';
++        (value >= '0' && value <= '9') ||
++        (value >= 'A' && value <= 'F') ||
++        (value >= 'a' && value <= 'f');
  }
 diff --git a/src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs b/src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs
 --- a/src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs
 +++ b/src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs
-@@ -137,6 +137,12 @@ internal sealed class VpnConnectivityVerifier
+@@ -14,12 +14,20 @@ internal sealed class VpnConnectivityVerifier
+ 
+     private readonly VerificationOptions _options;
+     private readonly L2tpDnsResolver _dnsResolver;
++    private readonly string _probeHost;
+ 
+     public VpnConnectivityVerifier(VerificationOptions options)
+     {
++        ArgumentNullException.ThrowIfNull(options);
++        if (!VerificationOptions.TryGetCanonicalProbeHost(options.ProbeHost, out _probeHost))
++        {
++            throw new ArgumentException(
++                "Verification probe host is not a valid IDNA-canonicalizable DNS host name.",
++                nameof(options));
++        }
++
+         _options = options;
+         _dnsResolver = new L2tpDnsResolver();
+     }
+@@ -34,7 +42,7 @@ internal sealed class VpnConnectivityVerifier
+         {
+             var targetAddresses = await _dnsResolver.ResolveIPv4Async(
+-                _options.ProbeHost,
++                _probeHost,
+                 context,
+                 timeout.Token);
+@@ -53,7 +61,7 @@ internal sealed class VpnConnectivityVerifier
+ 
+             throw new IOException(
+-                $"L2TP verification probe could not connect to {_options.ProbeHost}:{_options.ProbePort}.",
++                $"L2TP verification probe could not connect to {_probeHost}:{_options.ProbePort}.",
+                 lastError);
+@@ -92,11 +100,11 @@ internal sealed class VpnConnectivityVerifier
+         await sslStream.AuthenticateAsClientAsync(
+             new SslClientAuthenticationOptions
+             {
+-                TargetHost = _options.ProbeHost
++                TargetHost = _probeHost
+             },
+             cancellationToken);
+ 
+-        var request = BuildProbeRequest(_options.ProbeHost, _options.ProbePath);
++        var request = BuildProbeRequest(_probeHost, _options.ProbePath);
+@@ -137,6 +145,20 @@ internal sealed class VpnConnectivityVerifier
          host ??= string.Empty;
          path ??= string.Empty;
++
++        if (!VerificationOptions.TryGetCanonicalProbeHost(host, out var canonicalHost))
++        {
++            throw new ArgumentException(
++                "Verification probe host must be a valid IDNA-canonicalizable DNS host name.",
++                nameof(host));
++        }
 +
 +        if (!VerificationOptions.IsValidProbePath(path))
 +        {
@@ -74,22 +194,37 @@ diff --git a/src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs b/src/ProxyToA
 +        }
  
          ReadOnlySpan<byte> requestPrefix = "GET "u8;
+@@ -147,7 +169,7 @@ internal sealed class VpnConnectivityVerifier
+ 
+         var pathByteCount = Encoding.ASCII.GetByteCount(path);
+-        var hostByteCount = Encoding.ASCII.GetByteCount(host);
++        var hostByteCount = Encoding.ASCII.GetByteCount(canonicalHost);
+@@ -169,7 +191,7 @@ internal sealed class VpnConnectivityVerifier
+         hostPrefix.CopyTo(destination[offset..]);
+         offset += hostPrefix.Length;
+-        offset += Encoding.ASCII.GetBytes(host.AsSpan(), destination[offset..]);
++        offset += Encoding.ASCII.GetBytes(canonicalHost.AsSpan(), destination[offset..]);
+         fixedSuffix.CopyTo(destination[offset..]);
+ 
+         return request;
 diff --git a/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs b/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs
 --- a/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs
 +++ b/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs
-@@ -10,11 +10,12 @@ internal static class SettingsValidationSelfTests
+@@ -10,11 +10,13 @@ internal static class SettingsValidationSelfTests
          try
          {
              VerificationResponseLimitIsBounded();
 +            VerificationProbePathIsWireExactOriginForm();
++            VerificationProbeHostUsesCanonicalIdnAuthority();
              InvalidNumericValuesAreRepairable();
              UnusedProtectedSecretsAreDropped();
  
              Console.WriteLine(
 -                "PASS: settings enforce bounded verification responses, repair numeric values and drop unused secrets");
-+                "PASS: settings enforce bounded verification responses, byte-exact probe targets, repair numeric values and drop unused secrets");
++                "PASS: settings enforce bounded verification responses, byte-exact probe targets, canonical IDN hosts, repair numeric values and drop unused secrets");
              return 0;
-@@ -44,6 +45,50 @@ internal static class SettingsValidationSelfTests
+@@ -45,6 +47,94 @@ internal static class SettingsValidationSelfTests
+         throw new InvalidOperationException(
              $"verification.maxResponseBytes={maxResponseBytes} escaped the bounded configuration contract.");
      }
 +
@@ -103,7 +238,7 @@ diff --git a/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs b/
 +                     "/caf%C3%A9?next=%2Fok&flag=true"
 +                 })
 +        {
-+            CreateOptions(VerificationOptions.DefaultResponseLimitBytes, valid).Validate();
++            CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probePath: valid).Validate();
 +        }
 +
 +        foreach (var invalid in new[]
@@ -123,7 +258,7 @@ diff --git a/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs b/
 +        {
 +            try
 +            {
-+                CreateOptions(VerificationOptions.DefaultResponseLimitBytes, invalid).Validate();
++                CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probePath: invalid).Validate();
 +            }
 +            catch (InvalidOperationException ex) when (
 +                ex.Message.Contains("verification.probePath", StringComparison.Ordinal))
@@ -136,17 +271,61 @@ diff --git a/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs b/
 +        }
 +    }
 +
++    private static void VerificationProbeHostUsesCanonicalIdnAuthority()
++    {
++        CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: "api.ipify.org").Validate();
++        CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: "münich.example").Validate();
++
++        if (!VerificationOptions.TryGetCanonicalProbeHost("münich.example", out var canonical) ||
++            !canonical.Equals("xn--mnich-kva.example", StringComparison.Ordinal))
++        {
++            throw new InvalidOperationException(
++                $"Unicode verification host did not canonicalize to the expected IDNA A-label: '{canonical}'.");
++        }
++
++        foreach (var invalid in new[]
++                 {
++                     string.Empty,
++                     "bad host.example",
++                     "line\r\nhost.example",
++                     "bad_.example",
++                     "[2001:db8::1]"
++                 })
++        {
++            try
++            {
++                CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: invalid).Validate();
++            }
++            catch (InvalidOperationException ex) when (
++                ex.Message.Contains("verification.probeHost", StringComparison.Ordinal))
++            {
++                continue;
++            }
++
++            throw new InvalidOperationException(
++                $"verification.probeHost '{EscapeForDiagnostic(invalid)}' escaped canonical DNS-host validation.");
++        }
++    }
++
 +    private static string EscapeForDiagnostic(string value) =>
 +        value.Replace("\r", "\\r", StringComparison.Ordinal)
 +            .Replace("\n", "\\n", StringComparison.Ordinal)
 +            .Replace("\t", "\\t", StringComparison.Ordinal);
-@@ -99,7 +144,7 @@ internal static class SettingsValidationSelfTests
+ 
+     private static void InvalidNumericValuesAreRepairable()
+@@ -99,7 +189,10 @@ internal static class SettingsValidationSelfTests
 -    private static AppOptions CreateOptions(int maxResponseBytes) =>
-+    private static AppOptions CreateOptions(int maxResponseBytes, string probePath = "/") =>
++    private static AppOptions CreateOptions(
++        int maxResponseBytes,
++        string probePath = "/",
++        string probeHost = "api.ipify.org") =>
          new()
-@@ -135,7 +180,7 @@ internal static class SettingsValidationSelfTests
+@@ -133,9 +226,9 @@ internal static class SettingsValidationSelfTests
+                     Verification = new VerificationOptions
+                     {
                          PublicAddress = "vpn.example.com",
-                         ProbeHost = "api.ipify.org",
+-                        ProbeHost = "api.ipify.org",
++                        ProbeHost = probeHost,
                          ProbePort = 443,
 -                        ProbePath = "/",
 +                        ProbePath = probePath,
@@ -154,14 +333,16 @@ diff --git a/tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs b/
 diff --git a/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs b/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs
 --- a/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs
 +++ b/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs
-@@ -16,6 +16,7 @@ internal static class VerificationProbeRequestSelfTests
+@@ -16,6 +16,9 @@ internal static class VerificationProbeRequestSelfTests
          try
          {
              RequestWireBytesRemainEquivalent();
++            IdnHostIsCanonicalizedOnWire();
 +            InvalidRequestTargetsAreRejectedByBuilder();
++            InvalidHostsAreRejectedByBuilder();
  
              for (var i = 0; i < WarmupIterations; i++)
-@@ -71,9 +72,8 @@ internal static class VerificationProbeRequestSelfTests
+@@ -71,9 +74,8 @@ internal static class VerificationProbeRequestSelfTests
          [
              (RepresentativeHost, RepresentativePath),
              ("example.com", "/"),
@@ -171,9 +352,21 @@ diff --git a/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests
 +            ("example.com", "/ip/check?x=1%202"),
 +            ("example.com", "/caf%C3%A9?next=%2Fok&flag=true")
          ];
-@@ -89,6 +89,41 @@ internal static class VerificationProbeRequestSelfTests
+@@ -89,9 +91,78 @@ internal static class VerificationProbeRequestSelfTests
          }
      }
++
++    private static void IdnHostIsCanonicalizedOnWire()
++    {
++        var request = Encoding.ASCII.GetString(
++            VpnConnectivityVerifier.BuildProbeRequest("münich.example", "/?format=text"));
++        if (!request.Contains("\r\nHost: xn--mnich-kva.example\r\n", StringComparison.Ordinal) ||
++            request.Contains('?', StringComparison.Ordinal) && request.Contains("m?nich", StringComparison.Ordinal))
++        {
++            throw new InvalidOperationException(
++                $"Verification request did not emit the canonical IDNA Host authority: {request}");
++        }
++    }
 +
 +    private static void InvalidRequestTargetsAreRejectedByBuilder()
 +    {
@@ -204,6 +397,31 @@ diff --git a/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests
 +        }
 +    }
 +
++    private static void InvalidHostsAreRejectedByBuilder()
++    {
++        foreach (var invalid in new string?[]
++                 {
++                     null,
++                     string.Empty,
++                     "bad host.example",
++                     "line\r\nhost.example",
++                     "bad_.example"
++                 })
++        {
++            try
++            {
++                _ = VpnConnectivityVerifier.BuildProbeRequest(invalid, "/");
++            }
++            catch (ArgumentException ex) when (ex.ParamName == "host")
++            {
++                continue;
++            }
++
++            throw new InvalidOperationException(
++                $"Verification request builder accepted invalid host '{EscapeForDiagnostic(invalid)}'.");
++        }
++    }
++
 +    private static string EscapeForDiagnostic(string? value) =>
 +        value is null
 +            ? "<null>"
@@ -212,3 +430,20 @@ diff --git a/tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests
 +                .Replace("\t", "\\t", StringComparison.Ordinal);
  
      private static byte[] LegacyBuildProbeRequest(string? host, string? path)
+     {
++        host ??= string.Empty;
++        path ??= string.Empty;
++        if (!VerificationOptions.TryGetCanonicalProbeHost(host, out var canonicalHost))
++        {
++            throw new ArgumentException("Invalid verification host.", nameof(host));
++        }
++        if (!VerificationOptions.IsValidProbePath(path))
++        {
++            throw new ArgumentException("Invalid verification target.", nameof(path));
++        }
++
+         return Encoding.ASCII.GetBytes(
+             $"GET {path} HTTP/1.1\r\n" +
+-            $"Host: {host}\r\n" +
++            $"Host: {canonicalHost}\r\n" +
+             "User-Agent: ProxyToAnyConnect/1.0\r\n" +
