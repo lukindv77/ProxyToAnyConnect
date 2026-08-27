@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 expected = {
     'src/ProxyToAnyConnect/Proxy/ProxyServer.cs': '8f8692442e84f779d04c282770acf6c622c0504e',
@@ -8,58 +9,73 @@ expected = {
     'tests/ProxyToAnyConnect.SelfTests/ProxyConnectPortGrammarSelfTests.cs': 'ccca4399cbc3734c20bf997435ee361c5c399be6',
 }
 
-import subprocess
 for path, sha in expected.items():
     actual = subprocess.check_output(['git', 'rev-parse', f'HEAD:{path}'], text=True).strip()
     if actual != sha:
         raise SystemExit(f'unexpected input blob for {path}: {actual}')
 
+def replace_block(data: bytes, old_lf: bytes, new_lf: bytes, label: str) -> bytes:
+    matches = []
+    for newline in (b'\r\n', b'\n'):
+        old = old_lf.replace(b'\n', newline)
+        count = data.count(old)
+        if count:
+            matches.append((newline, old, count))
+    if len(matches) != 1 or matches[0][2] != 1:
+        detail = ', '.join(f'{nl!r}:{count}' for nl, _, count in matches) or 'none'
+        raise SystemExit(f'expected one {label}, matches={detail}')
+    newline, old, _ = matches[0]
+    new = new_lf.replace(b'\n', newline)
+    return data.replace(old, new)
+
 proxy = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
 data = proxy.read_bytes()
 
-old = b'''        var separator = authority.IndexOf(':');
+data = replace_block(
+    data,
+    b'''        var separator = authority.IndexOf(':');
         if (separator >= 0 && authority.IndexOf(':', separator + 1) >= 0)
         {
             throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
         }
-'''
-new = b'''        var separator = authority.IndexOf(':');
+''',
+    b'''        var separator = authority.IndexOf(':');
         if (separator >= 0 && authority.IndexOf(':', separator + 1) >= 0)
         {
             throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
         }
-'''
-if data.count(old) != 1:
-    raise SystemExit(f'expected one unbracketed multi-colon block, got {data.count(old)}')
-data = data.replace(old, new)
+''',
+    'unbracketed multi-colon block')
 
-old = b'''        var host = separator < 0 ? authority : authority[..separator];
+data = replace_block(
+    data,
+    b'''        var host = separator < 0 ? authority : authority[..separator];
         var port = defaultPort;
         if (separator >= 0 &&
             (!int.TryParse(authority[(separator + 1)..], out port) || port is < 1 or > 65535))
         {
             throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
         }
-'''
-new = b'''        var host = separator < 0 ? authority : authority[..separator];
+''',
+    b'''        var host = separator < 0 ? authority : authority[..separator];
         var port = defaultPort;
         if (separator >= 0 && !TryParseConnectPort(authority.AsSpan(separator + 1), out port))
         {
             throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
         }
-'''
-if data.count(old) != 1:
-    raise SystemExit(f'expected one CONNECT port parse block, got {data.count(old)}')
-data = data.replace(old, new)
+''',
+    'CONNECT port parse block')
 
-marker = b'''        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+data = replace_block(
+    data,
+    b'''        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
         {
             throw new InvalidDataException($"Invalid CONNECT target '{authority}'.", ex);
         }
     }
 
-    private static Uri ParseAbsoluteHttpUri'''
-replacement = b'''        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+    private static Uri ParseAbsoluteHttpUri''',
+    b'''        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
         {
             throw new InvalidDataException($"Invalid CONNECT target '{authority}'.", ex);
         }
@@ -97,15 +113,17 @@ replacement = b'''        catch (Exception ex) when (ex is ArgumentException or 
         return true;
     }
 
-    private static Uri ParseAbsoluteHttpUri'''
-if data.count(marker) != 1:
-    raise SystemExit(f'expected one CONNECT port helper marker, got {data.count(marker)}')
-proxy.write_bytes(data.replace(marker, replacement))
+    private static Uri ParseAbsoluteHttpUri''',
+    'CONNECT port helper marker')
+proxy.write_bytes(data)
 
 runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
 data = runner.read_bytes()
-anchor = b'        await RunAsync(nameof(ProxyConnectAuthoritySelfTests), ProxyConnectAuthoritySelfTests.RunAsync);\n'
-expanded = anchor + b'        await RunAsync(nameof(ProxyConnectPortGrammarSelfTests), ProxyConnectPortGrammarSelfTests.RunAsync);\n'
-if data.count(anchor) != 1:
-    raise SystemExit(f'expected one CONNECT authority runner anchor, got {data.count(anchor)}')
-runner.write_bytes(data.replace(anchor, expanded))
+data = replace_block(
+    data,
+    b'        await RunAsync(nameof(ProxyConnectAuthoritySelfTests), ProxyConnectAuthoritySelfTests.RunAsync);\n',
+    b'''        await RunAsync(nameof(ProxyConnectAuthoritySelfTests), ProxyConnectAuthoritySelfTests.RunAsync);
+        await RunAsync(nameof(ProxyConnectPortGrammarSelfTests), ProxyConnectPortGrammarSelfTests.RunAsync);
+''',
+    'CONNECT authority runner anchor')
+runner.write_bytes(data)
