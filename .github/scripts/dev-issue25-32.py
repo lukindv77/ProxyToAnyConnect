@@ -14,6 +14,7 @@ for path, sha in expected.items():
     if actual != sha:
         raise SystemExit(f'unexpected input blob for {path}: {actual}')
 
+
 def replace_block(data: bytes, old_lf: bytes, new_lf: bytes, label: str) -> bytes:
     matches = []
     for newline in (b'\r\n', b'\n'):
@@ -28,8 +29,28 @@ def replace_block(data: bytes, old_lf: bytes, new_lf: bytes, label: str) -> byte
     new = new_lf.replace(b'\n', newline)
     return data.replace(old, new)
 
+
 proxy = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
 data = proxy.read_bytes()
+
+# Remove escape-sensitive backslash char-literal generation from the inherited #25 source.
+# Match the unique semantic line by its stable prefix and rewrite it as an explicit numeric code point.
+lines = data.splitlines(keepends=True)
+matches = [
+    i for i, line in enumerate(lines)
+    if b"character is '@' or '/' or '?' or '#'" in line
+]
+if len(matches) != 1:
+    raise SystemExit(f'expected one forbidden-host-character line, got {len(matches)}')
+i = matches[0]
+line = lines[i]
+newline = b'\r\n' if line.endswith(b'\r\n') else b'\n'
+indent = b'                '
+lines[i] = (
+    indent + b'character == (char)0x5C ||' + newline +
+    indent + b"character is '@' or '/' or '?' or '#' or ':'" + newline
+)
+data = b''.join(lines)
 
 data = replace_block(
     data,
@@ -92,12 +113,12 @@ data = replace_block(
         var parsed = 0;
         foreach (var character in value)
         {
-            if (character is < '0' or > '9')
+            if (character < 0x30 || character > 0x39)
             {
                 return false;
             }
 
-            parsed = parsed * 10 + (character - '0');
+            parsed = parsed * 10 + (character - 0x30);
             if (parsed > 65535)
             {
                 return false;
