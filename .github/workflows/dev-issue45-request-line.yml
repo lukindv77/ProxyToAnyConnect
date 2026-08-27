@@ -1,0 +1,70 @@
+name: dev-issue45-request-line
+
+on:
+  push:
+    branches:
+      - dev/issue45-request-line
+    paths:
+      - .github/workflows/dev-issue45-request-line.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 45 patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = 'afb2df136dc757ab2f03ec613572d49f03175402'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          $expectedPatchSha = '74c5e570aeabb3d43bfdf94e52e7d13232d5cad33a83513833cb3fd8160ceb3e'
+          $actualPatchSha = (Get-FileHash '.github/validation/issue45.patch' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualPatchSha -ne $expectedPatchSha) { throw "Unexpected #45 patch SHA-256: $actualPatchSha" }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Proxy/ProxyServer.cs' = '7033087e57a28d93bdfde3a495a795b8f4b314b1'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyConnectSetupSelfTests.cs' = '6891387e7a17223e5ab6afa206e12c6c126fe6e0'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyHttpRequestLineSelfTests.cs' = '33002187a8587b6eac3b4749767d958752bd41f0'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyParserAllocationSelfTests.cs' = '5ad006b08460233e1dd1a4f6573f658ddb0a8b9a'
+            'tests/ProxyToAnyConnect.SelfTests/ProxySetupTimingSelfTests.cs' = 'db140c2ffe3ee702bb0df571ffae4c03895ef786'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) { throw "Unexpected base blob for $($entry.Key): $actual" }
+          }
+
+          git apply --check .github/validation/issue45.patch
+          git apply .github/validation/issue45.patch
+          $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
+          git add -- $expectedPaths
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #45 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 45 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'proxy: enforce canonical HTTP request-line separators'
+          git push origin HEAD:dev/issue45-request-line
