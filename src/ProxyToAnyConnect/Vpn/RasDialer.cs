@@ -147,16 +147,32 @@ internal sealed class RasDialer
     internal const int RasCsDisconnected = 0x2001;
 
     private static readonly TimeSpan HangUpPollInterval = TimeSpan.FromMilliseconds(10);
+    private static readonly TimeSpan DefaultHangUpDrainTimeout = TimeSpan.FromSeconds(10);
     private readonly IRasDialNative _native;
+    private readonly TimeSpan _hangUpDrainTimeout;
 
     public RasDialer()
-        : this(new WindowsRasDialNative())
+        : this(new WindowsRasDialNative(), DefaultHangUpDrainTimeout)
     {
     }
 
     internal RasDialer(IRasDialNative native)
+        : this(native, DefaultHangUpDrainTimeout)
+    {
+    }
+
+    internal RasDialer(IRasDialNative native, TimeSpan hangUpDrainTimeout)
     {
         _native = native ?? throw new ArgumentNullException(nameof(native));
+        if (hangUpDrainTimeout <= TimeSpan.Zero ||
+            hangUpDrainTimeout.TotalMilliseconds > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(hangUpDrainTimeout),
+                "RAS hangup drain timeout must be positive and representable in milliseconds.");
+        }
+
+        _hangUpDrainTimeout = hangUpDrainTimeout;
     }
 
     public async Task<nint> DialAsync(
@@ -270,12 +286,14 @@ internal sealed class RasDialer
         {
             await HangUpAndDrainAsync(handle).ConfigureAwait(false);
         }
-        catch (InvalidOperationException teardownFailure)
+        catch (Exception teardownFailure) when (
+            teardownFailure is InvalidOperationException or TimeoutException)
         {
             // Teardown is secondary to the control-flow/failure that led here. In
             // particular, caller cancellation must remain OperationCanceledException
             // so higher ownership layers can distinguish Exit/Pause from a RAS fault.
-            // Preserve cleanup detail without replacing the primary exception.
+            // Preserve cleanup detail without replacing the primary exception. A
+            // timeout deliberately retains native callback ownership for a later retry.
             primaryFailure.Data["RasTeardownError"] = teardownFailure.Message;
             System.Diagnostics.Debug.WriteLine(
                 $"RAS teardown did not complete while preserving primary failure: {teardownFailure.Message}");
@@ -305,6 +323,8 @@ internal sealed class RasDialer
             return;
         }
 
+        var timeoutMilliseconds = checked((long)Math.Ceiling(_hangUpDrainTimeout.TotalMilliseconds));
+        var deadline = Environment.TickCount64 + timeoutMilliseconds;
         while (true)
         {
             var result = _native.GetConnectStatus(handle);
@@ -324,7 +344,22 @@ internal sealed class RasDialer
                     RasNative.DescribeError(result));
             }
 
-            await Task.Delay(HangUpPollInterval).ConfigureAwait(false);
+            var remainingMilliseconds = deadline - Environment.TickCount64;
+            if (remainingMilliseconds <= 0)
+            {
+                // Do not release the callback root and do not claim terminal teardown.
+                // Higher ownership layers retain this exact HRASCONN and may retry
+                // later; bounding one attempt prevents Pause/Reconfigure/Exit from
+                // hanging forever on a stuck RAS state machine.
+                throw new TimeoutException(
+                    $"Timed out after {_hangUpDrainTimeout.TotalMilliseconds:F0} ms waiting for RAS connection state to reach ERROR_INVALID_HANDLE.");
+            }
+
+            await Task.Delay(
+                    TimeSpan.FromMilliseconds(Math.Min(
+                        HangUpPollInterval.TotalMilliseconds,
+                        remainingMilliseconds)))
+                .ConfigureAwait(false);
         }
     }
 
