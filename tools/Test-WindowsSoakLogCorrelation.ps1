@@ -22,7 +22,9 @@ param(
     [int]$MinimumMemoryRecords = 1,
 
     [ValidateRange(0, 3600)]
-    [int]$ClockSkewSeconds = 5
+    [int]$ClockSkewSeconds = 5,
+
+    [string]$CorrelationSummaryPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -38,12 +40,74 @@ function Read-RequiredJson {
     return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
 }
 
+function Resolve-DerivedSummaryPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RequestedPath,
+        [Parameter(Mandatory = $true)][string]$SealedBundlePath,
+        [Parameter(Mandatory = $true)][string[]]$InputLogPaths)
+
+    if ([string]::IsNullOrWhiteSpace($RequestedPath)) {
+        return $null
+    }
+
+    $resolved = [IO.Path]::GetFullPath($RequestedPath)
+    $bundleRoot = [IO.Path]::GetFullPath($SealedBundlePath).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $bundlePrefix = $bundleRoot + [IO.Path]::DirectorySeparatorChar
+
+    if ($resolved.Equals($bundleRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        $resolved.StartsWith($bundlePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'CorrelationSummaryPath must be outside the sealed soak evidence directory.'
+    }
+
+    foreach ($inputLogPath in $InputLogPaths) {
+        if ($resolved.Equals([IO.Path]::GetFullPath($inputLogPath), [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'CorrelationSummaryPath must not overwrite an application JSONL input log.'
+        }
+    }
+
+    return $resolved
+}
+
+function Write-AtomicUtf8Json {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Json)
+
+    $directory = [IO.Path]::GetDirectoryName($Path)
+    if ([string]::IsNullOrWhiteSpace($directory)) {
+        throw "Unable to determine derived correlation-summary directory for: $Path"
+    }
+
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
+    $temporaryPath = Join-Path $directory (
+        ".{0}.{1}.{2}.tmp" -f [IO.Path]::GetFileName($Path), $PID, [Guid]::NewGuid().ToString('N'))
+
+    try {
+        $encoding = [Text.UTF8Encoding]::new($false)
+        [IO.File]::WriteAllText($temporaryPath, $Json + [Environment]::NewLine, $encoding)
+        [IO.File]::Move($temporaryPath, $Path, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 $expectedHash = $ExpectedExecutableSha256.Trim().ToLowerInvariant()
 if ($expectedHash -notmatch '^[0-9a-f]{64}$') {
     throw 'ExpectedExecutableSha256 must be exactly 64 hexadecimal characters.'
 }
 
 $outputPath = [IO.Path]::GetFullPath($OutputDirectory)
+$resolvedLogPaths = @($ApplicationLogPath | ForEach-Object { [IO.Path]::GetFullPath($_) })
+$derivedSummaryPath = Resolve-DerivedSummaryPath `
+    -RequestedPath $CorrelationSummaryPath `
+    -SealedBundlePath $outputPath `
+    -InputLogPaths $resolvedLogPaths
+
 $bundleValidatorPath = Join-Path $PSScriptRoot 'Test-WindowsSoakEvidence.ps1'
 if (-not (Test-Path -LiteralPath $bundleValidatorPath -PathType Leaf)) {
     throw "Soak evidence validator is missing: $bundleValidatorPath"
@@ -97,8 +161,7 @@ $maxGen2Collections = 0
 
 # Scan JSONL one line at a time and retain only scalar aggregates. Multi-day log files
 # can be large; validation itself must not create an unbounded in-memory history.
-foreach ($logPathInput in $ApplicationLogPath) {
-    $logPath = [IO.Path]::GetFullPath($logPathInput)
+foreach ($logPath in $resolvedLogPaths) {
     if (-not (Test-Path -LiteralPath $logPath -PathType Leaf)) {
         throw "Application JSONL log is missing: $logPath"
     }
@@ -232,4 +295,9 @@ $result = [ordered]@{
     assessment = 'Sealed external soak evidence and application managed-memory records are correlated to one exact executable/process lifetime. Leak acceptance remains workload-aware and is not inferred from one delta.'
 }
 
-ConvertTo-Json -InputObject $result -Depth 4
+$resultJson = ConvertTo-Json -InputObject $result -Depth 4
+if ($null -ne $derivedSummaryPath) {
+    Write-AtomicUtf8Json -Path $derivedSummaryPath -Json $resultJson
+}
+
+$resultJson
