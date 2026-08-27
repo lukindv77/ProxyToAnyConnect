@@ -101,11 +101,6 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
                     result.Context,
                     cancellationToken);
 
-                if (!result.Context.IsAlive)
-                {
-                    throw new IOException("L2TP disappeared before verification completed.");
-                }
-
                 AppLog.Info(
                     "vpn.verification.succeeded",
                     "L2TP-bound connectivity verification completed successfully.",
@@ -120,6 +115,13 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
                         LocalIPv4 = result.Context.LocalIPv4.ToString(),
                         result.Context.InterfaceIndex
                     });
+
+                // This is the foreground connection's Ready-publication linearization
+                // point. If caller/owner cancellation has already won, the existing
+                // OperationCanceledException path tears down the exact result handle
+                // and no Current/Ready state is exposed. There are no awaits or
+                // external calls between this guard and ownership publication.
+                EnsureReadyPublicationAllowed(result.Context, cancellationToken);
 
                 _rasConnection = result.Handle;
                 _lastVerification = verification;
@@ -182,6 +184,21 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
         finally
         {
             _gate.Release();
+        }
+    }
+
+    internal static void EnsureReadyPublicationAllowed(
+        VpnContext context,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        // Preserve caller cancellation as control flow even if the context also
+        // disappeared at the same boundary.
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!context.IsAlive)
+        {
+            throw new IOException("L2TP disappeared before verification completed.");
         }
     }
 
