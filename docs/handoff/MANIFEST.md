@@ -1,64 +1,69 @@
 # ProxyToAnyConnect handoff manifest
 
-Live GitHub is authoritative. This manifest defines the minimum reading and archive behavior for continuing in a new chat.
+Live GitHub `main` is authoritative. This manifest defines the minimum reading and archive behavior for continuing development in a new chat without losing architecture, audit conclusions or current engineering goals.
 
 ## Required reading
 
 1. `docs/handoff/NEW_CHAT_PROMPT.md`
 2. `docs/handoff/CURRENT_STATE.md`
-3. `docs/handoff/FINAL_CI_STATUS.md`
-4. `docs/handoff/AUDIT_SNAPSHOT.md`
-5. `docs/handoff/ISSUES_SNAPSHOT.md`
-6. `docs/handoff/HANDOFF_INDEX.md`
-7. `docs/requirements.md`
-8. `docs/architecture.md`
-9. `docs/memory-stability.md`
-10. `docs/windows-integration-test.md`
-11. `README.md`
-12. `.github/workflows/build.yml`
-13. `.github/workflows/handoff.yml`
+3. `docs/handoff/AUDIT_SNAPSHOT.md`
+4. `docs/handoff/ACTIVE_DEVELOPMENT.md`
+5. `docs/handoff/FINAL_CI_STATUS.md`
+6. `docs/handoff/ISSUES_SNAPSHOT.md`
+7. `docs/handoff/HANDOFF_INDEX.md`
+8. `docs/requirements.md`
+9. `docs/architecture.md`
+10. `docs/memory-stability.md`
+11. `docs/windows-integration-test.md`
+12. `docs/windows-integration-evidence.md`
+13. `docs/windows-soak-evidence.md`
+14. `README.md`
+15. `.github/workflows/build.yml`
+16. `.github/workflows/handoff.yml`
 
-Before architecture changes inspect current `Configuration`, `Gui`, `Runtime`, `Proxy`, `Network`, `Vpn`, `Diagnostics` and `tests/ProxyToAnyConnect.SelfTests`.
+Before architecture changes inspect current `Configuration`, `Gui`, `Runtime`, `Proxy`, `Network`, `Vpn`, `Diagnostics`, `tools` and `tests/ProxyToAnyConnect.SelfTests`.
 
 ## Live facts the next chat must query
 
 - exact current `main` SHA;
-- exact-head build/handoff conclusions;
-- latest issue states/comments;
-- commits after this package;
-- latest artifacts.
+- exact-head `build` and `handoff` conclusions;
+- latest open issue states/comments (#2/#4/#5/#6/#7/#11/#13);
+- commits after the archive SHA;
+- latest build and handoff artifacts.
 
-Never infer green CI from older heads.
+Never infer green CI from an older head.
 
-## Handoff archive
+## Handoff archive contract
 
-`.github/workflows/handoff.yml` creates GitHub Actions artifact `ProxyToAnyConnect-handoff-<github.sha>` from the exact checked-out commit. It contains `src`, `tests`, `docs`, `.github`, README, solution, `.gitignore` and generated `HANDOFF_BUILD_INFO.txt` with repository, exact commit, ref, workflow run, UTC timestamp and startup prompt path. `bin`, `obj`, `.git` are excluded.
+`.github/workflows/handoff.yml` creates GitHub Actions artifact `ProxyToAnyConnect-handoff-<github.sha>` from the exact checked-out commit. It contains:
 
-Observed archive examples during preparation:
+- `src`, `tests`, `tools`, `docs`, `.github`;
+- README, solution and `.gitignore`;
+- `HANDOFF_BUILD_INFO.txt` with repository, exact SHA/ref/run/UTC timestamp and startup prompt path;
+- `RECENT_COMMITS.tsv` containing the latest 120 commits from that checkout;
+- `START_HERE.txt` pointing at the authoritative handoff documents.
 
-- handoff #84 / `b3fbe1f...`: success, artifact id 9611924335, SHA-256 `5b9307c6a184f3a6bf4ddc47b60af6569ea4a3611940f7cb7d9b527eaa72aa6b`;
-- handoff #85 / `b304a433...`: success, artifact id 9612150421, SHA-256 `a25e61eb00c969fa96a0f56b92c4d6b9f621b0fb5386f6a6f1f18ea7855a042a`.
+`bin`, `obj` and `.git` are excluded. Artifact retention is 90 days.
 
-This final handoff-doc commit will create a newer artifact. New chat must use the latest artifact corresponding to live `main`, not the historical ids above.
+## Baseline immediately before final handoff-document packaging
 
-## Current code/CI interpretation
+Substantive commit `4b100f3bb6c744b08918ce122ab75982fa263740` passed Windows build #534 and handoff #340. Build artifact `9637762202` digest: `sha256:be01041fefa07c4fe4dd39f4a02e5c038b9e729b97049a7da4880d685aedf239`.
 
-Production HTTP framing hardening is in `f9db53f074d6740296e46452077622099b6f64ff`.
+The final handoff-document commits move the live SHA forward. Their archive embeds the exact final SHA in `HANDOFF_BUILD_INFO.txt`; the new chat must verify the live head instead of assuming the baseline SHA above is current.
 
-Hosted Windows results on docs-only heads with unchanged production/parser code are intentionally both preserved:
+## Current engineering interpretation
 
-- build #272: paired setup timing PASS (parser 0.98x, origin 0.80x), then framing exact-CL test failed with SocketException 10054 while reading proxy response;
-- build #273: paired setup timing FAIL (parser 1.79x vs 1.25x limit), suite stopped before framing test.
-
-Therefore the next chat must first make `ProxySetupTimingSelfTests` reproducible and semantically fair without simply widening the 1.25x policy, then resolve the already-observed framing reset while preserving the invariant that no bytes after declared Content-Length reach origin.
-
-Issue #14 remains open. Issue #15 transactional proxy startup ownership remains the next confirmed lifecycle block after #14 validation.
+- #14 HTTP framing/request-smuggling and #15 transactional proxy startup are completed and closed.
+- Core proxy/L2TP/GUI/runtime architecture is implemented and deeply self-tested.
+- Major remaining release boundary is real Windows 11 + real L2TP endpoint acceptance (#2/#4/#5/#6/#7), not missing proxy architecture.
+- #13 additionally requires a representative 12–24 h exact-binary soak with external/native resource samples correlated to application `process.memory.*` records.
+- #11 remains a permanent performance/memory requirement; memory hardening may not weaken fail-closed behavior or measurably harm latency/throughput.
+- Latest evidence work adds per-proxy expected public IPv4 and independent direct-host expected IPv4. The next chat must verify end-to-end enforcement across Invoke/Test/Complete scripts and hosted smoke.
 
 ## Immediate continuation
 
-1. Fetch live state.
-2. Stabilize/harden the paired timing benchmark methodology and predecessor equivalence.
-3. Reproduce/fix framing reset 10054 without weakening smuggling boundary.
-4. Get exact-head Windows CI through framing suite and finish #14 only after acceptance.
-5. Implement #15 cancel -> exact run drain -> same-generation clear -> CTS dispose -> lease release once.
-6. Continue #11/#13 and real Windows #2/#4/#5/#6/#7 acceptance.
+1. Fetch live head/actions/issues and read this package.
+2. Verify/complete per-proxy + direct expected-egress evidence validation across the whole evidence toolchain.
+3. Keep exact-head Windows CI green after every substantial block.
+4. Continue deterministic ownership/stress/performance work without duplicating already accepted #14/#15/RAS bounded-drain work.
+5. Execute real #2/#4/#5/#6/#7 acceptance and #13 12–24 h soak when the endpoint/environment is available.
