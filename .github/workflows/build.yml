@@ -20,7 +20,9 @@ jobs:
           $toolPaths = @(
             './tools/Invoke-WindowsIntegrationEvidence.ps1',
             './tools/Test-WindowsIntegrationEvidence.ps1',
-            './tools/Complete-WindowsIntegrationEvidence.ps1'
+            './tools/Complete-WindowsIntegrationEvidence.ps1',
+            './tools/Invoke-WindowsSoakEvidence.ps1',
+            './tools/Test-WindowsSoakEvidence.ps1'
           )
           foreach ($toolPath in $toolPaths) {
             $tokens = $null
@@ -111,6 +113,28 @@ jobs:
               $identityAcceptance.stages.Final.processCount -ne 0) {
             throw 'Evidence lifecycle did not enforce exact Ready binary/process identity.'
           }
+
+      - name: Smoke-test Windows soak evidence lifecycle
+        shell: pwsh
+        run: |
+          $process = Get-Process -Id $PID
+          $process.Refresh()
+          $hash = (Get-FileHash -LiteralPath $process.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+          $output = './artifacts/windows-soak-evidence-smoke'
+
+          ./tools/Invoke-WindowsSoakEvidence.ps1 `
+            -ProcessId $PID `
+            -ExpectedProcessName $process.ProcessName `
+            -ExpectedExecutableSha256 $hash `
+            -DurationSeconds 2 `
+            -SampleIntervalSeconds 1 `
+            -OutputDirectory $output | Write-Host
+
+          ./tools/Test-WindowsSoakEvidence.ps1 `
+            -OutputDirectory $output `
+            -ExpectedExecutableSha256 $hash `
+            -MinimumSamples 2 `
+            -MinimumObservedDurationSeconds 1 | Write-Host
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
