@@ -240,6 +240,30 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
                     continue;
                 }
 
+                var cooldownRemaining = _connectionManager.ReconnectCooldownRemainingMilliseconds;
+                if (cooldownRemaining > 0)
+                {
+                    // RasConnectionManager already recorded the cooldown when the
+                    // fail-closed event occurred. Wait for that known eligibility
+                    // boundary instead of manufacturing rejected ConnectAsync calls,
+                    // exceptions and repeated JSONL/status records every maintenance
+                    // tick. Last-lease release cancels this delay immediately.
+                    await Task.Delay(
+                        TimeSpan.FromMilliseconds(cooldownRemaining),
+                        cancellationToken);
+
+                    if (ActiveProxyCount == 0)
+                    {
+                        return;
+                    }
+
+                    if (_connectionManager.Current is { IsAlive: true } &&
+                        _connectionManager.State == VpnConnectionState.Ready)
+                    {
+                        continue;
+                    }
+                }
+
                 try
                 {
                     AppLog.Info(
