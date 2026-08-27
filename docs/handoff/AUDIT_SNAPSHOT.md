@@ -1,106 +1,117 @@
 # ProxyToAnyConnect — technical audit snapshot
 
-This document preserves engineering findings and the reasons behind current architecture. Live GitHub code remains authoritative.
+This document preserves the main engineering findings and the reasons behind current architecture as of the 2026-08-27 handoff. Live GitHub code is authoritative.
 
-## Fail-closed routing
+## Fail-closed routing findings
 
-- Source-IP binding alone is insufficient; every outbound proxy TCP socket uses both L2TP source IPv4 `Bind()` and `IP_UNICAST_IF` for the L2TP interface.
-- Existing Windows VPN profile is rejected before dial unless it is L2TP + split tunnel.
-- Active IPv4 default routes are captured before/after dial and continuously monitored; mismatch is fail-closed and disconnects the managed VPN.
-- `RasDial` success is not readiness. Usable context is published only after `Disconnected -> Dialing -> Verifying -> Ready` and L2TP-bound HTTPS verification.
-- Fixed expected public IPv4 must exactly match observed egress.
+- Source-IP binding alone is insufficient. Every outbound proxy TCP socket must use both L2TP source IPv4 `Bind()` and `IP_UNICAST_IF` for the selected L2TP interface.
+- Proxy destination DNS must not use host/system DNS. `L2tpDnsResolver` owns source/interface-bound UDP, TCP fallback, CNAME traversal/loop protection and bounded per-context cache.
+- Existing Windows VPN profiles are rejected before dial unless they are L2TP and split-tunnel.
+- `RasDial` success is not readiness. A usable VPN context is published only after interface projection, route guards and real L2TP-bound HTTPS verification reach Ready.
+- IPv4 default-route fingerprints are checked before/after dial and monitored continuously. Route drift invalidates the managed context fail-closed.
+- Direct host traffic and proxied traffic must be proven independently in release evidence. Latest tooling supports a default expected proxy egress, per-proxy endpoint overrides and a separate direct-host expected IPv4.
 
-## DNS
+## HTTP framing / parser audit
 
-System DNS is not trusted for proxy destinations. `L2tpDnsResolver` uses source/interface-bound UDP, TCP fallback, CNAME handling, loop protection and bounded TTL cache scoped to the current VPN context. No DIRECT/system-DNS fallback.
+A previous plain-HTTP implementation could create request-framing ambiguity by forwarding post-header bytes without enforcing one authoritative request body length. The completed #14 work now enforces:
 
-## RAS / native ownership
+- one valid non-negative decimal `Content-Length` only;
+- duplicate/conflicting/comma-list CL rejected;
+- any `Transfer-Encoding` and TE+CL rejected until a real decode/re-encode implementation exists;
+- no CL means zero request body;
+- already-buffered data beyond declared CL is rejected;
+- exactly CL bytes are forwarded, with early EOF failure;
+- later client bytes cannot become a second/smuggled origin request;
+- CONNECT remains opaque and unchanged.
 
-Windows CI smoke tests drove fixes to RAS ABI/layout assumptions. Custom L2TP uses a private temporary `.pbk` rather than a persistent Windows Settings profile.
+Windows close/reset behavior with malicious unread trailing data was handled in tests without weakening the origin-side no-post-CL invariant. #14 is closed.
 
-Critical lifecycle invariant already fixed: one monitor CTS/task per RAS session. Disconnect cancels and joins the exact old monitor; stale monitor cannot hang up a replacement RAS handle. Do not regress this.
+## Proxy lifecycle audit
 
-## Proxy admission and shutdown
+The startup audit found a generation-ownership bug where a listener run/lease could be partially published before readiness failure. The completed #15 architecture establishes:
 
-- `maxConcurrentConnections` bounds user-space accepted sessions; admission happens before Accept and Windows backlog supplies backpressure.
-- Cancellation alone is not deterministic shutdown. `ProxyServer.RunAsync` drains accepted sessions before return by reacquiring the full permit set.
-- Higher runtime must not release L2TP lease before exact proxy run task finishes that drain.
-- Proxy completion observer is tracked/joined, not forgotten fire-and-forget.
+`acquire exact lease -> create exact run CTS/task -> wait readiness -> publish Running`
 
-## Selective reconfigure / memory
+and on rejected/cancelled start:
 
-- unchanged proxy/L2TP groups retain exact runtime object identity;
-- proxy-only changes recreate only proxy;
-- VPN change recreates that VPN + dependents;
-- canonical endpoint uniqueness parses IP addresses, so textual aliases cannot bypass listener collision validation;
-- 250-cycle selective-reconfigure stress preserved independent-group identity and recorded 0/250 retained replaced proxy runtimes and 0/250 retained VPN managers after test-only forced GC.
+`cancel exact run CTS -> drain exact run task -> clear only same-generation fields -> dispose CTS -> release exact lease once`.
 
-Whole-process memory state must remain bounded. Production forced GC is prohibited. Memory-only changes cannot add meaningful latency/jitter or reduce throughput.
+Pause/Dispose follows the same drain-before-lease-release rule. Caller cancellation remains control flow and is not replaced by secondary cleanup exceptions. #15 is closed.
 
-## Proxy parsing/hot path
+## RAS / native callback ownership audit
 
-- pooled transfer buffers and bounded/growing header storage;
-- no full tunnel buffering;
-- incremental CRLFCRLF scan avoids repeated prefix rescans under fragmented headers;
-- parser/origin allocation tests and setup timing guards;
-- atomic traffic accounting.
+- `RasDialW` is callback-driven async and tracked by exact `HRASCONN`.
+- The unmanaged callback thunk must remain rooted until Connected or until teardown proves `ERROR_INVALID_HANDLE`.
+- Releasing a callback root on a failed/ambiguous `RasHangUp` is unsafe because native RAS may still invoke it; process-lifetime retention is safer than callback-after-free.
+- One hangup/status-drain attempt is bounded to avoid indefinite application shutdown. Timeout does not claim terminal state and does not release the callback root; higher ownership keeps the exact handle for retry.
+- Native callback roots are tracked in a bounded exact-handle registry with deterministic high-churn regressions and current/high-watermark telemetry.
+- Managed RAS password/PSK carrier references are cleared immediately after native handoff where possible. This drops managed references; immutable string memory is not falsely claimed to be cryptographically zeroized.
 
-## HTTP framing / request-smuggling finding — issue #14
+## RAS manager / keepalive audit
 
-Old plain HTTP behavior could write all post-header remainder and then pump client→origin unboundedly while hop-by-hop filtering removed `Transfer-Encoding`, creating framing ambiguity and smuggling risk.
+- One monitor CTS/task belongs to one exact RAS session. A stale monitor must never hang up a replacement handle.
+- Disconnect/Dispose drains monitor ownership before completing session cleanup.
+- Monitor, context, ephemeral phonebook and shutdown-lifetime owners are independent cleanup phases; one failure must not silently skip the others.
+- Native ICMP keepalive is event-based asynchronous, not a blocking worker loop.
+- Keepalive failure threshold invalidates the shared VPN context and dependent sessions; reconnect happens only while active leases remain and observes reconnect cooldown.
 
-Production commit `f9db53f074d6740296e46452077622099b6f64ff` now:
+## CustomEphemeral audit
 
-- validates framing before outbound connect;
-- accepts only one valid non-negative decimal Content-Length;
-- rejects duplicate/conflicting/comma-list CL;
-- rejects all Transfer-Encoding and TE+CL until decode/re-encode exists;
-- treats no CL as zero body;
-- rejects already-read bytes beyond CL;
-- forwards exactly CL body bytes, never later pipelined/trailing bytes;
-- fails early EOF;
-- preserves valid CL;
-- leaves CONNECT opaque.
+- No persistent Windows Settings VPN profile is created.
+- Private temporary PBK ownership is published lock-first, then marker. Marker-first publication was rejected because another process could misclassify a live session as orphaned.
+- Cleanup only deletes directories with recognized ownership marker; ambiguous/unmarked directories are preserved fail-safe.
+- Marker contains the exact RAS entry name so stale recovery can best-effort delete the RAS entry before directory deletion.
+- Repeated partial-creation failures are regression-tested for non-accumulation of managed session directories.
+- Real endpoint authentication/encryption/certificate/PSK acceptance is still external #6 work.
 
-`ProxyHttpFramingSelfTests` provides parser and loopback boundary tests.
+## VPN lease / coordinator audit
 
-## Current exact Windows verdict — build #272
+- Shared and dedicated VPN configurations have explicit lease ownership.
+- First lease establishes/verifies; last release disconnects. Pausing one shared proxy must not disconnect a VPN still leased by another proxy.
+- DNS cache and latest-status ownership must be released even if disconnect/controller cleanup fails.
+- Runtime reconfigure uses desired topology plus actual-owner drift detection; identical config can recover missing runtime generations after prior cleanup failure.
+- Enabled starts that fail/cancel remain pending for same-config retry.
+- Independent proxy starts/restarts are allowed to overlap rather than serializing unrelated VPN groups.
+- Cleanup is dependency-phased: proxy owners first, then VPN managers. Owners within a phase may drain concurrently; diagnostics preserve deterministic input-order primary/secondary failure ordering.
 
-At handoff docs commit `b3fbe1f96c0ffa7d031cb72b81793ec6ea9c2858`:
+## GUI / persistence audit
 
-- compile succeeded, 0 warnings/errors;
-- setup paired timing guard passed: parser `1999 vs 2042 ns/op = 0.98x`, origin `973 vs 1222 = 0.80x`;
-- framing suite was reached;
-- `ExactContentLengthBoundsClientToOriginBytesAsync` failed while its client `ReadToEndAsync` received `IOException` / Windows `SocketException 10054` (connection forcibly closed by remote host).
+- Whole GUI configuration transactions are serialized, not only file writes. Add/Edit/Remove/Logging and Start/Pause use one FIFO command-generation queue.
+- Durable save is the desired-state publication boundary. Runtime reconciliation failure does not roll the persisted generation back in UI memory.
+- `appsettings.json` uses unique sibling temp files and mandatory cleanup. Fixed shared `.tmp` paths were rejected because cancellation/overlapping saves could conflict or leave stale temp state.
+- Invalid legacy config repair is staged in-memory across multiple editor operations. No partially repaired invalid generation is written; the first globally valid accumulated draft is persisted/applied as one generation.
+- Logging and runtime are independent consumers of the same durable generation. A logging change completing the last invalid field must also apply earlier proxy/VPN staged repairs.
+- `desired ∪ actual` projection prevents the GUI from hiding saved-but-missing runtime or residual cleanup drift.
+- Explicit Exit closes the currently owned modal editor, stops command admission, cancels/drains the queue and exact Windows-profile helper task, then tears down runtime owners.
 
-Likely explanation to investigate: after proxy intentionally consumes only declared CL bytes, malicious trailing client bytes remain unread; closing a TCP socket with unread receive data can produce an RST on Windows. This may be test-observation semantics rather than bytes leaking to origin, but it must be proven. Alternatives include proxy closing before full origin response or another production bug.
+## Logging / process-memory audit
 
-Do not weaken the fundamental invariant that bytes after CL must never reach origin. A deterministic test may need to read the expected response framing/body rather than requiring clean EOF if reset occurs only after a complete response and deliberate trailing attack bytes remain unread. Verify before changing test or production behavior.
+- File logging is fail-soft and transactional; malformed editable logging paths must not crash startup before the user can repair them.
+- Retention cleanup owns its cancellation source until the last worker exits; cancellation callback faults cannot abort independent cleanup.
+- No unbounded in-memory log history is retained.
+- Process memory health retains a bounded latest snapshot only: managed heap/allocation/GC counts, working/private bytes, handles/threads, PID/start-time and native callback-root current/high watermark.
+- Production forced GC and working-set trimming are prohibited.
 
-## Proxy setup timing audit
+## Long-run evidence audit (#13)
 
-Current source uses alternating paired measurement, 2048 warmup, 9 rounds, 32768 ops/round and unchanged 1.25x maximum slowdown policy. Although earlier runs #270/#271 were noisy/red, build #272 passed the paired gate. The immediate blocker is no longer timing unless later exact-head CI regresses.
+The soak path must measure rather than perturb the process:
 
-## New startup ownership bug — issue #15
+- collector binds to exact PID, process start time and executable SHA-256 and rejects PID reuse;
+- bundle is portable and manifest-protected;
+- sample and log validators stream multi-day data with bounded memory;
+- external working/private/handle/thread samples correlate with application `process.memory.*` managed records using exact PID + start time;
+- hosted smoke proves tooling mechanics only, not leak absence;
+- final acceptance needs 12–24 h representative traffic/reconnect/Pause/Resume/reconfigure workload and trend review without adding arbitrary machine-specific working-set thresholds.
 
-`ProxyInstanceRuntime.StartAsync` can publish `_lease`, `_runCancellation`, `_runTask`, then fail/cancel awaiting listener readiness. Existing catch cleanup may release/dispose local ownership without awaiting exact run-task drain or clearing already-published fields.
+## Current external validation boundary
 
-Required transactional order for failed/cancelled startup:
+Hosted Windows CI can validate native APIs, PBK/DPAPI mechanics, loopback data path, lifecycle ownership, stress and packaging. It cannot prove the user's actual L2TP server behavior, PPP server address, public egress, authentication policy, real keepalive failure/reconnect path or operator GUI experience.
 
-`cancel exact run CTS -> await exact runTask drain -> clear fields only if same attempt/generation -> dispose CTS -> release exact L2TP lease once`.
+Therefore release-critical external issues remain #2/#4/#5/#6/#7, plus #13 long-run soak. #11 remains an ongoing performance/memory requirement.
 
-Preserve cancellation semantics, retry, Pause/Dispose idempotence, no double-release/unobserved observer and successful Running path.
+## Next audit/development order
 
-Planned test seam is only orchestration-level: injectable lease acquisition + server lifetime (`RunAsync`, `WaitUntilListeningAsync`); production VPN/DNS/socket/proxy chain remains unchanged.
-
-## External validation boundary
-
-GitHub Windows CI can test native APIs, private RAS phonebook/DPAPI, loopback proxy/DNS, lifetimes, stress and packaging. It cannot validate the user's actual Windows 11 L2TP endpoint, real public egress, PPP server address, real authentication/encryption/certificate/PSK or live reconnect behavior. #2/#6/#7 remain open for this reason.
-
-## Next-chat audit order
-
-1. Fetch exact live head/actions/issues.
-2. Investigate framing test reset 10054 while preserving strict CL boundary.
-3. Get exact-head Windows framing tests green and finish #14 if acceptance is met.
-4. Implement #15 transactional startup ownership with drain-before-lease-release regression coverage.
-5. Continue #11/#13 and real Windows acceptance work.
+1. Re-read live head and latest issue comments.
+2. Verify the new per-proxy/direct expected-egress contract across collector, validators, aggregate completion and CI positive/negative smoke.
+3. Continue deterministic ownership/stress/performance work only where it preserves fail-closed and hot-path latency.
+4. Execute the real Windows 11/L2TP acceptance matrix and 12–24 h soak when the environment is available.
