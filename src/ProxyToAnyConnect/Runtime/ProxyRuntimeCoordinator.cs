@@ -54,13 +54,7 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
             lock (_collectionGate)
             {
                 proxies = _proxyById.Values.Where(item => item.Options.Enabled).ToArray();
-            }
-
-            foreach (var proxy in proxies)
-            {
-                operationToken.ThrowIfCancellationRequested();
-
-                lock (_collectionGate)
+                foreach (var proxy in proxies)
                 {
                     if (_proxyById.TryGetValue(proxy.Options.Id, out var current) &&
                         ReferenceEquals(current, proxy) &&
@@ -69,19 +63,11 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                         _pendingStartProxyIds.Add(proxy.Options.Id);
                     }
                 }
-
-                if (await TryStartProxyAsync(proxy, operationToken))
-                {
-                    lock (_collectionGate)
-                    {
-                        if (_proxyById.TryGetValue(proxy.Options.Id, out var current) &&
-                            ReferenceEquals(current, proxy))
-                        {
-                            _pendingStartProxyIds.Remove(proxy.Options.Id);
-                        }
-                    }
-                }
             }
+
+            operationToken.ThrowIfCancellationRequested();
+            await Task.WhenAll(
+                proxies.Select(proxy => StartDesiredProxyGenerationAsync(proxy, operationToken)));
         }
         finally
         {
@@ -249,8 +235,8 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
             Exception? cleanupFailure = null;
 
             // Stop every affected proxy before touching any changed/removed L2TP
-            // manager. One broken proxy teardown must not leave later removed
-            // runtimes alive but unreachable from the coordinator dictionaries.
+            // manager. Independent proxy owners drain concurrently within this phase;
+            // the phase itself remains a hard barrier before any VPN owner is disposed.
             cleanupFailure = await DisposeOwnedResourcesAsync(
                 proxiesToDispose.Cast<IAsyncDisposable>(),
                 "reconfigure-proxy",
@@ -270,9 +256,10 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 }
             }
 
-            // Changed/removed L2TP managers are disposed only after all dependent
-            // old proxy leases have had their cleanup attempt. Continue through all
-            // VPN managers even if one earlier teardown already failed.
+            // Changed/removed L2TP managers are disposed only after all dependent old
+            // proxy leases have completed their cleanup attempt. Independent managers
+            // then drain concurrently so one stuck dedicated RAS owner cannot serialize
+            // its full timeout across unrelated groups.
             cleanupFailure = await DisposeOwnedResourcesAsync(
                 vpnsToDispose.Cast<IAsyncDisposable>(),
                 "reconfigure-vpn",
@@ -350,48 +337,31 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
                 }
             }
 
+            ProxyInstanceRuntime[] startCandidates;
             lock (_collectionGate)
             {
+                var candidates = new List<ProxyInstanceRuntime>(startCandidateIds.Count);
                 foreach (var proxyId in startCandidateIds)
                 {
                     _pendingStartProxyIds.Add(proxyId);
-                }
-            }
-
-            foreach (var proxyId in startCandidateIds)
-            {
-                operationToken.ThrowIfCancellationRequested();
-
-                ProxyInstanceRuntime? runtime;
-                lock (_collectionGate)
-                {
-                    _proxyById.TryGetValue(proxyId, out runtime);
-                }
-
-                if (runtime is null ||
-                    !newProxyOptions.TryGetValue(proxyId, out var newProxy) ||
-                    !newProxy.Enabled)
-                {
-                    lock (_collectionGate)
+                    if (_proxyById.TryGetValue(proxyId, out var runtime) &&
+                        newProxyOptions.TryGetValue(proxyId, out var newProxy) &&
+                        newProxy.Enabled)
+                    {
+                        candidates.Add(runtime);
+                    }
+                    else
                     {
                         _pendingStartProxyIds.Remove(proxyId);
                     }
-
-                    continue;
                 }
 
-                if (await TryStartProxyAsync(runtime, operationToken))
-                {
-                    lock (_collectionGate)
-                    {
-                        if (_proxyById.TryGetValue(proxyId, out var current) &&
-                            ReferenceEquals(current, runtime))
-                        {
-                            _pendingStartProxyIds.Remove(proxyId);
-                        }
-                    }
-                }
+                startCandidates = candidates.ToArray();
             }
+
+            operationToken.ThrowIfCancellationRequested();
+            await Task.WhenAll(
+                startCandidates.Select(runtime => StartDesiredProxyGenerationAsync(runtime, operationToken)));
 
             int totalProxyCount;
             int affectedExistingProxyCount;
@@ -488,6 +458,25 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         }
     }
 
+    private async Task StartDesiredProxyGenerationAsync(
+        ProxyInstanceRuntime proxy,
+        CancellationToken cancellationToken)
+    {
+        if (!await TryStartProxyAsync(proxy, cancellationToken))
+        {
+            return;
+        }
+
+        lock (_collectionGate)
+        {
+            if (_proxyById.TryGetValue(proxy.Options.Id, out var current) &&
+                ReferenceEquals(current, proxy))
+            {
+                _pendingStartProxyIds.Remove(proxy.Options.Id);
+            }
+        }
+    }
+
     private static async Task<bool> TryStartProxyAsync(
         ProxyInstanceRuntime proxy,
         CancellationToken cancellationToken)
@@ -524,30 +513,50 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(resources);
         ArgumentException.ThrowIfNullOrWhiteSpace(phase);
 
-        var index = 0;
-        foreach (var resource in resources)
+        var owned = resources.ToArray();
+        var attempts = new Task<Exception?>[owned.Length];
+        for (var index = 0; index < owned.Length; index++)
         {
-            try
+            attempts[index] = DisposeOneOwnedResourceAsync(owned[index]);
+        }
+
+        // Consume results in the same deterministic input order even though every
+        // independent owner has already begun teardown. This preserves stable primary
+        // and secondary diagnostics while phase latency is bounded by the slowest owner
+        // rather than by the sum of owner teardown times.
+        for (var index = 0; index < attempts.Length; index++)
+        {
+            var failure = await attempts[index];
+            if (failure is null)
             {
-                await resource.DisposeAsync();
-            }
-            catch (Exception ex)
-            {
-                if (primaryFailure is null)
-                {
-                    primaryFailure = ex;
-                }
-                else
-                {
-                    primaryFailure.Data[$"CoordinatorCleanup:{phase}:{index}"] =
-                        $"{ex.GetType().FullName}: {ex.Message}";
-                }
+                continue;
             }
 
-            index++;
+            if (primaryFailure is null)
+            {
+                primaryFailure = failure;
+            }
+            else
+            {
+                primaryFailure.Data[$"CoordinatorCleanup:{phase}:{index}"] =
+                    $"{failure.GetType().FullName}: {failure.Message}";
+            }
         }
 
         return primaryFailure;
+    }
+
+    private static async Task<Exception?> DisposeOneOwnedResourceAsync(IAsyncDisposable resource)
+    {
+        try
+        {
+            await resource.DisposeAsync();
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
     }
 
     private static void CaptureCoordinatorCleanupFailure(
