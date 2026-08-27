@@ -4,6 +4,8 @@ namespace ProxyToAnyConnect.Diagnostics;
 
 internal sealed record ProcessMemorySnapshot(
     DateTimeOffset TimestampUtc,
+    int ProcessId,
+    DateTimeOffset ProcessStartTimeUtc,
     long ManagedHeapBytes,
     long TotalAllocatedBytes,
     long WorkingSetBytes,
@@ -48,6 +50,8 @@ internal sealed class ProcessMemoryHealthMonitor : IAsyncDisposable
 
         return new ProcessMemorySnapshot(
             DateTimeOffset.UtcNow,
+            process.Id,
+            new DateTimeOffset(process.StartTime.ToUniversalTime(), TimeSpan.Zero),
             GC.GetTotalMemory(forceFullCollection: false),
             GC.GetTotalAllocatedBytes(precise: false),
             Environment.WorkingSet,
@@ -91,6 +95,8 @@ internal sealed class ProcessMemoryHealthMonitor : IAsyncDisposable
             "Current ProxyToAnyConnect process memory/resource health snapshot.",
             new
             {
+                snapshot.ProcessId,
+                snapshot.ProcessStartTimeUtc,
                 snapshot.ManagedHeapBytes,
                 snapshot.TotalAllocatedBytes,
                 snapshot.WorkingSetBytes,
