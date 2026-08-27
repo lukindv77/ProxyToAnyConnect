@@ -508,7 +508,9 @@ internal sealed class MainForm : Form
     {
         cancellationToken.ThrowIfCancellationRequested();
         using var dialog = new L2tpSettingsDialog(null);
-        if (_configurationDialogs.Run(dialog, this) != DialogResult.OK)
+        var dialogResult = _configurationDialogs.Run(dialog, this);
+        await dialog.StopBackgroundOperationsAsync();
+        if (dialogResult != DialogResult.OK)
         {
             return;
         }
@@ -540,7 +542,9 @@ internal sealed class MainForm : Form
         }
 
         using var dialog = new L2tpSettingsDialog(existing);
-        if (_configurationDialogs.Run(dialog, this) != DialogResult.OK)
+        var dialogResult = _configurationDialogs.Run(dialog, this);
+        await dialog.StopBackgroundOperationsAsync();
+        if (dialogResult != DialogResult.OK)
         {
             return;
         }

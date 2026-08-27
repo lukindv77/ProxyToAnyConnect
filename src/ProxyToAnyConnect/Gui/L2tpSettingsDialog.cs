@@ -676,8 +676,8 @@ internal sealed class L2tpSettingsDialog : Form
         combo.SelectedItem is TEnum value ? value : default;
 
     private static void SelectEnum<TEnum>(ComboBox combo, TEnum value)
-    {
         where TEnum : struct, Enum
+    {
         for (var index = 0; index < combo.Items.Count; index++)
         {
             if (combo.Items[index] is TEnum candidate && EqualityComparer<TEnum>.Default.Equals(candidate, value))
