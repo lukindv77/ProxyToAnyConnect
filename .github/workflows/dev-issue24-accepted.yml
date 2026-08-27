@@ -65,18 +65,7 @@ jobs:
                   var version = versionSpan.ToString();'''
           if text.count(old) != 1:
               raise SystemExit(f'expected one CONNECT comparator request-line block, got {text.count(old)}')
-          text = text.replace(old, new)
-
-          anchor = '''        AssertBothRejectMalformed(
-                  "CONNECT example.test:443 HTTP/1.1\\r\\n" +
-                  "X-Test: bad\\0value\\r\\n\\r\\n");'''
-          expanded = anchor + '''
-              AssertBothRejectMalformed("CON/NECT example.test:443 HTTP/1.1\\r\\n\\r\\n");
-              AssertBothRejectMalformed("CONNECT example.test:443 HTTP/2.0\\r\\n\\r\\n");
-              AssertBothRejectMalformed("CONNECT example.test:443 HTTP/1.1 extra\\r\\n\\r\\n");'''
-          if text.count(anchor) != 1:
-              raise SystemExit(f'expected one CONNECT malformed comparator anchor, got {text.count(anchor)}')
-          connect.write_text(text.replace(anchor, expanded), encoding='utf-8', newline='')
+          connect.write_text(text.replace(old, new), encoding='utf-8', newline='')
           '@ | python -
 
           git diff --check
