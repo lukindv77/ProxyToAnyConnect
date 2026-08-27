@@ -241,8 +241,38 @@ $interfacesCapture = Invoke-Capture 'interfaces' { Get-InterfaceSnapshot }
 $processCapture = Invoke-Capture 'process' {
     $items = @(
         Get-Process -Name 'ProxyToAnyConnect' -ErrorAction SilentlyContinue |
-            Select-Object Id, ProcessName, StartTime, WorkingSet64, PrivateMemorySize64, HandleCount,
-                @{n='ThreadCount';e={$_.Threads.Count}}
+            ForEach-Object {
+                $executableSha256 = $null
+                $executableHashError = $null
+                try {
+                    $processPath = Get-OptionalPropertyValue -Object $_ -Name 'Path'
+                    if ([string]::IsNullOrWhiteSpace([string]$processPath) -or
+                        -not (Test-Path -LiteralPath $processPath -PathType Leaf)) {
+                        $executableHashError = 'ExecutablePathUnavailable'
+                    }
+                    else {
+                        $executableSha256 = (Get-FileHash -LiteralPath $processPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+                    }
+                }
+                catch {
+                    # Do not persist the exception message: filesystem errors can
+                    # contain the user's local executable path. The type is enough
+                    # to diagnose why binary identity could not be captured.
+                    $executableHashError = $_.Exception.GetType().Name
+                }
+
+                [pscustomobject]@{
+                    Id = $_.Id
+                    ProcessName = $_.ProcessName
+                    StartTime = $_.StartTime
+                    WorkingSet64 = $_.WorkingSet64
+                    PrivateMemorySize64 = $_.PrivateMemorySize64
+                    HandleCount = $_.HandleCount
+                    ThreadCount = $_.Threads.Count
+                    ExecutableSha256 = $executableSha256
+                    ExecutableHashError = $executableHashError
+                }
+            }
     )
     return ,$items
 }
