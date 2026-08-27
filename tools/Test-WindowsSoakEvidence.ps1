@@ -122,7 +122,7 @@ foreach ($line in Get-Content -LiteralPath $samplesPath) {
         $sample = $line | ConvertFrom-Json
     }
     catch {
-        throw "Soak sample JSON parse failure at logical sample $sampleCount: $($_.Exception.Message)"
+        throw "Soak sample JSON parse failure at logical sample ${sampleCount}: $($_.Exception.Message)"
     }
 
     if ($sample.schemaVersion -ne 1 -or [int]$sample.index -ne $sampleCount) {
