@@ -190,19 +190,33 @@ jobs:
           }
           $memoryEntry | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $memoryLog -Encoding utf8
 
+          $correlationSummaryPath = './artifacts/windows-soak-correlation-summary.json'
           $correlation = ./tools/Test-WindowsSoakLogCorrelation.ps1 `
             -OutputDirectory $output `
             -ExpectedExecutableSha256 $hash `
             -ApplicationLogPath $memoryLog `
             -MinimumSoakSamples 2 `
             -MinimumObservedDurationSeconds 1 `
-            -MinimumMemoryRecords 1 | ConvertFrom-Json
+            -MinimumMemoryRecords 1 `
+            -CorrelationSummaryPath $correlationSummaryPath | ConvertFrom-Json
           if (-not $correlation.correlated -or
               -not $correlation.bundleValidated -or
               $correlation.executableSha256 -ne $hash -or
               $correlation.validationMemoryModel -ne 'streaming-o1') {
             throw 'Soak/log correlation did not enforce exact sealed-bundle streaming semantics.'
           }
+          if (-not (Test-Path -LiteralPath $correlationSummaryPath -PathType Leaf)) {
+            throw 'Soak/log correlation did not publish its derived summary artifact.'
+          }
+          $correlationFile = Get-Content -LiteralPath $correlationSummaryPath -Raw | ConvertFrom-Json
+          if ($correlationFile.schemaVersion -ne $correlation.schemaVersion -or
+              $correlationFile.processId -ne $correlation.processId -or
+              $correlationFile.processStartTimeUtc -ne $correlation.processStartTimeUtc -or
+              $correlationFile.executableSha256 -ne $correlation.executableSha256 -or
+              $correlationFile.memoryRecordCount -ne $correlation.memoryRecordCount) {
+            throw 'Derived correlation summary does not match stdout correlation result.'
+          }
+          $correlationSummaryHash = (Get-FileHash -LiteralPath $correlationSummaryPath -Algorithm SHA256).Hash
           $correlation | ConvertTo-Json -Depth 4 | Write-Host
 
           $wrongIdentityLog = './artifacts/windows-soak-memory-wrong-identity.jsonl'
@@ -217,7 +231,8 @@ jobs:
               -ApplicationLogPath $wrongIdentityLog `
               -MinimumSoakSamples 2 `
               -MinimumObservedDurationSeconds 1 `
-              -MinimumMemoryRecords 1 | Out-Null
+              -MinimumMemoryRecords 1 `
+              -CorrelationSummaryPath $correlationSummaryPath | Out-Null
           }
           catch {
             $identityMismatchRejected = $true
@@ -225,6 +240,9 @@ jobs:
           }
           if (-not $identityMismatchRejected) {
             throw 'Soak/log correlation accepted managed-memory records from a different process identity.'
+          }
+          if ((Get-FileHash -LiteralPath $correlationSummaryPath -Algorithm SHA256).Hash -ne $correlationSummaryHash) {
+            throw 'Failed process-identity correlation replaced the previously accepted derived summary.'
           }
 
           # Correlation itself must validate the sealed external bundle. Reusing the
@@ -238,7 +256,8 @@ jobs:
               -ApplicationLogPath $memoryLog `
               -MinimumSoakSamples 2 `
               -MinimumObservedDurationSeconds 1 `
-              -MinimumMemoryRecords 1 | Out-Null
+              -MinimumMemoryRecords 1 `
+              -CorrelationSummaryPath $correlationSummaryPath | Out-Null
           }
           catch {
             $tamperedCorrelationRejected = $true
@@ -246,6 +265,28 @@ jobs:
           }
           if (-not $tamperedCorrelationRejected) {
             throw 'Soak/log correlation trusted a tampered external evidence bundle.'
+          }
+          if ((Get-FileHash -LiteralPath $correlationSummaryPath -Algorithm SHA256).Hash -ne $correlationSummaryHash) {
+            throw 'Tampered-bundle correlation replaced the previously accepted derived summary.'
+          }
+
+          $insideBundleSummaryRejected = $false
+          try {
+            ./tools/Test-WindowsSoakLogCorrelation.ps1 `
+              -OutputDirectory $output `
+              -ExpectedExecutableSha256 $hash `
+              -ApplicationLogPath $memoryLog `
+              -MinimumSoakSamples 2 `
+              -MinimumObservedDurationSeconds 1 `
+              -MinimumMemoryRecords 1 `
+              -CorrelationSummaryPath (Join-Path $output 'derived-correlation.json') | Out-Null
+          }
+          catch {
+            $insideBundleSummaryRejected = $true
+            Write-Host "PASS: derived summary inside sealed bundle rejected: $($_.Exception.Message)"
+          }
+          if (-not $insideBundleSummaryRejected) {
+            throw 'Correlation allowed a derived summary to mutate the sealed soak evidence directory.'
           }
 
       - name: Setup .NET 10
