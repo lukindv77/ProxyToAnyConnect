@@ -62,15 +62,10 @@ internal sealed class EphemeralRasPhonebook : IDisposable
         EphemeralRasPhonebook? resource = null;
         try
         {
-            // The persistent marker prevents a new version from treating legacy
-            // unmarked directories as abandoned sessions. Store the exact private
-            // entry name as recovery metadata so a later process can best-effort
-            // remove RAS entry-associated credentials before deleting an orphaned
-            // private phonebook. The owner lock is held exclusively for the runtime
-            // lifetime and is deleted automatically if this process terminates.
-            File.WriteAllText(
-                Path.Combine(sessionRoot, OwnershipMarkerFileName),
-                entryName);
+            // Establish exclusive ownership before publishing the persistent marker.
+            // Another process scans only marked directories, so it cannot classify a
+            // newly-created session as stale in the directory-create/lock-create gap.
+            // DeleteOnClose removes the lock automatically after abnormal process exit.
             ownershipLock = new FileStream(
                 Path.Combine(sessionRoot, OwnershipLockFileName),
                 FileMode.CreateNew,
@@ -78,6 +73,13 @@ internal sealed class EphemeralRasPhonebook : IDisposable
                 FileShare.None,
                 bufferSize: 1,
                 FileOptions.DeleteOnClose);
+
+            // The marker opts this directory into orphan recovery and stores the exact
+            // private entry name so a later process can best-effort remove RAS
+            // entry-associated credentials before deleting an orphaned phonebook.
+            File.WriteAllText(
+                Path.Combine(sessionRoot, OwnershipMarkerFileName),
+                entryName);
 
             var phoneBookPath = Path.Combine(sessionRoot, "session.pbk");
             resource = new EphemeralRasPhonebook(
@@ -168,9 +170,9 @@ internal sealed class EphemeralRasPhonebook : IDisposable
             var markerPath = Path.Combine(sessionDirectory, OwnershipMarkerFileName);
             if (!File.Exists(markerPath))
             {
-                // Do not infer ownership for directories created by an older build
-                // or by another application. Only the marker opts a directory into
-                // this cleanup protocol.
+                // Do not infer ownership for directories created by an older build,
+                // another application, or a creator that died before publishing its
+                // marker. Ambiguous ownership is intentionally preserved fail-safe.
                 continue;
             }
 
