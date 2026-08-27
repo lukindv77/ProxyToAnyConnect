@@ -44,6 +44,28 @@ function Write-JsonFile {
     $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding utf8
 }
 
+function Get-OptionalPropertyValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        $Object,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+
+    return $property.Value
+}
+
 function Invoke-Capture {
     param(
         [Parameter(Mandatory = $true)][string] $Name,
@@ -146,14 +168,24 @@ function Get-InterfaceSnapshot {
     $items = @(
         Get-NetIPConfiguration -ErrorAction Stop |
             ForEach-Object {
+                $netProfile = Get-OptionalPropertyValue -Object $_ -Name 'NetProfile'
+                $ipv4Addresses = @(Get-OptionalPropertyValue -Object $_ -Name 'IPv4Address')
+                $gateways = @(Get-OptionalPropertyValue -Object $_ -Name 'IPv4DefaultGateway')
+                $dnsServer = Get-OptionalPropertyValue -Object $_ -Name 'DNSServer'
+                $dnsAddresses = @(Get-OptionalPropertyValue -Object $dnsServer -Name 'ServerAddresses')
+
                 [pscustomobject]@{
-                    InterfaceAlias = $_.InterfaceAlias
-                    InterfaceIndex = $_.InterfaceIndex
-                    InterfaceDescription = $_.InterfaceDescription
-                    NetProfileName = $_.NetProfile.Name
-                    IPv4Address = @($_.IPv4Address | ForEach-Object { $_.IPAddress })
-                    IPv4DefaultGateway = @($_.IPv4DefaultGateway | ForEach-Object { $_.NextHop })
-                    DnsServers = @($_.DNSServer.ServerAddresses)
+                    InterfaceAlias = Get-OptionalPropertyValue -Object $_ -Name 'InterfaceAlias'
+                    InterfaceIndex = Get-OptionalPropertyValue -Object $_ -Name 'InterfaceIndex'
+                    InterfaceDescription = Get-OptionalPropertyValue -Object $_ -Name 'InterfaceDescription'
+                    NetProfileName = Get-OptionalPropertyValue -Object $netProfile -Name 'Name'
+                    IPv4Address = @($ipv4Addresses | ForEach-Object {
+                        Get-OptionalPropertyValue -Object $_ -Name 'IPAddress'
+                    } | Where-Object { $null -ne $_ })
+                    IPv4DefaultGateway = @($gateways | ForEach-Object {
+                        Get-OptionalPropertyValue -Object $_ -Name 'NextHop'
+                    } | Where-Object { $null -ne $_ })
+                    DnsServers = @($dnsAddresses | Where-Object { $null -ne $_ })
                 }
             } |
             Sort-Object InterfaceIndex
