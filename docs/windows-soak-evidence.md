@@ -78,28 +78,34 @@ The small duration tolerance accounts for time between collector initialization 
 The validator checks:
 
 - evidence schema versions;
-- exact executable SHA-256;
-- manifest file lengths and SHA-256 values;
-- sample count against the summary;
+- exact executable SHA-256 in metadata, summary and result;
+- exactly four emitted payloads in the manifest;
+- bundle-relative, non-absolute manifest paths;
+- manifest file lengths and SHA-256 values for every emitted payload;
+- absence of a host-specific absolute output path in `result.json`;
+- sample count against both summary and result;
 - contiguous sample indexes;
 - stable PID, process name and process start time across every sample;
 - monotonic sample timestamps;
 - non-negative memory/handle/thread measurements;
-- requested minimum sample count and observed duration.
+- requested minimum sample count and observed duration;
+- summary/result observed-duration consistency.
 
-Validation means the evidence bundle is internally consistent and belongs to the expected process binary. It does **not** automatically declare the application leak-free.
+Validation means the evidence bundle is internally consistent, portable between machines/directories and belongs to the expected process binary. It does **not** automatically declare the application leak-free.
 
-## Evidence files
+## Evidence files and portability contract
 
-The output directory contains:
+The output directory contains exactly these four manifested payload files plus the manifest itself:
 
 - `metadata.json` — exact process/binary identity and requested sampling parameters;
 - `process-samples.jsonl` — append-only external sample stream;
 - `summary.json` — first/last/min/max/delta process metrics and collection status;
-- `manifest.json` — SHA-256 and byte length for the evidence files;
-- `result.json` — compact successful-collection result.
+- `result.json` — compact successful-collection result with no absolute host path;
+- `manifest.json` — SHA-256 and byte length for all four payload files above.
 
-The collector deliberately does not store the executable path in the evidence bundle; the release identity is represented by process name, PID/start time and SHA-256.
+The collector deliberately does not store the executable path or output-directory path in the evidence payloads. Release identity is represented by process name, PID/start time and SHA-256, while all manifest paths are relative to the bundle root. The completed directory can therefore be copied or archived without invalidating its internal identity/integrity contract.
+
+Any post-collection change to `metadata.json`, `process-samples.jsonl`, `summary.json` or `result.json` must make validation fail until a new evidence run produces a new manifest. Operators must not regenerate only the manifest around edited evidence.
 
 ## Workload to exercise during the soak
 
@@ -127,4 +133,4 @@ If a suspected retention pattern appears, reproduce it with the deterministic ow
 
 ## Hosted CI coverage
 
-The Windows build workflow performs a short smoke run of both soak scripts against the current PowerShell process. That smoke validates script syntax, process identity/hash checking, sample emission, manifest integrity and validator execution without pretending to replace the required multi-hour Windows 11/L2TP soak.
+The Windows build workflow performs a short smoke run of both soak scripts against the current PowerShell process. The smoke validates script syntax, process identity/hash checking, sample emission, complete four-payload manifest integrity, result/summary consistency and validator execution. It also mutates a copied payload after collection and requires the validator to reject that tampered bundle. This hosted smoke does not pretend to replace the required multi-hour Windows 11/L2TP soak.
