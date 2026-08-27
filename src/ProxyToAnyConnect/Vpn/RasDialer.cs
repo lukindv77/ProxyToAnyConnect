@@ -197,14 +197,16 @@ internal sealed class RasDialer
 
             if (initialResult != RasNative.ErrorSuccess)
             {
-                if (handle != 0)
-                {
-                    await HangUpAndDrainAsync(handle).ConfigureAwait(false);
-                }
-
-                throw new InvalidOperationException(
+                var primaryFailure = new InvalidOperationException(
                     $"RasDial failed before asynchronous connection setup: " +
                     RasNative.DescribeError(initialResult));
+                if (handle != 0)
+                {
+                    await TryHangUpAndDrainPreservingPrimaryAsync(handle, primaryFailure)
+                        .ConfigureAwait(false);
+                }
+
+                throw primaryFailure;
             }
 
             if (handle == 0)
@@ -219,27 +221,33 @@ internal sealed class RasDialer
                 completed = await terminal.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException cancellationFailure)
+                when (cancellationToken.IsCancellationRequested)
             {
-                await HangUpAndDrainAsync(handle).ConfigureAwait(false);
+                await TryHangUpAndDrainPreservingPrimaryAsync(handle, cancellationFailure)
+                    .ConfigureAwait(false);
                 throw;
             }
 
             if (completed.Error != RasNative.ErrorSuccess)
             {
-                await HangUpAndDrainAsync(handle).ConfigureAwait(false);
-                throw new InvalidOperationException(
+                var primaryFailure = new InvalidOperationException(
                     $"RAS connection failed while dialing: {RasNative.DescribeError(completed.Error)}" +
                     (completed.ExtendedError == 0
                         ? string.Empty
                         : $" (extended error {completed.ExtendedError})"));
+                await TryHangUpAndDrainPreservingPrimaryAsync(handle, primaryFailure)
+                    .ConfigureAwait(false);
+                throw primaryFailure;
             }
 
             if (completed.ConnectionState != RasCsConnected)
             {
-                await HangUpAndDrainAsync(handle).ConfigureAwait(false);
-                throw new InvalidOperationException(
+                var primaryFailure = new InvalidOperationException(
                     $"RAS connection ended before reaching Connected (state {completed.ConnectionState}).");
+                await TryHangUpAndDrainPreservingPrimaryAsync(handle, primaryFailure)
+                    .ConfigureAwait(false);
+                throw primaryFailure;
             }
 
             WindowsRasDialNative.ReleaseCallbackRoot(handle);
@@ -254,6 +262,26 @@ internal sealed class RasDialer
         }
     }
 
+    private async Task TryHangUpAndDrainPreservingPrimaryAsync(
+        nint handle,
+        Exception primaryFailure)
+    {
+        try
+        {
+            await HangUpAndDrainAsync(handle).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException teardownFailure)
+        {
+            // Teardown is secondary to the control-flow/failure that led here. In
+            // particular, caller cancellation must remain OperationCanceledException
+            // so higher ownership layers can distinguish Exit/Pause from a RAS fault.
+            // Preserve cleanup detail without replacing the primary exception.
+            primaryFailure.Data["RasTeardownError"] = teardownFailure.Message;
+            System.Diagnostics.Debug.WriteLine(
+                $"RAS teardown did not complete while preserving primary failure: {teardownFailure.Message}");
+        }
+    }
+
     public async Task HangUpAndDrainAsync(nint handle)
     {
         if (handle == 0)
@@ -264,6 +292,9 @@ internal sealed class RasDialer
         var hangUpResult = _native.HangUp(handle);
         if (hangUpResult is not (RasNative.ErrorSuccess or ErrorInvalidHandle))
         {
+            // Do not release the callback root here. Without successful RasHangUp
+            // plus ERROR_INVALID_HANDLE (or another proven terminal boundary), the
+            // native state machine may still invoke the registered callback.
             throw new InvalidOperationException(
                 $"RasHangUp failed: {RasNative.DescribeError(hangUpResult)}");
         }
@@ -285,7 +316,9 @@ internal sealed class RasDialer
 
             if (result != RasNative.ErrorSuccess)
             {
-                WindowsRasDialNative.ReleaseCallbackRoot(handle);
+                // Status is no longer trustworthy but the handle has not been proven
+                // invalid, so retaining the callback root is safer than allowing an
+                // unmanaged callback into a collected delegate.
                 throw new InvalidOperationException(
                     $"Unable to drain RAS connection state after hangup: " +
                     RasNative.DescribeError(result));
