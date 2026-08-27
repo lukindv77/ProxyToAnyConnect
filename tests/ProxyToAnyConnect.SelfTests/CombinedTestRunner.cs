@@ -62,6 +62,7 @@ internal static class CombinedTestRunner
         await RunAsync(nameof(NativeRouteSelfTests), NativeRouteSelfTests.RunAsync);
         await RunAsync(nameof(WindowsVpnProfileInspectorLifetimeSelfTests), WindowsVpnProfileInspectorLifetimeSelfTests.RunAsync);
         await RunAsync(nameof(IcmpBoundPingSelfTests), IcmpBoundPingSelfTests.RunAsync);
+        await RunAsync(nameof(NativeCallbackRootRegistrySelfTests), NativeCallbackRootRegistrySelfTests.RunAsync);
         await RunAsync(nameof(RasDialerSelfTests), RasDialerSelfTests.RunAsync);
         await RunAsync(nameof(RasConnectionManagerCleanupFailureSelfTests), RasConnectionManagerCleanupFailureSelfTests.RunAsync);
         Run(nameof(RasReadyPublicationSelfTests), RasReadyPublicationSelfTests.Run);
@@ -122,7 +123,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, bounded-settings/secret-pruning, configuration-persistence/persisted-desired-state/GUI-topology-projection/GUI-command-generation-serialization/GUI-modal-ownership/application-shutdown-ordering, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation/desired-start-reconciliation/topology-recovery/generation-serialization/coordinator-cleanup/host-shutdown, Windows-profile-helper ownership, native-ICMP keepalive, cancellable-RAS-dial/manager-cleanup/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle/cleanup-failure, shared-VPN fail-closed/reconnect ownership, reconnect-cooldown maintenance, transactional proxy startup/rejected-cleanup/shutdown, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, bounded-settings/secret-pruning, configuration-persistence/persisted-desired-state/GUI-topology-projection/GUI-command-generation-serialization/GUI-modal-ownership/application-shutdown-ordering, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation/desired-start-reconciliation/topology-recovery/generation-serialization/coordinator-cleanup/host-shutdown, Windows-profile-helper ownership, native-ICMP keepalive/native-callback-root-churn, cancellable-RAS-dial/manager-cleanup/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle/cleanup-failure, shared-VPN fail-closed/reconnect ownership, reconnect-cooldown maintenance, transactional proxy startup/rejected-cleanup/shutdown, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
