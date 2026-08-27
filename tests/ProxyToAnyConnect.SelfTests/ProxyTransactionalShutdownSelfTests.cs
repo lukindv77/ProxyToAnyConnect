@@ -211,7 +211,7 @@ internal static class ProxyTransactionalShutdownSelfTests
         {
             try
             {
-                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                await Task.Delay(System.Threading.Timeout.InfiniteTimeSpan, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
