@@ -60,6 +60,7 @@ internal static class CombinedTestRunner
         await RunAsync(nameof(ProxyShutdownDrainSelfTests), ProxyShutdownDrainSelfTests.RunAsync);
         await RunAsync(nameof(AcceptedClientTransportSelfTests), AcceptedClientTransportSelfTests.RunAsync);
         await RunAsync(nameof(NativeRouteSelfTests), NativeRouteSelfTests.RunAsync);
+        await RunAsync(nameof(WindowsVpnProfileInspectorLifetimeSelfTests), WindowsVpnProfileInspectorLifetimeSelfTests.RunAsync);
         await RunAsync(nameof(IcmpBoundPingSelfTests), IcmpBoundPingSelfTests.RunAsync);
         await RunAsync(nameof(RasDialerSelfTests), RasDialerSelfTests.RunAsync);
         Run(nameof(RasReadyPublicationSelfTests), RasReadyPublicationSelfTests.Run);
@@ -108,7 +109,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, bounded-settings/secret-pruning, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation/generation-serialization/host-shutdown, native-ICMP keepalive, cancellable-RAS-dial/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle, shared-VPN fail-closed/reconnect ownership, reconnect-cooldown maintenance, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, bounded-settings/secret-pruning, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation/generation-serialization/host-shutdown, Windows-profile-helper ownership, native-ICMP keepalive, cancellable-RAS-dial/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle, shared-VPN fail-closed/reconnect ownership, reconnect-cooldown maintenance, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
