@@ -264,15 +264,46 @@ internal sealed partial class RasConnectionManager
 
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        var firstDispose = Interlocked.Exchange(ref _disposed, 1) == 0;
+        if (!firstDispose)
         {
+            // Disposal remains idempotent after successful teardown, but a previous
+            // failed RasHangUp intentionally retained the exact handle because the
+            // native state was not proven terminal. Allow later DisposeAsync calls to
+            // retry that residual ownership instead of stranding it until process exit.
+            if (Volatile.Read(ref _rasConnection) == 0)
+            {
+                return;
+            }
+
+            Exception? residualFailure = null;
+            try
+            {
+                await DisconnectAsync();
+            }
+            catch (Exception ex)
+            {
+                CaptureLifecycleCleanupFailure(ref residualFailure, ex, "disposed-residual-retry");
+            }
+
+            RethrowLifecycleCleanupFailure(residualFailure);
             return;
         }
 
         Exception? cleanupFailure = null;
         try
         {
-            _shutdown.Cancel();
+            try
+            {
+                _shutdown.Cancel();
+            }
+            catch (Exception ex)
+            {
+                // Cancellation callbacks are secondary teardown participants. A bad
+                // callback must not prevent exact RAS/monitor/context cleanup below.
+                CaptureLifecycleCleanupFailure(ref cleanupFailure, ex, "shutdown-cancel");
+            }
+
             try
             {
                 await DisconnectAsync();
