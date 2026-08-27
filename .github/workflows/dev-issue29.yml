@@ -21,20 +21,23 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Apply true paired-round ratio patch
+      - name: Apply paired-ratio and warmup-floor patch
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           @'
           from pathlib import Path
+          import re
 
-          old = '''        var optimizedMedian = Median(optimizedRounds);
+          WARMUP_FLOOR = 4096
+          old_pair = '''        var optimizedMedian = Median(optimizedRounds);
                   var predecessorMedian = Median(predecessorRounds);
                   return new TimingResult(
                       optimizedMedian,
                       predecessorMedian,
                       optimizedMedian / predecessorMedian);'''
-          new = '''        var pairedRatios = new double[TimingRounds];
+          new_pair = '''        var pairedRatios = new double[TimingRounds];
                   for (var round = 0; round < TimingRounds; round++)
                   {
                       pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
@@ -46,54 +49,83 @@ jobs:
                       optimizedMedian,
                       predecessorMedian,
                       Median(pairedRatios));'''
+          warmup_pattern = re.compile(r'private const int WarmupIterations = (\d+);')
 
-          changed = []
+          paired_changed = []
+          warmup_changed = []
+          relative_without_warmup = []
           for path in sorted(Path('tests').rglob('*.cs')):
               text = path.read_text(encoding='utf-8')
-              if old not in text:
-                  continue
-              if text.count(old) != 1:
-                  raise SystemExit(f'unexpected paired helper count in {path}: {text.count(old)}')
-              if 'double Ratio);' not in text or '.Ratio' not in text:
-                  raise SystemExit(f'{path} does not expose the expected TimingResult Ratio contract')
-              text = text.replace(old, new)
-              text = text.replace('double Ratio);', 'double PairedRatioMedian);')
-              text = text.replace('.Ratio', '.PairedRatioMedian')
-              path.write_text(text, encoding='utf-8', newline='')
-              changed.append(str(path).replace('\\', '/'))
+              original = text
 
-          if not changed:
+              if old_pair in text:
+                  if text.count(old_pair) != 1:
+                      raise SystemExit(f'unexpected paired helper count in {path}: {text.count(old_pair)}')
+                  if 'double Ratio);' not in text or '.Ratio' not in text:
+                      raise SystemExit(f'{path} does not expose the expected TimingResult Ratio contract')
+                  text = text.replace(old_pair, new_pair)
+                  text = text.replace('double Ratio);', 'double PairedRatioMedian);')
+                  text = text.replace('.Ratio', '.PairedRatioMedian')
+                  paired_changed.append(str(path).replace('\\', '/'))
+
+              if 'MaxMedianSlowdownRatio' in text:
+                  match = warmup_pattern.search(text)
+                  if match is None:
+                      relative_without_warmup.append(str(path).replace('\\', '/'))
+                  else:
+                      current = int(match.group(1))
+                      if current < WARMUP_FLOOR:
+                          text = text[:match.start(1)] + str(WARMUP_FLOOR) + text[match.end(1):]
+                          warmup_changed.append(f'{str(path).replace("\\\\", "/")}: {current} -> {WARMUP_FLOOR}')
+
+              if text != original:
+                  path.write_text(text, encoding='utf-8', newline='')
+
+          if not paired_changed:
               raise SystemExit('no ratio-of-independent-medians MeasurePaired helpers were found')
-          print(f'paired-round migrated files ({len(changed)}):')
-          for item in changed:
+          if not warmup_changed:
+              raise SystemExit('no relative timing gate required the audited warmup floor')
+          if relative_without_warmup:
+              raise SystemExit('relative timing gates missing WarmupIterations: ' + ', '.join(relative_without_warmup))
+
+          print(f'paired-round migrated files ({len(paired_changed)}):')
+          for item in paired_changed:
               print(f'  {item}')
-          Path('.issue29-changed.txt').write_text('\n'.join(changed) + '\n', encoding='utf-8')
+          print(f'warmup-floor migrated gates ({len(warmup_changed)}):')
+          for item in warmup_changed:
+              print(f'  {item}')
           '@ | python -
           git diff --check
-          Get-Content .issue29-changed.txt | Write-Host
+          git diff --stat
       - name: Run full aggregate self-tests
         shell: pwsh
-        run: dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
 
   publish:
     needs: validate
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Apply audited paired-round ratio patch
+      - name: Apply audited paired-ratio and warmup-floor patch
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           @'
           from pathlib import Path
+          import re
 
-          old = '''        var optimizedMedian = Median(optimizedRounds);
+          WARMUP_FLOOR = 4096
+          old_pair = '''        var optimizedMedian = Median(optimizedRounds);
                   var predecessorMedian = Median(predecessorRounds);
                   return new TimingResult(
                       optimizedMedian,
                       predecessorMedian,
                       optimizedMedian / predecessorMedian);'''
-          new = '''        var pairedRatios = new double[TimingRounds];
+          new_pair = '''        var pairedRatios = new double[TimingRounds];
                   for (var round = 0; round < TimingRounds; round++)
                   {
                       pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
@@ -105,30 +137,49 @@ jobs:
                       optimizedMedian,
                       predecessorMedian,
                       Median(pairedRatios));'''
+          warmup_pattern = re.compile(r'private const int WarmupIterations = (\d+);')
 
-          changed = []
+          paired_changed = []
+          warmup_changed = []
+          relative_without_warmup = []
           for path in sorted(Path('tests').rglob('*.cs')):
               text = path.read_text(encoding='utf-8')
-              if old not in text:
-                  continue
-              if text.count(old) != 1 or 'double Ratio);' not in text or '.Ratio' not in text:
-                  raise SystemExit(f'unexpected paired TimingResult contract in {path}')
-              text = text.replace(old, new)
-              text = text.replace('double Ratio);', 'double PairedRatioMedian);')
-              text = text.replace('.Ratio', '.PairedRatioMedian')
-              path.write_text(text, encoding='utf-8', newline='')
-              changed.append(str(path).replace('\\', '/'))
-          if not changed:
-              raise SystemExit('no paired timing helpers were migrated')
-          print('\n'.join(changed))
+              original = text
+
+              if old_pair in text:
+                  if text.count(old_pair) != 1 or 'double Ratio);' not in text or '.Ratio' not in text:
+                      raise SystemExit(f'unexpected paired TimingResult contract in {path}')
+                  text = text.replace(old_pair, new_pair)
+                  text = text.replace('double Ratio);', 'double PairedRatioMedian);')
+                  text = text.replace('.Ratio', '.PairedRatioMedian')
+                  paired_changed.append(str(path).replace('\\', '/'))
+
+              if 'MaxMedianSlowdownRatio' in text:
+                  match = warmup_pattern.search(text)
+                  if match is None:
+                      relative_without_warmup.append(str(path).replace('\\', '/'))
+                  else:
+                      current = int(match.group(1))
+                      if current < WARMUP_FLOOR:
+                          text = text[:match.start(1)] + str(WARMUP_FLOOR) + text[match.end(1):]
+                          warmup_changed.append(str(path).replace('\\', '/'))
+
+              if text != original:
+                  path.write_text(text, encoding='utf-8', newline='')
+
+          if not paired_changed or not warmup_changed:
+              raise SystemExit('paired/warmup audit did not produce both required migration classes')
+          if relative_without_warmup:
+              raise SystemExit('relative timing gates missing WarmupIterations: ' + ', '.join(relative_without_warmup))
+          print(f'paired={len(paired_changed)} warmup={len(warmup_changed)}')
           '@ | python -
           git diff --check
           $changed = @(git diff --name-only)
           if ($changed.Count -lt 2) {
-            throw "Expected a broad paired-gate audit, changed only: $($changed -join ', ')"
+            throw "Expected broad performance-gate audit, changed only: $($changed -join ', ')"
           }
           git config user.name 'ProxyToAnyConnect CI'
           git config user.email 'actions@github.com'
           git add tests
-          git commit -m 'test: gate performance on paired-round ratios'
+          git commit -m 'test: stabilize paired performance gates'
           git push origin HEAD:refs/heads/dev/issue29-paired-ratios
