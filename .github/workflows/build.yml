@@ -131,11 +131,16 @@ jobs:
             -SampleIntervalSeconds 1 `
             -OutputDirectory $output | Write-Host
 
-          ./tools/Test-WindowsSoakEvidence.ps1 `
+          $soakValidation = ./tools/Test-WindowsSoakEvidence.ps1 `
             -OutputDirectory $output `
             -ExpectedExecutableSha256 $hash `
             -MinimumSamples 2 `
-            -MinimumObservedDurationSeconds 1 | Write-Host
+            -MinimumObservedDurationSeconds 1 | ConvertFrom-Json
+          if (-not $soakValidation.validated -or
+              $soakValidation.validationMemoryModel -ne 'streaming-o1') {
+            throw 'Soak evidence validator did not report streaming O(1) validation semantics.'
+          }
+          $soakValidation | ConvertTo-Json -Depth 4 | Write-Host
 
           # Prove the manifest covers result.json too. A copied bundle remains valid
           # until one manifested payload is altered, after which validation must fail.
@@ -185,10 +190,20 @@ jobs:
           }
           $memoryEntry | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $memoryLog -Encoding utf8
 
-          ./tools/Test-WindowsSoakLogCorrelation.ps1 `
+          $correlation = ./tools/Test-WindowsSoakLogCorrelation.ps1 `
             -OutputDirectory $output `
+            -ExpectedExecutableSha256 $hash `
             -ApplicationLogPath $memoryLog `
-            -MinimumMemoryRecords 1 | Write-Host
+            -MinimumSoakSamples 2 `
+            -MinimumObservedDurationSeconds 1 `
+            -MinimumMemoryRecords 1 | ConvertFrom-Json
+          if (-not $correlation.correlated -or
+              -not $correlation.bundleValidated -or
+              $correlation.executableSha256 -ne $hash -or
+              $correlation.validationMemoryModel -ne 'streaming-o1') {
+            throw 'Soak/log correlation did not enforce exact sealed-bundle streaming semantics.'
+          }
+          $correlation | ConvertTo-Json -Depth 4 | Write-Host
 
           $wrongIdentityLog = './artifacts/windows-soak-memory-wrong-identity.jsonl'
           $wrongIdentityEntry = Get-Content -LiteralPath $memoryLog -Raw | ConvertFrom-Json
@@ -198,7 +213,10 @@ jobs:
           try {
             ./tools/Test-WindowsSoakLogCorrelation.ps1 `
               -OutputDirectory $output `
+              -ExpectedExecutableSha256 $hash `
               -ApplicationLogPath $wrongIdentityLog `
+              -MinimumSoakSamples 2 `
+              -MinimumObservedDurationSeconds 1 `
               -MinimumMemoryRecords 1 | Out-Null
           }
           catch {
@@ -207,6 +225,27 @@ jobs:
           }
           if (-not $identityMismatchRejected) {
             throw 'Soak/log correlation accepted managed-memory records from a different process identity.'
+          }
+
+          # Correlation itself must validate the sealed external bundle. Reusing the
+          # good memory record with a post-manifest-mutated bundle must fail before
+          # any process-memory conclusion is produced.
+          $tamperedCorrelationRejected = $false
+          try {
+            ./tools/Test-WindowsSoakLogCorrelation.ps1 `
+              -OutputDirectory $tamperedOutput `
+              -ExpectedExecutableSha256 $hash `
+              -ApplicationLogPath $memoryLog `
+              -MinimumSoakSamples 2 `
+              -MinimumObservedDurationSeconds 1 `
+              -MinimumMemoryRecords 1 | Out-Null
+          }
+          catch {
+            $tamperedCorrelationRejected = $true
+            Write-Host "PASS: correlation rejected tampered soak bundle: $($_.Exception.Message)"
+          }
+          if (-not $tamperedCorrelationRejected) {
+            throw 'Soak/log correlation trusted a tampered external evidence bundle.'
           }
 
       - name: Setup .NET 10
