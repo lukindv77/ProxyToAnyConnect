@@ -29,6 +29,7 @@ internal sealed class MainForm : Form
     private readonly Label _configurationStatus = new() { AutoSize = true };
 
     private AppOptions _options;
+    private string? _draftConfigurationError;
     private bool _allowExit;
     private int _configurationCommandsStopping;
 
@@ -284,9 +285,11 @@ internal sealed class MainForm : Form
         SetLabelText(_effectiveLogPath, AppLog.LogRootDirectory ?? AppContext.BaseDirectory);
         SetLabelText(
             _configurationStatus,
-            string.IsNullOrWhiteSpace(_runtimeHost.ConfigurationError)
-                ? "Конфигурация runtime: OK"
-                : $"Конфигурация runtime: {_runtimeHost.ConfigurationError}");
+            !string.IsNullOrWhiteSpace(_draftConfigurationError)
+                ? $"Черновик настроек не сохранён: {_draftConfigurationError}"
+                : string.IsNullOrWhiteSpace(_runtimeHost.ConfigurationError)
+                    ? "Конфигурация runtime: OK"
+                    : $"Конфигурация runtime: {_runtimeHost.ConfigurationError}");
     }
 
     private void RefreshProxyGrid()
@@ -620,51 +623,100 @@ internal sealed class MainForm : Form
         }, cancellationToken);
     }
 
-    private async Task ApplyConfigurationAsync(
+    private Task ApplyConfigurationAsync(
         AppOptions newOptions,
+        CancellationToken cancellationToken) =>
+        CommitConfigurationDraftAsync(
+            newOptions,
+            (desired, operationToken) => _runtimeHost.ApplyOptionsAsync(desired, operationToken),
+            "Настройки сохранены, runtime не применён",
+            cancellationToken);
+
+    private async Task CommitConfigurationDraftAsync(
+        AppOptions newOptions,
+        Func<AppOptions, CancellationToken, Task> applyPersistedAsync,
+        string persistedApplyFailureTitle,
         CancellationToken cancellationToken)
     {
         var persisted = false;
         try
         {
-            await PersistedDesiredConfiguration.SaveThenApplyAsync(
+            var result = await EditableConfigurationWorkflow.StageValidateSaveApplyAsync(
                 newOptions,
+                StageConfigurationDraft,
                 (desired, operationToken) => desired.SaveAsync(_configPath, operationToken),
                 desired =>
                 {
                     _options = desired;
                     RebuildVpnNameIndex();
+                    _draftConfigurationError = null;
                     persisted = true;
                 },
-                (desired, operationToken) => _runtimeHost.ApplyOptionsAsync(desired, operationToken),
+                applyPersistedAsync,
                 cancellationToken);
+
+            if (!result.IsGloballyValid)
+            {
+                _draftConfigurationError = result.ValidationError ?? "Конфигурация содержит ошибку.";
+                if (Volatile.Read(ref _configurationCommandsStopping) == 0)
+                {
+                    RefreshRuntimeViews();
+                    RefreshLoggingSettings();
+                    MessageBox.Show(
+                        this,
+                        "Правка сохранена в черновике окна, но файл и runtime не изменены, потому что в конфигурации остаётся ошибка:\n\n" +
+                        _draftConfigurationError,
+                        "Черновик настроек требует дальнейшего исправления",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+                return;
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Exit cancellation may arrive before publication or after durable save.
-            // In the latter case the persisted desired state remains authoritative and
-            // will be reconciled on the next application start.
+            // Exit cancellation may arrive after staging but before persistence. Such
+            // an unsaved draft is intentionally process-local and is never written as
+            // invalid/partial config merely to survive application shutdown. If the
+            // durable publication already happened, that persisted generation remains
+            // authoritative and will reconcile on next start.
         }
         catch (Exception ex)
         {
-            MessageBox.Show(
-                this,
-                ex.Message,
-                persisted
-                    ? "Настройки сохранены, runtime не применён"
-                    : "Не удалось применить настройки",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+            if (!persisted)
+            {
+                // Staging happened before validation/save by design. Preserve the
+                // operator's latest complete editor result in-memory even when durable
+                // IO fails, so a retry or another repair starts from that exact draft.
+                _draftConfigurationError = ex.Message;
+            }
+
+            if (Volatile.Read(ref _configurationCommandsStopping) == 0)
+            {
+                MessageBox.Show(
+                    this,
+                    ex.Message,
+                    persisted
+                        ? persistedApplyFailureTitle
+                        : "Черновик настроек не удалось сохранить",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
         }
         finally
         {
-            if (persisted && Volatile.Read(ref _configurationCommandsStopping) == 0)
+            if (Volatile.Read(ref _configurationCommandsStopping) == 0)
             {
-                // Show the persisted desired settings through subsequent editors and
-                // refresh current runtime/Error state even when reconciliation failed.
                 RefreshRuntimeViews();
+                RefreshLoggingSettings();
             }
         }
+    }
+
+    private void StageConfigurationDraft(AppOptions desired)
+    {
+        _options = desired;
+        RebuildVpnNameIndex();
     }
 
     private void BrowseLogDirectory(object? sender, EventArgs e)
@@ -684,14 +736,14 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async Task SaveLoggingSettingsAsync(
+    private Task SaveLoggingSettingsAsync(
         LoggingOptions newLogging,
         CancellationToken cancellationToken)
     {
         // This method runs only inside the serialized configuration command queue.
-        // Merge the captured log request with the latest persisted desired topology
-        // so an earlier proxy/VPN generation cannot be overwritten by a stale full
-        // AppOptions snapshot from a later log-only save.
+        // Merge the captured log request with the latest staged topology, not merely
+        // the last durable generation. This preserves earlier repairs when a legacy
+        // loaded config still contains another defect and cannot yet be persisted.
         var newOptions = new AppOptions
         {
             Proxies = _options.Proxies,
@@ -699,23 +751,15 @@ internal sealed class MainForm : Form
             Logging = newLogging
         };
 
-        try
-        {
-            await newOptions.SaveAsync(_configPath, cancellationToken);
-            _options = newOptions;
-            AppLog.Configure(newLogging);
-            if (Volatile.Read(ref _configurationCommandsStopping) == 0)
+        return CommitConfigurationDraftAsync(
+            newOptions,
+            (desired, _) =>
             {
-                RefreshLoggingSettings();
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, ex.Message, "Не удалось сохранить настройки", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
+                AppLog.Configure(desired.Logging);
+                return Task.CompletedTask;
+            },
+            "Настройки логов сохранены, но не применены",
+            cancellationToken);
     }
 
     private void RefreshLoggingSettings()
