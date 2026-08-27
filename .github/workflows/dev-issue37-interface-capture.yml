@@ -59,11 +59,12 @@ jobs:
 
           foreach ($stage in @('baseline', 'ready', 'final')) {
             $evidence = Get-Content -LiteralPath (Join-Path (Join-Path $output $stage) 'evidence.json') -Raw | ConvertFrom-Json
-            $interfaces = @($evidence.captures | Where-Object name -eq 'interfaces')
-            if ($interfaces.Count -ne 1 -or -not $interfaces[0].succeeded) {
-              throw "Stage $stage did not produce a successful interface capture."
+            $interfaces = $evidence.interfaces
+            if ($null -eq $interfaces -or -not $interfaces.succeeded) {
+              $detail = if ($null -eq $interfaces) { 'missing interfaces capture' } else { [string]$interfaces.error }
+              throw "Stage $stage did not produce a successful interface capture: $detail"
             }
-            foreach ($item in @($interfaces[0].value)) {
+            foreach ($item in @($interfaces.value)) {
               foreach ($required in @('InterfaceAlias','InterfaceIndex','InterfaceDescription','NetProfileName','IPv4Address','IPv4DefaultGateway','DnsServers')) {
                 if ($null -eq $item.PSObject.Properties[$required]) {
                   throw "Stage $stage interface snapshot omitted '$required'."
