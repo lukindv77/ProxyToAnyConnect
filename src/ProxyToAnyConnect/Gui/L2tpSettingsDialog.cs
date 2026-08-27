@@ -11,6 +11,8 @@ internal sealed class L2tpSettingsDialog : Form
     private readonly L2tpOptions? _existing;
     private readonly WindowsVpnProfileInspector _profileInspector = new();
     private CancellationTokenSource? _profileLoadCancellation;
+    private Task _profileLoadTask = Task.CompletedTask;
+    private int _profileLoadStopping;
     private L2tpOptions? _acceptedResult;
 
     private readonly TextBox _name = new() { Dock = DockStyle.Fill };
@@ -149,8 +151,8 @@ internal sealed class L2tpSettingsDialog : Form
         _keepaliveMode.SelectedIndexChanged += (_, _) => RefreshKeepaliveVisibility();
         _ipsecAuth.SelectedIndexChanged += (_, _) => RefreshCustomAuthVisibility();
         _useWindowsCredentials.CheckedChanged += (_, _) => RefreshCredentialVisibility();
-        _refreshProfiles.Click += async (_, _) => await LoadWindowsProfilesAsync();
-        Shown += async (_, _) => await LoadWindowsProfilesAsync();
+        _refreshProfiles.Click += (_, _) => StartWindowsProfileLoad();
+        Shown += (_, _) => StartWindowsProfileLoad();
         FormClosed += (_, _) =>
         {
             CancelProfileLoad();
@@ -165,6 +167,19 @@ internal sealed class L2tpSettingsDialog : Form
     }
 
     public L2tpOptions Result => _acceptedResult ?? BuildResult();
+
+    internal async Task StopBackgroundOperationsAsync()
+    {
+        Interlocked.Exchange(ref _profileLoadStopping, 1);
+        CancelProfileLoad();
+
+        // StartWindowsProfileLoad stores the exact task synchronously before control
+        // returns to the WinForms message loop. Awaiting the current task therefore
+        // drains the helper process/redirected streams owned by this dialog before
+        // MainForm lets the enclosing configuration generation complete.
+        var task = Volatile.Read(ref _profileLoadTask);
+        await task.ConfigureAwait(true);
+    }
 
     private L2tpOptions BuildResult()
     {
@@ -386,9 +401,24 @@ internal sealed class L2tpSettingsDialog : Form
         _allowMsChapV2.Checked = existing?.Custom.AllowMsChapV2 ?? true;
     }
 
+    private void StartWindowsProfileLoad()
+    {
+        if (Volatile.Read(ref _profileLoadStopping) != 0)
+        {
+            return;
+        }
+
+        // LoadWindowsProfilesAsync disables the refresh button before its first
+        // asynchronous yield, so WinForms cannot admit overlapping refresh clicks.
+        // Store its exact task immediately so close/Exit can cancel and drain it.
+        var task = LoadWindowsProfilesAsync();
+        Volatile.Write(ref _profileLoadTask, task);
+    }
+
     private async Task LoadWindowsProfilesAsync()
     {
-        if (SelectedEnum<L2tpConnectionMode>(_mode) != L2tpConnectionMode.ExistingWindowsProfile ||
+        if (Volatile.Read(ref _profileLoadStopping) != 0 ||
+            SelectedEnum<L2tpConnectionMode>(_mode) != L2tpConnectionMode.ExistingWindowsProfile ||
             IsDisposed || Disposing)
         {
             return;
@@ -440,8 +470,10 @@ internal sealed class L2tpSettingsDialog : Form
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
-            // Closing the dialog, switching mode or starting a newer refresh owns
-            // cancellation. Do not turn expected UI lifecycle into a visible error.
+            // Closing the dialog, switching mode or application Exit owns
+            // cancellation. WindowsVpnProfileInspector drains its process tree before
+            // propagating cancellation, and StopBackgroundOperationsAsync awaits this
+            // exact task before the dialog's configuration generation may finish.
         }
         catch (Exception ex)
         {
@@ -455,7 +487,9 @@ internal sealed class L2tpSettingsDialog : Form
             if (ReferenceEquals(_profileLoadCancellation, cancellation))
             {
                 _profileLoadCancellation = null;
-                if (!IsDisposed && !Disposing)
+                if (!IsDisposed &&
+                    !Disposing &&
+                    Volatile.Read(ref _profileLoadStopping) == 0)
                 {
                     _refreshProfiles.Enabled = true;
                 }
@@ -468,6 +502,7 @@ internal sealed class L2tpSettingsDialog : Form
     private bool OwnsProfileLoad(CancellationTokenSource cancellation) =>
         ReferenceEquals(_profileLoadCancellation, cancellation) &&
         !cancellation.IsCancellationRequested &&
+        Volatile.Read(ref _profileLoadStopping) == 0 &&
         !IsDisposed &&
         !Disposing &&
         SelectedEnum<L2tpConnectionMode>(_mode) == L2tpConnectionMode.ExistingWindowsProfile;
@@ -640,8 +675,9 @@ internal sealed class L2tpSettingsDialog : Form
     private static TEnum SelectedEnum<TEnum>(ComboBox combo) where TEnum : struct, Enum =>
         combo.SelectedItem is TEnum value ? value : default;
 
-    private static void SelectEnum<TEnum>(ComboBox combo, TEnum value) where TEnum : struct, Enum
+    private static void SelectEnum<TEnum>(ComboBox combo, TEnum value)
     {
+        where TEnum : struct, Enum
         for (var index = 0; index < combo.Items.Count; index++)
         {
             if (combo.Items[index] is TEnum candidate && EqualityComparer<TEnum>.Default.Equals(candidate, value))
