@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Apply and verify issue 49 patch
+      - name: Apply and verify issues 49 and 50 patch
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -28,8 +28,8 @@ jobs:
           $expectedBase = '2e56f8f76efda9047ec83f3cd0e58aee395de322'
           git merge-base --is-ancestor $expectedBase HEAD
 
-          if ((git rev-parse HEAD:.github/validation/issue49.patch).Trim() -ne 'd3f446cbcc424d88c3025387cb33420aa3280c1a') {
-            throw 'Unexpected issue49 patch blob.'
+          if ((git rev-parse HEAD:.github/validation/issue49.patch).Trim() -ne 'fb9bfa2328cbd352b10514e975b1a0c809873974') {
+            throw 'Unexpected issue49/50 patch blob.'
           }
 
           $expectedBlobs = [ordered]@{
@@ -53,7 +53,7 @@ jobs:
           git diff --cached --check
           $staged = @(git diff --cached --name-only | Sort-Object)
           if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
-            throw "Unexpected #49 staged surface: $($staged -join ', ')"
+            throw "Unexpected #49/#50 staged surface: $($staged -join ', ')"
           }
       - name: Full aggregate self-tests
         shell: pwsh
@@ -61,12 +61,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
-      - name: Publish validated issue 49 source
+      - name: Publish validated verification source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'verification: reject unsafe or lossy probe targets'
+          git commit -m 'verification: canonicalize and validate probe wire inputs'
           git push origin HEAD:dev/issue49-probe-target
