@@ -1,0 +1,118 @@
+name: dev-issue32
+
+on:
+  push:
+    branches: [ dev/issue32-connect-port ]
+    paths:
+      - '.github/workflows/dev-issue32.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply ASCII-decimal port parser and run isolated suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          from pathlib import Path
+
+          proxy = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = proxy.read_text(encoding='utf-8')
+          old = '''        var host = separator < 0 ? authority : authority[..separator];
+                  var port = defaultPort;
+                  if (separator >= 0 &&
+                      (!int.TryParse(authority[(separator + 1)..], out port) || port is < 1 or > 65535))
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                  }
+          '''
+          new = '''        var host = separator < 0 ? authority : authority[..separator];
+                  var port = defaultPort;
+                  if (separator >= 0 && !TryParseConnectPort(authority.AsSpan(separator + 1), out port))
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                  }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one CONNECT port parser block, got {text.count(old)}')
+          text = text.replace(old, new)
+          marker = '''        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.", ex);
+                  }
+              }
+
+              private static Uri ParseAbsoluteHttpUri'''
+          replacement = '''        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.", ex);
+                  }
+              }
+
+              private static bool TryParseConnectPort(ReadOnlySpan<char> value, out int port)
+              {
+                  port = 0;
+                  if (value.IsEmpty)
+                  {
+                      return false;
+                  }
+
+                  var parsed = 0;
+                  foreach (var character in value)
+                  {
+                      if (character is < '0' or > '9')
+                      {
+                          return false;
+                      }
+
+                      parsed = parsed * 10 + (character - '0');
+                      if (parsed > 65535)
+                      {
+                          return false;
+                      }
+                  }
+
+                  if (parsed == 0)
+                  {
+                      return false;
+                  }
+
+                  port = parsed;
+                  return true;
+              }
+
+              private static Uri ParseAbsoluteHttpUri'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'expected one CONNECT port helper insertion marker, got {text.count(marker)}')
+          proxy.write_text(text.replace(marker, replacement), encoding='utf-8', newline='')
+          '@ | python -
+          git diff --check
+
+          $runner = 'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          @'
+          namespace ProxyToAnyConnect.SelfTests;
+
+          internal static class CombinedTestRunner
+          {
+              public static async Task<int> Main() =>
+                  await ProxyConnectPortGrammarSelfTests.RunAsync();
+          }
+          '@ | Set-Content -LiteralPath $runner -Encoding utf8
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+          git checkout -- $runner
+          git diff --check
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add src/ProxyToAnyConnect/Proxy/ProxyServer.cs
+          git commit -m 'proxy: enforce ASCII-decimal CONNECT ports'
+          git push origin HEAD:refs/heads/dev/issue32-connect-port
