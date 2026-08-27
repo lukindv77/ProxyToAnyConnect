@@ -22,7 +22,8 @@ jobs:
             './tools/Test-WindowsIntegrationEvidence.ps1',
             './tools/Complete-WindowsIntegrationEvidence.ps1',
             './tools/Invoke-WindowsSoakEvidence.ps1',
-            './tools/Test-WindowsSoakEvidence.ps1'
+            './tools/Test-WindowsSoakEvidence.ps1',
+            './tools/Test-WindowsSoakLogCorrelation.ps1'
           )
           foreach ($toolPath in $toolPaths) {
             $tokens = $null
@@ -155,6 +156,57 @@ jobs:
           }
           if (-not $tamperRejected) {
             throw 'Soak evidence validator accepted a post-manifest result.json mutation.'
+          }
+
+          # Correlate a schema-faithful managed-memory log record with the exact
+          # external soak PID/start-time identity. Production emits these fields from
+          # ProcessMemoryHealthMonitor; the smoke avoids launching the GUI/VPN stack.
+          $metadata = Get-Content -LiteralPath (Join-Path $output 'metadata.json') -Raw | ConvertFrom-Json
+          $memoryLog = './artifacts/windows-soak-memory-smoke.jsonl'
+          $memoryEntry = [ordered]@{
+            TimestampUtc = ([DateTimeOffset]::Parse([string]$metadata.startedAtUtc)).AddMilliseconds(500).ToString('O')
+            Level = 'Information'
+            Event = 'process.memory.periodic'
+            Message = 'synthetic hosted correlation smoke'
+            Data = [ordered]@{
+              ProcessId = [int]$metadata.processId
+              ProcessStartTimeUtc = [string]$metadata.processStartTimeUtc
+              ManagedHeapBytes = 1
+              TotalAllocatedBytes = 2
+              WorkingSetBytes = 3
+              PrivateBytes = 4
+              Gen0Collections = 0
+              Gen1Collections = 0
+              Gen2Collections = 0
+              HandleCount = 5
+              ThreadCount = 6
+            }
+            Exception = $null
+          }
+          $memoryEntry | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $memoryLog -Encoding utf8
+
+          ./tools/Test-WindowsSoakLogCorrelation.ps1 `
+            -OutputDirectory $output `
+            -ApplicationLogPath $memoryLog `
+            -MinimumMemoryRecords 1 | Write-Host
+
+          $wrongIdentityLog = './artifacts/windows-soak-memory-wrong-identity.jsonl'
+          $wrongIdentityEntry = Get-Content -LiteralPath $memoryLog -Raw | ConvertFrom-Json
+          $wrongIdentityEntry.Data.ProcessId = [int]$metadata.processId + 1
+          $wrongIdentityEntry | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $wrongIdentityLog -Encoding utf8
+          $identityMismatchRejected = $false
+          try {
+            ./tools/Test-WindowsSoakLogCorrelation.ps1 `
+              -OutputDirectory $output `
+              -ApplicationLogPath $wrongIdentityLog `
+              -MinimumMemoryRecords 1 | Out-Null
+          }
+          catch {
+            $identityMismatchRejected = $true
+            Write-Host "PASS: wrong managed-memory process identity rejected: $($_.Exception.Message)"
+          }
+          if (-not $identityMismatchRejected) {
+            throw 'Soak/log correlation accepted managed-memory records from a different process identity.'
           }
 
       - name: Setup .NET 10
