@@ -21,7 +21,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Apply paired-ratio and warmup-floor patch
+      - name: Apply stable relative-timing contract
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -31,6 +31,8 @@ jobs:
           import re
 
           WARMUP_FLOOR = 4096
+          ROUND_FLOOR = 15
+          ITERATION_FLOOR = 16384
           old_pair = '''        var optimizedMedian = Median(optimizedRounds);
                   var predecessorMedian = Median(predecessorRounds);
                   return new TimingResult(
@@ -49,50 +51,57 @@ jobs:
                       optimizedMedian,
                       predecessorMedian,
                       Median(pairedRatios));'''
-          warmup_pattern = re.compile(r'private const int WarmupIterations = (\d+);')
+          patterns = {
+              'warmup': (re.compile(r'private const int WarmupIterations = (\d+);'), WARMUP_FLOOR),
+              'rounds': (re.compile(r'private const int TimingRounds = (\d+);'), ROUND_FLOOR),
+              'iterations': (re.compile(r'private const int IterationsPerRound = (\d+);'), ITERATION_FLOOR),
+          }
 
           paired_changed = []
-          warmup_changed = []
-          relative_without_warmup = []
+          floor_changes = []
+          missing_sampling = []
           for path in sorted(Path('tests').rglob('*.cs')):
               text = path.read_text(encoding='utf-8')
               original = text
+              display = str(path).replace(chr(92), '/')
 
               if old_pair in text:
-                  if text.count(old_pair) != 1:
-                      raise SystemExit(f'unexpected paired helper count in {path}: {text.count(old_pair)}')
-                  if 'double Ratio);' not in text or '.Ratio' not in text:
-                      raise SystemExit(f'{path} does not expose the expected TimingResult Ratio contract')
+                  if text.count(old_pair) != 1 or 'double Ratio);' not in text or '.Ratio' not in text:
+                      raise SystemExit(f'unexpected paired TimingResult contract in {display}')
                   text = text.replace(old_pair, new_pair)
                   text = text.replace('double Ratio);', 'double PairedRatioMedian);')
                   text = text.replace('.Ratio', '.PairedRatioMedian')
-                  paired_changed.append(str(path).replace('\\', '/'))
+                  paired_changed.append(display)
 
               if 'MaxMedianSlowdownRatio' in text:
-                  match = warmup_pattern.search(text)
-                  if match is None:
-                      relative_without_warmup.append(str(path).replace('\\', '/'))
-                  else:
+                  missing = []
+                  for name, (pattern, floor) in patterns.items():
+                      match = pattern.search(text)
+                      if match is None:
+                          missing.append(name)
+                          continue
                       current = int(match.group(1))
-                      if current < WARMUP_FLOOR:
-                          text = text[:match.start(1)] + str(WARMUP_FLOOR) + text[match.end(1):]
-                          warmup_changed.append(f'{str(path).replace("\\\\", "/")}: {current} -> {WARMUP_FLOOR}')
+                      if current < floor:
+                          text = text[:match.start(1)] + str(floor) + text[match.end(1):]
+                          floor_changes.append(f'{display}: {name} {current} -> {floor}')
+                  if missing:
+                      missing_sampling.append(f'{display}: {",".join(missing)}')
 
               if text != original:
                   path.write_text(text, encoding='utf-8', newline='')
 
           if not paired_changed:
               raise SystemExit('no ratio-of-independent-medians MeasurePaired helpers were found')
-          if not warmup_changed:
-              raise SystemExit('no relative timing gate required the audited warmup floor')
-          if relative_without_warmup:
-              raise SystemExit('relative timing gates missing WarmupIterations: ' + ', '.join(relative_without_warmup))
+          if not floor_changes:
+              raise SystemExit('no relative timing gate required sampling-floor migration')
+          if missing_sampling:
+              raise SystemExit('relative timing gates missing sampling constants: ' + '; '.join(missing_sampling))
 
           print(f'paired-round migrated files ({len(paired_changed)}):')
           for item in paired_changed:
               print(f'  {item}')
-          print(f'warmup-floor migrated gates ({len(warmup_changed)}):')
-          for item in warmup_changed:
+          print(f'sampling-floor changes ({len(floor_changes)}):')
+          for item in floor_changes:
               print(f'  {item}')
           '@ | python -
           git diff --check
@@ -109,7 +118,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Apply audited paired-ratio and warmup-floor patch
+      - name: Apply audited stable relative-timing contract
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -119,6 +128,8 @@ jobs:
           import re
 
           WARMUP_FLOOR = 4096
+          ROUND_FLOOR = 15
+          ITERATION_FLOOR = 16384
           old_pair = '''        var optimizedMedian = Median(optimizedRounds);
                   var predecessorMedian = Median(predecessorRounds);
                   return new TimingResult(
@@ -137,41 +148,50 @@ jobs:
                       optimizedMedian,
                       predecessorMedian,
                       Median(pairedRatios));'''
-          warmup_pattern = re.compile(r'private const int WarmupIterations = (\d+);')
+          patterns = {
+              'warmup': (re.compile(r'private const int WarmupIterations = (\d+);'), WARMUP_FLOOR),
+              'rounds': (re.compile(r'private const int TimingRounds = (\d+);'), ROUND_FLOOR),
+              'iterations': (re.compile(r'private const int IterationsPerRound = (\d+);'), ITERATION_FLOOR),
+          }
 
           paired_changed = []
-          warmup_changed = []
-          relative_without_warmup = []
+          floor_changes = []
+          missing_sampling = []
           for path in sorted(Path('tests').rglob('*.cs')):
               text = path.read_text(encoding='utf-8')
               original = text
+              display = str(path).replace(chr(92), '/')
 
               if old_pair in text:
                   if text.count(old_pair) != 1 or 'double Ratio);' not in text or '.Ratio' not in text:
-                      raise SystemExit(f'unexpected paired TimingResult contract in {path}')
+                      raise SystemExit(f'unexpected paired TimingResult contract in {display}')
                   text = text.replace(old_pair, new_pair)
                   text = text.replace('double Ratio);', 'double PairedRatioMedian);')
                   text = text.replace('.Ratio', '.PairedRatioMedian')
-                  paired_changed.append(str(path).replace('\\', '/'))
+                  paired_changed.append(display)
 
               if 'MaxMedianSlowdownRatio' in text:
-                  match = warmup_pattern.search(text)
-                  if match is None:
-                      relative_without_warmup.append(str(path).replace('\\', '/'))
-                  else:
+                  missing = []
+                  for name, (pattern, floor) in patterns.items():
+                      match = pattern.search(text)
+                      if match is None:
+                          missing.append(name)
+                          continue
                       current = int(match.group(1))
-                      if current < WARMUP_FLOOR:
-                          text = text[:match.start(1)] + str(WARMUP_FLOOR) + text[match.end(1):]
-                          warmup_changed.append(str(path).replace('\\', '/'))
+                      if current < floor:
+                          text = text[:match.start(1)] + str(floor) + text[match.end(1):]
+                          floor_changes.append(f'{display}: {name} {current} -> {floor}')
+                  if missing:
+                      missing_sampling.append(f'{display}: {",".join(missing)}')
 
               if text != original:
                   path.write_text(text, encoding='utf-8', newline='')
 
-          if not paired_changed or not warmup_changed:
-              raise SystemExit('paired/warmup audit did not produce both required migration classes')
-          if relative_without_warmup:
-              raise SystemExit('relative timing gates missing WarmupIterations: ' + ', '.join(relative_without_warmup))
-          print(f'paired={len(paired_changed)} warmup={len(warmup_changed)}')
+          if not paired_changed or not floor_changes:
+              raise SystemExit('relative timing audit did not produce both required migration classes')
+          if missing_sampling:
+              raise SystemExit('relative timing gates missing sampling constants: ' + '; '.join(missing_sampling))
+          print(f'paired={len(paired_changed)} sampling={len(floor_changes)}')
           '@ | python -
           git diff --check
           $changed = @(git diff --name-only)
@@ -181,5 +201,5 @@ jobs:
           git config user.name 'ProxyToAnyConnect CI'
           git config user.email 'actions@github.com'
           git add tests
-          git commit -m 'test: stabilize paired performance gates'
+          git commit -m 'test: stabilize relative performance gates'
           git push origin HEAD:refs/heads/dev/issue29-paired-ratios
