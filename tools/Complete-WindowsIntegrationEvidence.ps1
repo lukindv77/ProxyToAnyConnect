@@ -53,6 +53,7 @@ function Read-StageBundle {
         Summary = $summary
         Manifest = $manifest
         EvidencePath = $evidencePath
+        SummaryPath = $summaryPath
         ManifestPath = $manifestPath
     }
 }
@@ -143,6 +144,23 @@ elseif ($RequireProxyHttpProbe) {
     throw '-RequireProxyHttpProbe also requires -RequireExternalProbes.'
 }
 
+function New-StageSummary {
+    param(
+        [Parameter(Mandatory = $true)] $Bundle
+    )
+
+    return [ordered]@{
+        evidencePath = $Bundle.EvidencePath
+        summaryPath = $Bundle.SummaryPath
+        manifestPath = $Bundle.ManifestPath
+        validatedFileCount = $Bundle.Manifest.fileCount
+        routeFingerprint = [string]$Bundle.Evidence.routeFingerprint
+        profileFingerprint = [string]$Bundle.Evidence.profileFingerprint
+        assertionCount = $Bundle.Summary.assertionCount
+        failedAssertionCount = $Bundle.Summary.failedAssertionCount
+    }
+}
+
 $acceptancePath = Join-Path $OutputDirectory 'acceptance-summary.json'
 $acceptance = [ordered]@{
     schemaVersion = 1
@@ -159,21 +177,9 @@ $acceptance = [ordered]@{
     proxyPublicIPv4 = $proxyPublicIPv4
     proxyHttpValidated = $proxyHttpValidated
     stages = [ordered]@{
-        Baseline = [ordered]@{
-            evidencePath = $baseline.EvidencePath
-            manifestPath = $baseline.ManifestPath
-            validatedFileCount = $baseline.Manifest.fileCount
-        }
-        Ready = [ordered]@{
-            evidencePath = $ready.EvidencePath
-            manifestPath = $ready.ManifestPath
-            validatedFileCount = $ready.Manifest.fileCount
-        }
-        Final = [ordered]@{
-            evidencePath = $final.EvidencePath
-            manifestPath = $final.ManifestPath
-            validatedFileCount = $final.Manifest.fileCount
-        }
+        Baseline = New-StageSummary -Bundle $baseline
+        Ready = New-StageSummary -Bundle $ready
+        Final = New-StageSummary -Bundle $final
     }
 }
 
