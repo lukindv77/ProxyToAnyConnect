@@ -1,0 +1,42 @@
+name: one-shot-proxy-control-serialization
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Serialize proxy control actions with configuration generations
+        shell: python
+        run: |
+          from pathlib import Path
+
+          main = Path('src/ProxyToAnyConnect/Gui/MainForm.cs')
+          text = main.read_text(encoding='utf-8')
+          old = '''    private async void ProxyGridOnCellContentClick(object? sender, DataGridViewCellEventArgs e)\n    {\n        var actionColumn = _proxyGrid.Columns["action"];\n        if (actionColumn is null || e.RowIndex < 0 || e.ColumnIndex != actionColumn.Index)\n        {\n            return;\n        }\n\n        if (_proxyGrid.Rows[e.RowIndex].Tag is not string proxyId)\n        {\n            return;\n        }\n\n        var view = RuntimeViewProjection.ProjectProxies(\n                _options.Proxies,\n                _runtimeHost.GetProxySnapshots(),\n                _runtimeHost.ConfigurationError)\n            .FirstOrDefault(item => item.Id.Equals(proxyId, StringComparison.OrdinalIgnoreCase));\n        if (!view.CanToggle)\n        {\n            return;\n        }\n\n        try\n        {\n            if (view.State is nameof(ProxyInstanceState.Running) or nameof(ProxyInstanceState.Starting))\n            {\n                await _runtimeHost.PauseProxyAsync(proxyId);\n            }\n            else\n            {\n                await _runtimeHost.StartProxyAsync(proxyId);\n            }\n        }\n        catch (Exception ex)\n        {\n            MessageBox.Show(this, ex.Message, "ProxyToAnyConnect", MessageBoxButtons.OK, MessageBoxIcon.Error);\n        }\n        finally\n        {\n            RefreshRuntimeViews();\n        }\n    }\n\n'''
+          new = '''    private async void ProxyGridOnCellContentClick(object? sender, DataGridViewCellEventArgs e)\n    {\n        var actionColumn = _proxyGrid.Columns["action"];\n        if (actionColumn is null || e.RowIndex < 0 || e.ColumnIndex != actionColumn.Index)\n        {\n            return;\n        }\n\n        if (_proxyGrid.Rows[e.RowIndex].Tag is not string proxyId)\n        {\n            return;\n        }\n\n        // Start/Pause is a GUI control generation just like Add/Edit/Remove. Queue it\n        // behind any earlier configuration transaction and recompute desired/runtime\n        // state only when its turn begins, so a stale row click cannot overtake a\n        // reconfigure or target a proxy that was removed by an earlier generation.\n        await RunConfigurationCommandAsync(\n            cancellationToken => ToggleProxyAsync(proxyId, cancellationToken));\n    }\n\n    private async Task ToggleProxyAsync(string proxyId, CancellationToken cancellationToken)\n    {\n        cancellationToken.ThrowIfCancellationRequested();\n        var view = RuntimeViewProjection.ProjectProxies(\n                _options.Proxies,\n                _runtimeHost.GetProxySnapshots(),\n                _runtimeHost.ConfigurationError)\n            .FirstOrDefault(item => item.Id.Equals(proxyId, StringComparison.OrdinalIgnoreCase));\n        if (!view.CanToggle)\n        {\n            return;\n        }\n\n        try\n        {\n            if (view.State is nameof(ProxyInstanceState.Running) or nameof(ProxyInstanceState.Starting))\n            {\n                await _runtimeHost.PauseProxyAsync(proxyId, cancellationToken);\n            }\n            else\n            {\n                await _runtimeHost.StartProxyAsync(proxyId, cancellationToken);\n            }\n        }\n        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)\n        {\n            throw;\n        }\n        catch (Exception ex)\n        {\n            if (Volatile.Read(ref _configurationCommandsStopping) == 0)\n            {\n                MessageBox.Show(this, ex.Message, "ProxyToAnyConnect", MessageBoxButtons.OK, MessageBoxIcon.Error);\n            }\n        }\n        finally\n        {\n            if (Volatile.Read(ref _configurationCommandsStopping) == 0)\n            {\n                RefreshRuntimeViews();\n            }\n        }\n    }\n\n'''
+          if text.count(old) != 1:
+              raise SystemExit('Expected ProxyGridOnCellContentClick fragment was not found exactly once.')
+          main.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+      - name: Commit source patch to review branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch='automation/proxy-control-serialization'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/ProxyToAnyConnect/Gui/MainForm.cs
+          git diff --cached --check
+          git commit -m 'fix: serialize proxy control actions with GUI configuration generations'
+          git push --force origin "HEAD:refs/heads/$branch"
