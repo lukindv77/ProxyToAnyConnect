@@ -56,6 +56,22 @@ internal sealed class ProxyApplicationContext : ApplicationContext
             {
                 await _runtimeHost.StartEnabledAsync();
             }
+            catch (OperationCanceledException) when (Volatile.Read(ref _exitStarted) != 0)
+            {
+                // Exit owns cancellation of any foreground startup operation. This
+                // is expected lifecycle control flow, not a runtime startup failure.
+                AppLog.Info(
+                    "runtime.start.cancelled_for_exit",
+                    "Runtime startup was cancelled because application exit began.");
+            }
+            catch (ObjectDisposedException) when (Volatile.Read(ref _exitStarted) != 0)
+            {
+                // The UI callback may begin after ExitApplicationAsync has already
+                // disposed the host. Treat the same startup-vs-exit race as normal.
+                AppLog.Info(
+                    "runtime.start.skipped_for_exit",
+                    "Runtime startup was skipped because application exit had already disposed the host.");
+            }
             catch (Exception ex)
             {
                 AppLog.Error("runtime.start.failed", "Runtime startup failed.", ex);
