@@ -48,6 +48,10 @@ jobs:
           git apply .github/validation/issue45.patch
           $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
           git add -- $expectedPaths
+          # The repository intentionally contains CRLF text files. Treat CR at EOL
+          # as line termination rather than trailing whitespace while retaining all
+          # other whitespace diagnostics.
+          git config core.whitespace cr-at-eol
           git diff --cached --check
           $staged = @(git diff --cached --name-only | Sort-Object)
           if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
