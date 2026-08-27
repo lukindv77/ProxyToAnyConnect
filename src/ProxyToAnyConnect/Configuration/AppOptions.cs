@@ -69,11 +69,6 @@ internal sealed class AppOptions
         var fullPath = Path.GetFullPath(path);
         var directory = Path.GetDirectoryName(fullPath) ?? AppContext.BaseDirectory;
         Directory.CreateDirectory(directory);
-
-        // Never share one fixed .tmp name between save generations. A cancelled or
-        // failed write owns only its unique sibling and can clean it without touching
-        // another foreground save. Keeping the temporary file in the destination
-        // directory also keeps the final replace on the same filesystem/volume.
         var temporaryPath = Path.Combine(
             directory,
             $".{Path.GetFileName(fullPath)}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
@@ -92,22 +87,22 @@ internal sealed class AppOptions
                 await stream.FlushAsync(cancellationToken);
             }
 
-            // Cancellation before this publication boundary must leave the previous
-            // complete configuration untouched. After this point the synchronous
-            // same-volume rename owns publication and is intentionally not aborted.
+            // Cancellation before publication leaves the previous complete
+            // generation untouched. The same-volume rename is intentionally a
+            // synchronous atomic ownership boundary once it begins.
             cancellationToken.ThrowIfCancellationRequested();
             File.Move(temporaryPath, fullPath, overwrite: true);
         }
         finally
         {
-            // Best effort only: never replace the primary serialization/move error
-            // with a secondary stale-temp cleanup failure.
             try
             {
                 File.Delete(temporaryPath);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
+                // Never replace the primary serialization/publication failure with
+                // a secondary stale-temp cleanup problem.
             }
         }
     }
@@ -249,147 +244,161 @@ internal sealed class AppOptions
             throw new InvalidOperationException($"L2TP connection '{l2tp.Id}' must have a name.");
         }
 
-        if (l2tp.MonitorIntervalMilliseconds is < 250 or > 300000)
+        if (l2tp.MonitorIntervalMilliseconds is < 250 or > 60000)
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' monitorIntervalMilliseconds must be between 250 and 300000.");
+            throw new InvalidOperationException($"L2TP '{l2tp.Name}' monitorIntervalMilliseconds is outside the allowed range.");
         }
 
-        if (l2tp.RouteMonitorIntervalMilliseconds is < 250 or > 300000)
+        if (l2tp.RouteMonitorIntervalMilliseconds is < 1000 or > 300000)
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' routeMonitorIntervalMilliseconds must be between 250 and 300000.");
+            throw new InvalidOperationException($"L2TP '{l2tp.Name}' routeMonitorIntervalMilliseconds is outside the allowed range.");
         }
 
-        if (l2tp.ReconnectCooldownMilliseconds is < 0 or > 3600000)
+        if (l2tp.ReconnectCooldownMilliseconds is < 0 or > 300000)
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' reconnectCooldownMilliseconds must be between 0 and 3600000.");
+            throw new InvalidOperationException($"L2TP '{l2tp.Name}' reconnectCooldownMilliseconds is outside the allowed range.");
         }
 
-        ValidateVerification(l2tp);
-        ValidateKeepalive(l2tp);
-
-        if (l2tp.Mode == L2tpConnectionMode.ExistingWindowsProfile)
+        switch (l2tp.Mode)
         {
-            if (string.IsNullOrWhiteSpace(l2tp.EntryName))
-            {
-                throw new InvalidOperationException(
-                    $"L2TP connection '{l2tp.Name}' requires entryName in ExistingWindowsProfile mode.");
-            }
-            return;
+            case L2tpConnectionMode.ExistingWindowsProfile:
+                if (string.IsNullOrWhiteSpace(l2tp.EntryName))
+                {
+                    throw new InvalidOperationException($"L2TP '{l2tp.Name}' entryName is required.");
+                }
+                break;
+            case L2tpConnectionMode.CustomEphemeral:
+                ValidateCustomL2tp(l2tp.Name, l2tp.Custom);
+                break;
+            default:
+                throw new InvalidOperationException($"Unsupported l2tp.mode '{l2tp.Mode}'.");
         }
 
-        if (l2tp.Mode != L2tpConnectionMode.CustomEphemeral)
+        ValidateVerification(l2tp.Name, l2tp.Verification);
+        ValidateKeepalive(l2tp.Name, l2tp.Keepalive);
+    }
+
+    private static void ValidateCustomL2tp(string name, CustomL2tpOptions custom)
+    {
+        if (string.IsNullOrWhiteSpace(custom.ServerAddress) ||
+            (!IPAddress.TryParse(custom.ServerAddress, out _) &&
+             Uri.CheckHostName(custom.ServerAddress) != UriHostNameType.Dns))
         {
-            throw new InvalidOperationException($"Unsupported L2TP mode '{l2tp.Mode}'.");
+            throw new InvalidOperationException($"L2TP '{name}' custom serverAddress must be an IP address or DNS host name.");
         }
 
-        if (string.IsNullOrWhiteSpace(l2tp.ServerAddress))
+        if (!custom.UseCurrentWindowsCredentials && string.IsNullOrWhiteSpace(custom.UserName))
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' requires serverAddress in CustomEphemeral mode.");
+            throw new InvalidOperationException($"L2TP '{name}' custom userName is required.");
         }
 
-        if (!l2tp.UseWindowsCredentials && string.IsNullOrWhiteSpace(l2tp.UserName))
+        if (!custom.UseCurrentWindowsCredentials && string.IsNullOrWhiteSpace(custom.ProtectedPassword))
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' requires userName when Windows credentials are disabled.");
+            throw new InvalidOperationException($"L2TP '{name}' custom password is required.");
         }
 
-        if (!l2tp.UseWindowsCredentials && string.IsNullOrWhiteSpace(l2tp.ProtectedPassword))
+        if (custom.IpsecAuthentication == L2tpIpsecAuthentication.PreSharedKey &&
+            string.IsNullOrWhiteSpace(custom.ProtectedPreSharedKey))
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' requires protectedPassword when Windows credentials are disabled.");
+            throw new InvalidOperationException($"L2TP '{name}' custom pre-shared key is required.");
         }
 
-        if (l2tp.Authentication == L2tpAuthenticationMode.PreSharedKey &&
-            string.IsNullOrWhiteSpace(l2tp.ProtectedPreSharedKey))
+        if (!custom.AllowPap && !custom.AllowChap && !custom.AllowMsChapV2)
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' requires protectedPreSharedKey for PSK authentication.");
+            throw new InvalidOperationException($"L2TP '{name}' must enable at least one PPP authentication protocol.");
         }
     }
 
-    private static void ValidateVerification(L2tpOptions l2tp)
+    private static void ValidateVerification(string name, VerificationOptions verification)
     {
-        var verification = l2tp.Verification;
         if (string.IsNullOrWhiteSpace(verification.PublicAddress))
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' verification.publicAddress is required.");
+            throw new InvalidOperationException($"L2TP '{name}' verification.publicAddress is required.");
         }
 
-        if (string.IsNullOrWhiteSpace(verification.ProbeHost))
+        if (IPAddress.TryParse(verification.PublicAddress, out var publicIp))
+        {
+            if (publicIp.AddressFamily != AddressFamily.InterNetwork)
+            {
+                throw new InvalidOperationException(
+                    $"L2TP '{name}' verification.publicAddress supports IPv4 or a domain name only.");
+            }
+        }
+        else if (Uri.CheckHostName(verification.PublicAddress) != UriHostNameType.Dns)
         {
             throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' verification.probeHost is required.");
+                $"L2TP '{name}' verification.publicAddress must be an IPv4 address or DNS host name.");
+        }
+
+        if (string.IsNullOrWhiteSpace(verification.ProbeHost) ||
+            Uri.CheckHostName(verification.ProbeHost) != UriHostNameType.Dns)
+        {
+            throw new InvalidOperationException($"L2TP '{name}' verification.probeHost must be a DNS host name.");
         }
 
         if (verification.ProbePort is < 1 or > 65535)
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' verification.probePort must be between 1 and 65535.");
+            throw new InvalidOperationException($"L2TP '{name}' verification.probePort must be between 1 and 65535.");
         }
 
-        if (verification.TimeoutSeconds is < 1 or > 300)
+        if (string.IsNullOrWhiteSpace(verification.ProbePath) ||
+            !verification.ProbePath.StartsWith("/", StringComparison.Ordinal))
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' verification.timeoutSeconds must be between 1 and 300.");
+            throw new InvalidOperationException($"L2TP '{name}' verification.probePath must start with '/'.");
         }
 
-        if (verification.MaxResponseBytes is < VerificationOptions.MinResponseBytes or > VerificationOptions.MaxAllowedResponseBytes)
+        if (verification.TimeoutSeconds is < 1 or > 60)
+        {
+            throw new InvalidOperationException($"L2TP '{name}' verification.timeoutSeconds must be between 1 and 60.");
+        }
+
+        if (verification.MaxResponseBytes is < VerificationOptions.MinimumResponseLimitBytes or > VerificationOptions.MaximumResponseLimitBytes)
         {
             throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' verification.maxResponseBytes must be between " +
-                $"{VerificationOptions.MinResponseBytes} and {VerificationOptions.MaxAllowedResponseBytes}.");
+                $"L2TP '{name}' verification.maxResponseBytes must be between " +
+                $"{VerificationOptions.MinimumResponseLimitBytes} and {VerificationOptions.MaximumResponseLimitBytes}.");
         }
     }
 
-    private static void ValidateKeepalive(L2tpOptions l2tp)
+    private static void ValidateKeepalive(string name, KeepaliveOptions keepalive)
     {
-        var keepalive = l2tp.Keepalive;
         if (keepalive.IntervalSeconds is < 1 or > 3600)
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' keepalive.intervalSeconds must be between 1 and 3600.");
+            throw new InvalidOperationException($"L2TP '{name}' keepalive.intervalSeconds must be between 1 and 3600.");
         }
 
         if (keepalive.TimeoutMilliseconds is < 100 or > 60000)
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' keepalive.timeoutMilliseconds must be between 100 and 60000.");
+            throw new InvalidOperationException($"L2TP '{name}' keepalive.timeoutMilliseconds must be between 100 and 60000.");
         }
 
         if (keepalive.FailureThreshold is < 1 or > 100)
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' keepalive.failureThreshold must be between 1 and 100.");
+            throw new InvalidOperationException($"L2TP '{name}' keepalive.failureThreshold must be between 1 and 100.");
         }
 
         if (keepalive.Mode == L2tpKeepaliveMode.CustomIPv4 &&
-            (!IPAddress.TryParse(keepalive.CustomIPv4, out var target) ||
-             target.AddressFamily != AddressFamily.InterNetwork))
+            (!IPAddress.TryParse(keepalive.CustomIPv4, out var address) ||
+             address.AddressFamily != AddressFamily.InterNetwork))
         {
-            throw new InvalidOperationException(
-                $"L2TP connection '{l2tp.Name}' keepalive.customIPv4 must be an IPv4 address in CustomIPv4 mode.");
+            throw new InvalidOperationException($"L2TP '{name}' keepalive.customIPv4 must be an IPv4 address.");
         }
     }
 
-    private static void EnsureUniqueIds(IEnumerable<string> ids, string entityName)
+    private static void EnsureUniqueIds(IEnumerable<string> ids, string kind)
     {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var id in ids)
+        var values = ids.ToArray();
+        if (values.Any(string.IsNullOrWhiteSpace))
         {
-            if (string.IsNullOrWhiteSpace(id))
-            {
-                throw new InvalidOperationException($"Every {entityName} must have a non-empty id.");
-            }
+            throw new InvalidOperationException($"Every {kind} must have a non-empty id.");
+        }
 
-            if (!seen.Add(id))
-            {
-                throw new InvalidOperationException($"Duplicate {entityName} id '{id}'.");
-            }
+        var duplicate = values
+            .GroupBy(value => value, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicate is not null)
+        {
+            throw new InvalidOperationException($"Duplicate {kind} id '{duplicate.Key}'.");
         }
     }
 
@@ -400,98 +409,109 @@ internal sealed class AppOptions
             return true;
         }
 
-        foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
-        {
-            foreach (var unicast in networkInterface.GetIPProperties().UnicastAddresses)
-            {
-                if (unicast.Address.AddressFamily == AddressFamily.InterNetwork &&
-                    unicast.Address.Equals(address))
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
+        return NetworkInterface.GetAllNetworkInterfaces()
+            .SelectMany(networkInterface => networkInterface.GetIPProperties().UnicastAddresses)
+            .Any(unicast => unicast.Address.AddressFamily == AddressFamily.InterNetwork &&
+                            unicast.Address.Equals(address));
     }
-}
-
-internal sealed class LoggingOptions
-{
-    [JsonPropertyName("directory")]
-    public string Directory { get; set; } = "logs";
-
-    [JsonPropertyName("retentionDays")]
-    public int RetentionDays { get; set; } = 30;
-
-    [JsonPropertyName("consoleJson")]
-    public bool ConsoleJson { get; set; }
 }
 
 internal sealed class ProxyOptions
 {
     [JsonPropertyName("id")]
-    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Id { get; init; } = Guid.NewGuid().ToString("N");
 
     [JsonPropertyName("name")]
-    public string Name { get; set; } = "Proxy";
+    public string Name { get; init; } = "Proxy";
 
     [JsonPropertyName("enabled")]
-    public bool Enabled { get; set; } = true;
+    public bool Enabled { get; init; } = true;
 
     [JsonPropertyName("listenAddress")]
-    public string ListenAddress { get; set; } = "127.0.0.1";
+    public string ListenAddress { get; init; } = "127.0.0.1";
 
     [JsonPropertyName("listenPort")]
-    public int ListenPort { get; set; } = 18080;
-
-    [JsonPropertyName("vpnConnectionId")]
-    public string VpnConnectionId { get; set; } = "vpn-1";
+    public int ListenPort { get; init; } = 18080;
 
     [JsonPropertyName("maxConcurrentConnections")]
-    public int MaxConcurrentConnections { get; set; } = 512;
+    public int MaxConcurrentConnections { get; init; } = 512;
+
+    [JsonPropertyName("vpnConnectionId")]
+    public string VpnConnectionId { get; init; } = string.Empty;
 
     [JsonPropertyName("maxHeaderBytes")]
-    public int MaxHeaderBytes { get; set; } = 32 * 1024;
+    public int MaxHeaderBytes { get; init; } = 65536;
 
     [JsonPropertyName("clientHeaderTimeoutSeconds")]
-    public int ClientHeaderTimeoutSeconds { get; set; } = 15;
+    public int ClientHeaderTimeoutSeconds { get; init; } = 15;
 
     [JsonPropertyName("outboundConnectTimeoutSeconds")]
-    public int OutboundConnectTimeoutSeconds { get; set; } = 20;
+    public int OutboundConnectTimeoutSeconds { get; init; } = 15;
 
     [JsonPropertyName("dnsTimeoutMilliseconds")]
-    public int DnsTimeoutMilliseconds { get; set; } = 5000;
+    public int DnsTimeoutMilliseconds { get; init; } = 3000;
 }
 
+[JsonConverter(typeof(JsonStringEnumConverter<L2tpConnectionMode>))]
 internal enum L2tpConnectionMode
 {
     ExistingWindowsProfile,
     CustomEphemeral
 }
 
-internal enum L2tpAuthenticationMode
+internal sealed class L2tpOptions
+{
+    [JsonPropertyName("id")]
+    public string Id { get; init; } = Guid.NewGuid().ToString("N");
+
+    [JsonPropertyName("name")]
+    public string Name { get; init; } = "L2TP";
+
+    [JsonPropertyName("shared")]
+    public bool Shared { get; init; }
+
+    [JsonPropertyName("mode")]
+    public L2tpConnectionMode Mode { get; init; } = L2tpConnectionMode.ExistingWindowsProfile;
+
+    [JsonPropertyName("entryName")]
+    public string EntryName { get; init; } = "ProxyToAnyConnect-L2TP";
+
+    [JsonPropertyName("monitorIntervalMilliseconds")]
+    public int MonitorIntervalMilliseconds { get; init; } = 1000;
+
+    [JsonPropertyName("routeMonitorIntervalMilliseconds")]
+    public int RouteMonitorIntervalMilliseconds { get; init; } = 5000;
+
+    [JsonPropertyName("reconnectCooldownMilliseconds")]
+    public int ReconnectCooldownMilliseconds { get; init; } = 5000;
+
+    [JsonPropertyName("verification")]
+    public VerificationOptions Verification { get; init; } = new();
+
+    [JsonPropertyName("keepalive")]
+    public KeepaliveOptions Keepalive { get; init; } = new();
+
+    [JsonPropertyName("custom")]
+    public CustomL2tpOptions Custom { get; init; } = new();
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter<L2tpIpsecAuthentication>))]
+internal enum L2tpIpsecAuthentication
 {
     PreSharedKey,
     MachineCertificate
 }
 
+[JsonConverter(typeof(JsonStringEnumConverter<L2tpEncryptionMode>))]
 internal enum L2tpEncryptionMode
 {
+    None,
     Optional,
     Required,
     Maximum
 }
 
-[Flags]
-internal enum L2tpAuthProtocols
-{
-    None = 0,
-    Pap = 1,
-    Chap = 2,
-    MsChapV2 = 4
-}
-
+[JsonConverter(typeof(JsonStringEnumConverter<L2tpKeepaliveMode>))]
 internal enum L2tpKeepaliveMode
 {
     Off,
@@ -499,112 +519,94 @@ internal enum L2tpKeepaliveMode
     CustomIPv4
 }
 
-internal sealed class L2tpOptions
+internal sealed class KeepaliveOptions
 {
-    [JsonPropertyName("id")]
-    public string Id { get; set; } = Guid.NewGuid().ToString("N");
-
-    [JsonPropertyName("name")]
-    public string Name { get; set; } = "L2TP";
-
-    [JsonPropertyName("shared")]
-    public bool Shared { get; set; }
-
     [JsonPropertyName("mode")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public L2tpConnectionMode Mode { get; set; } = L2tpConnectionMode.ExistingWindowsProfile;
+    public L2tpKeepaliveMode Mode { get; init; } = L2tpKeepaliveMode.Off;
 
-    [JsonPropertyName("entryName")]
-    public string EntryName { get; set; } = "ProxyToAnyConnect-L2TP";
+    [JsonPropertyName("customIPv4")]
+    public string CustomIPv4 { get; init; } = string.Empty;
 
+    [JsonPropertyName("intervalSeconds")]
+    public int IntervalSeconds { get; init; } = 10;
+
+    [JsonPropertyName("timeoutMilliseconds")]
+    public int TimeoutMilliseconds { get; init; } = 2000;
+
+    [JsonPropertyName("failureThreshold")]
+    public int FailureThreshold { get; init; } = 3;
+}
+
+internal sealed class CustomL2tpOptions
+{
     [JsonPropertyName("serverAddress")]
-    public string ServerAddress { get; set; } = string.Empty;
+    public string ServerAddress { get; init; } = string.Empty;
 
     [JsonPropertyName("userName")]
-    public string UserName { get; set; } = string.Empty;
+    public string UserName { get; init; } = string.Empty;
 
     [JsonPropertyName("domain")]
-    public string Domain { get; set; } = string.Empty;
+    public string Domain { get; init; } = string.Empty;
 
-    [JsonPropertyName("useWindowsCredentials")]
-    public bool UseWindowsCredentials { get; set; }
+    [JsonPropertyName("useCurrentWindowsCredentials")]
+    public bool UseCurrentWindowsCredentials { get; init; }
 
     [JsonPropertyName("protectedPassword")]
-    public string ProtectedPassword { get; set; } = string.Empty;
+    public string ProtectedPassword { get; init; } = string.Empty;
 
-    [JsonPropertyName("authentication")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public L2tpAuthenticationMode Authentication { get; set; } = L2tpAuthenticationMode.PreSharedKey;
+    [JsonPropertyName("ipsecAuthentication")]
+    public L2tpIpsecAuthentication IpsecAuthentication { get; init; } = L2tpIpsecAuthentication.PreSharedKey;
 
     [JsonPropertyName("protectedPreSharedKey")]
-    public string ProtectedPreSharedKey { get; set; } = string.Empty;
+    public string ProtectedPreSharedKey { get; init; } = string.Empty;
 
     [JsonPropertyName("encryption")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public L2tpEncryptionMode Encryption { get; set; } = L2tpEncryptionMode.Required;
+    public L2tpEncryptionMode Encryption { get; init; } = L2tpEncryptionMode.Required;
 
-    [JsonPropertyName("authProtocols")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public L2tpAuthProtocols AuthProtocols { get; set; } = L2tpAuthProtocols.MsChapV2;
+    [JsonPropertyName("allowPap")]
+    public bool AllowPap { get; init; }
 
-    [JsonPropertyName("monitorIntervalMilliseconds")]
-    public int MonitorIntervalMilliseconds { get; set; } = 1000;
+    [JsonPropertyName("allowChap")]
+    public bool AllowChap { get; init; }
 
-    [JsonPropertyName("routeMonitorIntervalMilliseconds")]
-    public int RouteMonitorIntervalMilliseconds { get; set; } = 5000;
-
-    [JsonPropertyName("reconnectCooldownMilliseconds")]
-    public int ReconnectCooldownMilliseconds { get; set; } = 5000;
-
-    [JsonPropertyName("verification")]
-    public VerificationOptions Verification { get; set; } = new();
-
-    [JsonPropertyName("keepalive")]
-    public KeepaliveOptions Keepalive { get; set; } = new();
+    [JsonPropertyName("allowMsChapV2")]
+    public bool AllowMsChapV2 { get; init; } = true;
 }
 
 internal sealed class VerificationOptions
 {
-    internal const int MinResponseBytes = 1024;
-    internal const int MaxAllowedResponseBytes = 1024 * 1024;
+    internal const int MinimumResponseLimitBytes = 1024;
+    internal const int MaximumResponseLimitBytes = 1024 * 1024;
+    internal const int DefaultResponseLimitBytes = 64 * 1024;
 
     [JsonPropertyName("publicAddress")]
-    public string PublicAddress { get; set; } = "vpn.example.com";
-
-    [JsonPropertyName("expectedPublicIPv4")]
-    public string ExpectedPublicIPv4 { get; set; } = string.Empty;
+    public string PublicAddress { get; init; } = string.Empty;
 
     [JsonPropertyName("probeHost")]
-    public string ProbeHost { get; set; } = "api.ipify.org";
+    public string ProbeHost { get; init; } = "api.ipify.org";
 
     [JsonPropertyName("probePort")]
-    public int ProbePort { get; set; } = 443;
+    public int ProbePort { get; init; } = 443;
 
     [JsonPropertyName("probePath")]
-    public string ProbePath { get; set; } = "/";
+    public string ProbePath { get; init; } = "/";
 
     [JsonPropertyName("timeoutSeconds")]
-    public int TimeoutSeconds { get; set; } = 10;
+    public int TimeoutSeconds { get; init; } = 10;
 
     [JsonPropertyName("maxResponseBytes")]
-    public int MaxResponseBytes { get; set; } = 64 * 1024;
+    public int MaxResponseBytes { get; init; } = DefaultResponseLimitBytes;
 }
 
-internal sealed class KeepaliveOptions
+internal sealed class LoggingOptions
 {
-    [JsonPropertyName("mode")]
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public L2tpKeepaliveMode Mode { get; set; } = L2tpKeepaliveMode.Off;
+    // Empty means AppContext.BaseDirectory (the directory containing/running the utility).
+    [JsonPropertyName("directory")]
+    public string Directory { get; init; } = string.Empty;
 
-    [JsonPropertyName("customIPv4")]
-    public string CustomIPv4 { get; set; } = string.Empty;
+    [JsonPropertyName("retentionDays")]
+    public int RetentionDays { get; init; } = 30;
 
-    [JsonPropertyName("intervalSeconds")]
-    public int IntervalSeconds { get; set; } = 30;
-
-    [JsonPropertyName("timeoutMilliseconds")]
-    public int TimeoutMilliseconds { get; set; } = 1500;
-
-    [JsonPropertyName("failureThreshold")]
-    public int FailureThreshold { get; set; } = 3;
+    [JsonPropertyName("consoleJson")]
+    public bool ConsoleJson { get; init; }
 }
