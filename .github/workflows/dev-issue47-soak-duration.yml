@@ -8,7 +8,7 @@ on:
       - .github/workflows/dev-issue47-soak-duration.yml
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
@@ -119,12 +119,23 @@ jobs:
             Write-Host "PASS: semantic duration mismatch rejected: $($_.Exception.Message)"
           }
           if (-not $rejected) { throw 'Manifest-consistent duration mismatch was accepted.' }
-      - name: Publish validated issue 47 source
+      - name: Stage validated source artifact
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'test: preserve serialized soak timestamp precision'
-          git push origin HEAD:dev/issue47-soak-duration
+          New-Item -ItemType Directory -Path './artifacts/issue47-source/.github/workflows' -Force | Out-Null
+          New-Item -ItemType Directory -Path './artifacts/issue47-source/tools' -Force | Out-Null
+          Copy-Item -LiteralPath './.github/workflows/build.yml' -Destination './artifacts/issue47-source/.github/workflows/build.yml'
+          Copy-Item -LiteralPath './tools/Test-WindowsSoakEvidence.ps1' -Destination './artifacts/issue47-source/tools/Test-WindowsSoakEvidence.ps1'
+          $buildBlob = (git hash-object './.github/workflows/build.yml').Trim()
+          $validatorBlob = (git hash-object './tools/Test-WindowsSoakEvidence.ps1').Trim()
+          [ordered]@{
+            baseCommit = 'e4b9d53177c80639ed142c53a94e45fb6e54f2cf'
+            buildBlob = $buildBlob
+            validatorBlob = $validatorBlob
+          } | ConvertTo-Json | Set-Content -LiteralPath './artifacts/issue47-source/blob-identities.json' -Encoding utf8
+          Get-Content -LiteralPath './artifacts/issue47-source/blob-identities.json' -Raw | Write-Host
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue47-validated-source
+          path: artifacts/issue47-source
+          if-no-files-found: error
