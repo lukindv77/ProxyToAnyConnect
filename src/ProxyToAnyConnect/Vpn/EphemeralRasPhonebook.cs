@@ -7,18 +7,32 @@ namespace ProxyToAnyConnect.Vpn;
 
 internal sealed class EphemeralRasPhonebook : IDisposable
 {
+    internal const string OwnershipMarkerFileName = ".managed-session-v1";
+    internal const string OwnershipLockFileName = ".owner.lock";
+
     private readonly string _sessionDirectory;
+    private readonly FileStream _ownershipLock;
     private int _disposed;
 
-    private EphemeralRasPhonebook(string sessionDirectory, string phoneBookPath, string entryName)
+    private EphemeralRasPhonebook(
+        string sessionDirectory,
+        string phoneBookPath,
+        string entryName,
+        FileStream ownershipLock)
     {
         _sessionDirectory = sessionDirectory;
         PhoneBookPath = phoneBookPath;
         EntryName = entryName;
+        _ownershipLock = ownershipLock;
     }
 
     public string PhoneBookPath { get; }
     public string EntryName { get; }
+
+    internal static string SessionRootDirectory => Path.Combine(
+        Path.GetTempPath(),
+        "ProxyToAnyConnect",
+        "ras");
 
     public static EphemeralRasPhonebook Create(L2tpOptions options)
     {
@@ -28,23 +42,48 @@ internal sealed class EphemeralRasPhonebook : IDisposable
             throw new ArgumentException("CustomEphemeral L2TP options are required.", nameof(options));
         }
 
+        CleanupOrphanedSessionDirectories();
+
+        var rasRoot = SessionRootDirectory;
+        Directory.CreateDirectory(rasRoot);
         var sessionRoot = Path.Combine(
-            Path.GetTempPath(),
-            "ProxyToAnyConnect",
-            "ras",
+            rasRoot,
             $"{SanitizeId(options.Id)}-{Guid.NewGuid():N}");
         Directory.CreateDirectory(sessionRoot);
 
-        var phoneBookPath = Path.Combine(sessionRoot, "session.pbk");
-        var entryName = $"ProxyToAnyConnect-{SanitizeId(options.Id)}";
-        if (entryName.Length > RasNative.RasMaxEntryName)
-        {
-            entryName = entryName[..RasNative.RasMaxEntryName];
-        }
-
-        var resource = new EphemeralRasPhonebook(sessionRoot, phoneBookPath, entryName);
+        FileStream? ownershipLock = null;
+        EphemeralRasPhonebook? resource = null;
         try
         {
+            // The persistent marker prevents a new version from treating legacy
+            // unmarked directories as abandoned sessions. The owner lock is held
+            // exclusively for the runtime lifetime and is deleted automatically if
+            // the process terminates without running Dispose.
+            File.WriteAllText(
+                Path.Combine(sessionRoot, OwnershipMarkerFileName),
+                "ProxyToAnyConnect managed RAS session v1");
+            ownershipLock = new FileStream(
+                Path.Combine(sessionRoot, OwnershipLockFileName),
+                FileMode.CreateNew,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                FileOptions.DeleteOnClose);
+
+            var phoneBookPath = Path.Combine(sessionRoot, "session.pbk");
+            var entryName = $"ProxyToAnyConnect-{SanitizeId(options.Id)}";
+            if (entryName.Length > RasNative.RasMaxEntryName)
+            {
+                entryName = entryName[..RasNative.RasMaxEntryName];
+            }
+
+            resource = new EphemeralRasPhonebook(
+                sessionRoot,
+                phoneBookPath,
+                entryName,
+                ownershipLock);
+            ownershipLock = null;
+
             using (File.Create(phoneBookPath))
             {
             }
@@ -87,8 +126,85 @@ internal sealed class EphemeralRasPhonebook : IDisposable
         }
         catch
         {
-            resource.Dispose();
+            if (resource is not null)
+            {
+                resource.Dispose();
+            }
+            else
+            {
+                ownershipLock?.Dispose();
+                TryDeleteSessionDirectory(sessionRoot);
+            }
+
             throw;
+        }
+    }
+
+    internal static void CleanupOrphanedSessionDirectories()
+    {
+        var root = SessionRootDirectory;
+        if (!Directory.Exists(root))
+        {
+            return;
+        }
+
+        string[] sessionDirectories;
+        try
+        {
+            sessionDirectories = Directory
+                .EnumerateDirectories(root, "*", SearchOption.TopDirectoryOnly)
+                .ToArray();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        foreach (var sessionDirectory in sessionDirectories)
+        {
+            var markerPath = Path.Combine(sessionDirectory, OwnershipMarkerFileName);
+            if (!File.Exists(markerPath))
+            {
+                // Do not infer ownership for directories created by an older build
+                // or by another application. Only the marker opts a directory into
+                // this cleanup protocol.
+                continue;
+            }
+
+            var lockPath = Path.Combine(sessionDirectory, OwnershipLockFileName);
+            if (HasLiveOwner(lockPath))
+            {
+                continue;
+            }
+
+            TryDeleteSessionDirectory(sessionDirectory);
+        }
+    }
+
+    private static bool HasLiveOwner(string lockPath)
+    {
+        if (!File.Exists(lockPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var probe = new FileStream(
+                lockPath,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                FileOptions.None);
+            return false;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A sharing violation means another live process owns the session. An
+            // access-denied result is treated the same way: cleanup must fail safe
+            // and preserve a directory whose ownership cannot be proven stale.
+            return true;
         }
     }
 
@@ -250,6 +366,20 @@ internal sealed class EphemeralRasPhonebook : IDisposable
         return string.IsNullOrWhiteSpace(sanitized) ? "session" : sanitized;
     }
 
+    private static void TryDeleteSessionDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, recursive: true);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -263,6 +393,14 @@ internal sealed class EphemeralRasPhonebook : IDisposable
             {
                 _ = RasNative.RasDeleteEntryW(PhoneBookPath, EntryName);
             }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            _ownershipLock.Dispose();
         }
         catch
         {
