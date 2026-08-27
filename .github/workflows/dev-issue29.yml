@@ -1,0 +1,134 @@
+name: dev-issue29
+
+on:
+  push:
+    branches: [ dev/issue29-paired-ratios ]
+    paths:
+      - '.github/workflows/dev-issue29.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply true paired-round ratio patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+
+          old = '''        var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(
+                      optimizedMedian,
+                      predecessorMedian,
+                      optimizedMedian / predecessorMedian);'''
+          new = '''        var pairedRatios = new double[TimingRounds];
+                  for (var round = 0; round < TimingRounds; round++)
+                  {
+                      pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
+                  }
+
+                  var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(
+                      optimizedMedian,
+                      predecessorMedian,
+                      Median(pairedRatios));'''
+
+          changed = []
+          for path in sorted(Path('tests').rglob('*.cs')):
+              text = path.read_text(encoding='utf-8')
+              if old not in text:
+                  continue
+              if text.count(old) != 1:
+                  raise SystemExit(f'unexpected paired helper count in {path}: {text.count(old)}')
+              if 'double Ratio);' not in text or '.Ratio' not in text:
+                  raise SystemExit(f'{path} does not expose the expected TimingResult Ratio contract')
+              text = text.replace(old, new)
+              text = text.replace('double Ratio);', 'double PairedRatioMedian);')
+              text = text.replace('.Ratio', '.PairedRatioMedian')
+              path.write_text(text, encoding='utf-8', newline='')
+              changed.append(str(path).replace('\\', '/'))
+
+          if not changed:
+              raise SystemExit('no ratio-of-independent-medians MeasurePaired helpers were found')
+          print(f'paired-round migrated files ({len(changed)}):')
+          for item in changed:
+              print(f'  {item}')
+          Path('.issue29-changed.txt').write_text('\n'.join(changed) + '\n', encoding='utf-8')
+          '@ | python -
+          git diff --check
+          Get-Content .issue29-changed.txt | Write-Host
+      - name: Run full aggregate self-tests
+        shell: pwsh
+        run: dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+  publish:
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply audited paired-round ratio patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+
+          old = '''        var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(
+                      optimizedMedian,
+                      predecessorMedian,
+                      optimizedMedian / predecessorMedian);'''
+          new = '''        var pairedRatios = new double[TimingRounds];
+                  for (var round = 0; round < TimingRounds; round++)
+                  {
+                      pairedRatios[round] = optimizedRounds[round] / predecessorRounds[round];
+                  }
+
+                  var optimizedMedian = Median(optimizedRounds);
+                  var predecessorMedian = Median(predecessorRounds);
+                  return new TimingResult(
+                      optimizedMedian,
+                      predecessorMedian,
+                      Median(pairedRatios));'''
+
+          changed = []
+          for path in sorted(Path('tests').rglob('*.cs')):
+              text = path.read_text(encoding='utf-8')
+              if old not in text:
+                  continue
+              if text.count(old) != 1 or 'double Ratio);' not in text or '.Ratio' not in text:
+                  raise SystemExit(f'unexpected paired TimingResult contract in {path}')
+              text = text.replace(old, new)
+              text = text.replace('double Ratio);', 'double PairedRatioMedian);')
+              text = text.replace('.Ratio', '.PairedRatioMedian')
+              path.write_text(text, encoding='utf-8', newline='')
+              changed.append(str(path).replace('\\', '/'))
+          if not changed:
+              raise SystemExit('no paired timing helpers were migrated')
+          print('\n'.join(changed))
+          '@ | python -
+          git diff --check
+          $changed = @(git diff --name-only)
+          if ($changed.Count -lt 2) {
+            throw "Expected a broad paired-gate audit, changed only: $($changed -join ', ')"
+          }
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add tests
+          git commit -m 'test: gate performance on paired-round ratios'
+          git push origin HEAD:refs/heads/dev/issue29-paired-ratios
