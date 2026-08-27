@@ -534,13 +534,12 @@ internal sealed class ProxyServer
         var separator = authority.IndexOf(':');
         if (separator >= 0 && authority.IndexOf(':', separator + 1) >= 0)
         {
-            throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+            throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
         }
 
         var host = separator < 0 ? authority : authority[..separator];
         var port = defaultPort;
-        if (separator >= 0 &&
-            (!int.TryParse(authority[(separator + 1)..], out port) || port is < 1 or > 65535))
+        if (separator >= 0 && !TryParseConnectPort(authority.AsSpan(separator + 1), out port))
         {
             throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
         }
@@ -553,7 +552,8 @@ internal sealed class ProxyServer
         foreach (var character in host)
         {
             if (character <= 0x20 || character == 0x7F ||
-                character is '@' or '/' or '?' or '#' or '\' or ':')
+                character == (char)0x5C ||
+                character is '@' or '/' or '?' or '#' or ':')
             {
                 throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
             }
@@ -577,6 +577,38 @@ internal sealed class ProxyServer
         {
             throw new InvalidDataException($"Invalid CONNECT target '{authority}'.", ex);
         }
+    }
+
+    private static bool TryParseConnectPort(ReadOnlySpan<char> value, out int port)
+    {
+        port = 0;
+        if (value.IsEmpty)
+        {
+            return false;
+        }
+
+        var parsed = 0;
+        foreach (var character in value)
+        {
+            if (character < 0x30 || character > 0x39)
+            {
+                return false;
+            }
+
+            parsed = parsed * 10 + (character - 0x30);
+            if (parsed > 65535)
+            {
+                return false;
+            }
+        }
+
+        if (parsed == 0)
+        {
+            return false;
+        }
+
+        port = parsed;
+        return true;
     }
 
     private static Uri ParseAbsoluteHttpUri(string target)
