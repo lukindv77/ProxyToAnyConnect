@@ -790,9 +790,9 @@ internal sealed class ProxyServer
         }
 
         private static bool IsValidHeaderNameCharacter(char character) =>
-            character <= 0x7F &&
-            (char.IsAsciiLetterOrDigit(character) ||
-             character is '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~');
+            (uint)(character - '0') <= 9 ||
+            (uint)((character | 0x20) - 'a') <= 25 ||
+            character is '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~';
 
         private static bool IsValidHeaderName(ReadOnlySpan<char> name)
         {
@@ -827,56 +827,69 @@ internal sealed class ProxyServer
 
         private static void ValidateHeaderLines(string text, int offset)
         {
-            while (offset < text.Length)
+            var lineHasName = false;
+            var seenColon = false;
+
+            for (var i = offset; i < text.Length; i++)
             {
-                var remaining = text.AsSpan(offset);
-                var lineEnd = remaining.IndexOf("\r\n".AsSpan());
-                if (lineEnd < 0)
+                var character = text[i];
+                if (character == '\r')
+                {
+                    if (i + 1 >= text.Length || text[i + 1] != '\n')
+                    {
+                        throw new InvalidDataException("Invalid HTTP header line.");
+                    }
+
+                    if (!lineHasName && !seenColon)
+                    {
+                        return;
+                    }
+
+                    if (!seenColon)
+                    {
+                        throw new InvalidDataException("Invalid HTTP header line.");
+                    }
+
+                    lineHasName = false;
+                    seenColon = false;
+                    i++;
+                    continue;
+                }
+
+                if (character == '\n')
                 {
                     throw new InvalidDataException("Invalid HTTP header line.");
                 }
 
-                if (lineEnd == 0)
+                if (!seenColon)
                 {
-                    return;
-                }
-
-                var line = remaining[..lineEnd];
-                var separator = -1;
-                for (var i = 0; i < line.Length; i++)
-                {
-                    var character = line[i];
-                    if (separator < 0)
+                    if (character == ':')
                     {
-                        if (character == ':')
+                        if (!lineHasName)
                         {
-                            if (i == 0)
-                            {
-                                throw new InvalidDataException("Invalid HTTP header line.");
-                            }
-
-                            separator = i;
-                            continue;
+                            throw new InvalidDataException("Invalid HTTP header line.");
                         }
 
-                        if (!IsValidHeaderNameCharacter(character))
-                        {
-                            throw new InvalidDataException("Invalid HTTP header name.");
-                        }
+                        seenColon = true;
+                        continue;
                     }
-                    else if ((character < 0x20 && character != '\t') || character == 0x7F)
+
+                    if (!IsValidHeaderNameCharacter(character))
                     {
-                        throw new InvalidDataException("Invalid HTTP header field value.");
+                        throw new InvalidDataException("Invalid HTTP header name.");
                     }
+
+                    lineHasName = true;
+                    continue;
                 }
 
-                if (separator < 0)
+                if ((character < 0x20 && character != '\t') || character == 0x7F)
                 {
-                    throw new InvalidDataException("Invalid HTTP header line.");
+                    throw new InvalidDataException("Invalid HTTP header field value.");
                 }
-
-                offset += lineEnd + 2;
             }
+
+            throw new InvalidDataException("Invalid HTTP header line.");
         }
 
         public byte[] BuildOriginHeader(string pathAndQuery)
