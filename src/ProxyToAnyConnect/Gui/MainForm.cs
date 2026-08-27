@@ -240,43 +240,23 @@ internal sealed class MainForm : Form
     private void RefreshProxyGrid()
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var views = RuntimeViewProjection.ProjectProxies(
+            _options.Proxies,
+            _runtimeHost.GetProxySnapshots(),
+            _runtimeHost.ConfigurationError);
 
-        if (_runtimeHost.Current is null)
+        foreach (var view in views)
         {
-            foreach (var proxy in _options.Proxies)
-            {
-                seen.Add(proxy.Id);
-                var row = GetOrCreateRow(_proxyGrid, _proxyRows, proxy.Id);
-                SetCell(row, 0, proxy.Name);
-                SetCell(row, 1, $"{proxy.ListenAddress}:{proxy.ListenPort}");
-                SetCell(row, 2, FindVpnName(proxy.VpnConnectionId));
-                SetCell(row, 3, "Error");
-                SetByteCell(row.Cells[4], 0);
-                SetByteCell(row.Cells[5], 0);
-                SetCell(row, 6, _runtimeHost.ConfigurationError ?? "Конфигурация runtime недействительна");
-                SetCell(row, 7, "Запустить");
-            }
-        }
-        else
-        {
-            foreach (var snapshot in _runtimeHost.GetProxySnapshots())
-            {
-                seen.Add(snapshot.Id);
-                var row = GetOrCreateRow(_proxyGrid, _proxyRows, snapshot.Id);
-                SetCell(row, 0, snapshot.Name);
-                SetCell(row, 1, $"{snapshot.ListenAddress}:{snapshot.ListenPort}");
-                SetCell(row, 2, FindVpnName(snapshot.VpnConnectionId));
-                SetCell(row, 3, snapshot.State.ToString());
-                SetByteCell(row.Cells[4], snapshot.ReceivedBytes);
-                SetByteCell(row.Cells[5], snapshot.SentBytes);
-                SetCell(row, 6, snapshot.LastError ?? string.Empty);
-                SetCell(
-                    row,
-                    7,
-                    snapshot.State is ProxyInstanceState.Running or ProxyInstanceState.Starting
-                        ? "Пауза"
-                        : "Запустить");
-            }
+            seen.Add(view.Id);
+            var row = GetOrCreateRow(_proxyGrid, _proxyRows, view.Id);
+            SetCell(row, 0, view.Name);
+            SetCell(row, 1, $"{view.ListenAddress}:{view.ListenPort}");
+            SetCell(row, 2, FindVpnName(view.VpnConnectionId));
+            SetCell(row, 3, view.State);
+            SetByteCell(row.Cells[4], view.ReceivedBytes);
+            SetByteCell(row.Cells[5], view.SentBytes);
+            SetCell(row, 6, view.Status);
+            SetCell(row, 7, view.ActionText);
         }
 
         RemoveStaleRows(_proxyGrid, _proxyRows, seen);
@@ -285,42 +265,26 @@ internal sealed class MainForm : Form
     private void RefreshVpnGrid()
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var views = RuntimeViewProjection.ProjectVpns(
+            _options.VpnConnections,
+            _runtimeHost.GetL2tpSnapshots(),
+            _runtimeHost.ConfigurationError,
+            id => VpnLatestStatusRegistry.Get(id)?.Text);
 
-        if (_runtimeHost.Current is null)
+        foreach (var view in views)
         {
-            foreach (var vpn in _options.VpnConnections)
-            {
-                seen.Add(vpn.Id);
-                var row = GetOrCreateRow(_vpnGrid, _vpnRows, vpn.Id);
-                SetCell(row, 0, vpn.Name);
-                SetCell(row, 1, vpn.Mode.ToString());
-                SetCell(row, 2, vpn.Shared ? "Shared" : "Dedicated");
-                SetCell(row, 3, "Error");
-                SetCell(row, 4, string.Empty);
-                SetCell(row, 5, 0);
-                SetByteCell(row.Cells[6], 0);
-                SetByteCell(row.Cells[7], 0);
-                SetCell(row, 8, "—");
-                SetCell(row, 9, _runtimeHost.ConfigurationError ?? "Конфигурация runtime недействительна");
-            }
-        }
-        else
-        {
-            foreach (var snapshot in _runtimeHost.GetL2tpSnapshots())
-            {
-                seen.Add(snapshot.Id);
-                var row = GetOrCreateRow(_vpnGrid, _vpnRows, snapshot.Id);
-                SetCell(row, 0, snapshot.Name);
-                SetCell(row, 1, snapshot.Mode.ToString());
-                SetCell(row, 2, snapshot.Shared ? "Shared" : "Dedicated");
-                SetCell(row, 3, snapshot.State.ToString());
-                SetCell(row, 4, FormatVpnInterface(snapshot.LocalIPv4, snapshot.InterfaceIndex));
-                SetCell(row, 5, snapshot.ActiveProxyCount);
-                SetByteCell(row.Cells[6], snapshot.ReceivedBytes);
-                SetByteCell(row.Cells[7], snapshot.SentBytes);
-                SetPingCell(row.Cells[8], snapshot.AveragePingMilliseconds);
-                SetCell(row, 9, VpnLatestStatusRegistry.Get(snapshot.Id)?.Text ?? string.Empty);
-            }
+            seen.Add(view.Id);
+            var row = GetOrCreateRow(_vpnGrid, _vpnRows, view.Id);
+            SetCell(row, 0, view.Name);
+            SetCell(row, 1, view.Mode.ToString());
+            SetCell(row, 2, view.Shared ? "Shared" : "Dedicated");
+            SetCell(row, 3, view.State);
+            SetCell(row, 4, FormatVpnInterface(view.LocalIPv4, view.InterfaceIndex));
+            SetCell(row, 5, view.ActiveProxyCount);
+            SetByteCell(row.Cells[6], view.ReceivedBytes);
+            SetByteCell(row.Cells[7], view.SentBytes);
+            SetPingCell(row.Cells[8], view.AveragePingMilliseconds);
+            SetCell(row, 9, view.Status);
         }
 
         RemoveStaleRows(_vpnGrid, _vpnRows, seen);
@@ -339,12 +303,19 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var snapshot = _runtimeHost.GetProxySnapshots().FirstOrDefault(item =>
-            item.Id.Equals(proxyId, StringComparison.OrdinalIgnoreCase));
+        var view = RuntimeViewProjection.ProjectProxies(
+                _options.Proxies,
+                _runtimeHost.GetProxySnapshots(),
+                _runtimeHost.ConfigurationError)
+            .FirstOrDefault(item => item.Id.Equals(proxyId, StringComparison.OrdinalIgnoreCase));
+        if (!view.CanToggle)
+        {
+            return;
+        }
 
         try
         {
-            if (snapshot.State is ProxyInstanceState.Running or ProxyInstanceState.Starting)
+            if (view.State is nameof(ProxyInstanceState.Running) or nameof(ProxyInstanceState.Starting))
             {
                 await _runtimeHost.PauseProxyAsync(proxyId);
             }
