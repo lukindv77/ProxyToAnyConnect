@@ -11,10 +11,10 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
         try
         {
             await DisconnectContinuesAfterMonitorFailureAsync();
-            await DisposeReleasesShutdownOwnerWhenHangupFailsAsync();
+            await DisposeReleasesShutdownOwnerAndRetriesResidualHandleAsync();
 
             Console.WriteLine(
-                "PASS: RAS manager teardown preserves primary failures while releasing independent lifetime ownership");
+                "PASS: RAS manager teardown preserves primary failures while retaining only retryable native ownership");
             return 0;
         }
         catch (Exception ex)
@@ -26,14 +26,15 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
 
     private static async Task DisconnectContinuesAfterMonitorFailureAsync()
     {
-        var native = new CleanupRasNative(hangUpResult: 623);
+        var native = new CleanupRasNative(623, RasNative.ErrorSuccess);
         var manager = CreateManager(native);
         var monitorCancellation = new CancellationTokenSource();
         var primary = new SyntheticCleanupException("monitor teardown failed");
+        var expectedHandle = (nint)0x7001;
 
         SetPrivateField(manager, "_monitorCancellation", monitorCancellation);
         SetPrivateField(manager, "_monitorTask", Task.FromException(primary));
-        SetPrivateField(manager, "_rasConnection", (nint)0x7001);
+        SetPrivateField(manager, "_rasConnection", expectedHandle);
 
         try
         {
@@ -50,18 +51,23 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
             }
         }
 
-        if (native.HangUpCount != 1 || native.LastHungUpHandle != (nint)0x7001)
+        if (native.HangUpCount != 1 || native.LastHungUpHandle != expectedHandle)
         {
             throw new InvalidOperationException(
                 "RAS hangup was not attempted after monitor teardown failed.");
         }
 
-        if (GetPrivateField<nint>(manager, "_rasConnection") != 0 ||
-            GetPrivateField<CancellationTokenSource?>(manager, "_monitorCancellation") is not null ||
+        if (GetPrivateField<nint>(manager, "_rasConnection") != expectedHandle)
+        {
+            throw new InvalidOperationException(
+                "Failed RasHangUp did not retain the exact handle for a later safe cleanup retry.");
+        }
+
+        if (GetPrivateField<CancellationTokenSource?>(manager, "_monitorCancellation") is not null ||
             GetPrivateField<Task?>(manager, "_monitorTask") is not null)
         {
             throw new InvalidOperationException(
-                "RAS manager retained exact-handle or monitor ownership after failed disconnect cleanup.");
+                "RAS manager retained monitor ownership after failed disconnect cleanup.");
         }
 
         if (!CancellationSourceWasDisposed(monitorCancellation))
@@ -70,15 +76,35 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
                 "Failed monitor teardown retained its CancellationTokenSource.");
         }
 
+        // A later explicit disconnect owns the retained generation and must be able to
+        // finish cleanup once RasHangUp succeeds and invalid-handle is observed.
+        await manager.DisconnectAsync();
+        if (native.HangUpCount != 2 || native.LastHungUpHandle != expectedHandle)
+        {
+            throw new InvalidOperationException(
+                "Second disconnect did not retry the retained exact RAS handle.");
+        }
+
+        if (native.GetConnectStatusCount == 0 ||
+            GetPrivateField<nint>(manager, "_rasConnection") != 0)
+        {
+            throw new InvalidOperationException(
+                "Successful retry did not drain the retained RAS handle to terminal invalid-handle state.");
+        }
+
         await manager.DisposeAsync();
     }
 
-    private static async Task DisposeReleasesShutdownOwnerWhenHangupFailsAsync()
+    private static async Task DisposeReleasesShutdownOwnerAndRetriesResidualHandleAsync()
     {
-        var native = new CleanupRasNative(hangUpResult: 623);
+        var native = new CleanupRasNative(
+            623,
+            623,
+            RasNative.ErrorSuccess);
         var manager = CreateManager(native);
         var shutdown = GetPrivateField<CancellationTokenSource>(manager, "_shutdown");
-        SetPrivateField(manager, "_rasConnection", (nint)0x7002);
+        var expectedHandle = (nint)0x7002;
+        SetPrivateField(manager, "_rasConnection", expectedHandle);
 
         try
         {
@@ -91,16 +117,16 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
         {
         }
 
-        if (native.HangUpCount != 1 || native.LastHungUpHandle != (nint)0x7002)
+        if (native.HangUpCount != 2 || native.LastHungUpHandle != expectedHandle)
         {
             throw new InvalidOperationException(
-                "RAS manager disposal did not attempt hangup of the exact owned handle.");
+                "Initial RAS manager disposal did not perform its bounded immediate retry of the exact handle.");
         }
 
-        if (GetPrivateField<nint>(manager, "_rasConnection") != 0)
+        if (GetPrivateField<nint>(manager, "_rasConnection") != expectedHandle)
         {
             throw new InvalidOperationException(
-                "RAS manager retained its connection handle after failed disposal cleanup.");
+                "Repeated failed RasHangUp calls did not retain the exact residual handle safely.");
         }
 
         if (!CancellationSourceWasDisposed(shutdown))
@@ -109,13 +135,29 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
                 "RAS manager retained its shutdown CancellationTokenSource after cleanup failed.");
         }
 
-        // Disposal is an ownership transition even when cleanup reported a defect;
-        // subsequent DisposeAsync calls must remain harmless and must not repeat hangup.
+        // Disposed state blocks new connection ownership, but residual native state is
+        // still retryable. A later DisposeAsync must drain that exact handle instead of
+        // turning the first cleanup failure into a process-lifetime native leak.
         await manager.DisposeAsync();
-        if (native.HangUpCount != 1)
+        if (native.HangUpCount != 3 || native.LastHungUpHandle != expectedHandle)
         {
             throw new InvalidOperationException(
-                "Repeated RAS manager disposal duplicated native hangup ownership.");
+                "Repeated DisposeAsync did not retry the retained native RAS handle.");
+        }
+
+        if (native.GetConnectStatusCount == 0 ||
+            GetPrivateField<nint>(manager, "_rasConnection") != 0)
+        {
+            throw new InvalidOperationException(
+                "Residual RAS cleanup retry did not reach terminal invalid-handle state.");
+        }
+
+        // Once terminal cleanup succeeds, further DisposeAsync calls are idempotent.
+        await manager.DisposeAsync();
+        if (native.HangUpCount != 3)
+        {
+            throw new InvalidOperationException(
+                "Successful residual cleanup was repeated by an idempotent DisposeAsync call.");
         }
     }
 
@@ -168,14 +210,15 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
 
     private sealed class CleanupRasNative : IRasDialNative
     {
-        private readonly uint _hangUpResult;
+        private readonly Queue<uint> _hangUpResults;
 
-        public CleanupRasNative(uint hangUpResult)
+        public CleanupRasNative(params uint[] hangUpResults)
         {
-            _hangUpResult = hangUpResult;
+            _hangUpResults = new Queue<uint>(hangUpResults);
         }
 
         public int HangUpCount { get; private set; }
+        public int GetConnectStatusCount { get; private set; }
         public nint LastHungUpHandle { get; private set; }
 
         public uint Dial(
@@ -193,12 +236,16 @@ internal static class RasConnectionManagerCleanupFailureSelfTests
         {
             HangUpCount++;
             LastHungUpHandle = rasConnection;
-            return _hangUpResult;
+            return _hangUpResults.Count == 0
+                ? RasNative.ErrorSuccess
+                : _hangUpResults.Dequeue();
         }
 
-        public uint GetConnectStatus(nint rasConnection) =>
-            throw new InvalidOperationException(
-                "Hangup-error path must not poll connection status.");
+        public uint GetConnectStatus(nint rasConnection)
+        {
+            GetConnectStatusCount++;
+            return RasDialer.ErrorInvalidHandle;
+        }
     }
 
     private sealed class SyntheticCleanupException : Exception
