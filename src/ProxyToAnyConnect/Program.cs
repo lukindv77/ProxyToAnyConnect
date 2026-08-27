@@ -60,6 +60,7 @@ internal static class Program
         finally
         {
             AppLog.Info("application.stop", "ProxyToAnyConnect GUI stopped.");
+            AppLog.Shutdown();
         }
     }
 
