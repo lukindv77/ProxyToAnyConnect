@@ -552,7 +552,9 @@ internal sealed class ProxyServer
     {
         if (!Uri.TryCreate(target, UriKind.Absolute, out var uri) ||
             !uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
-            string.IsNullOrWhiteSpace(uri.Host))
+            string.IsNullOrWhiteSpace(uri.Host) ||
+            !string.IsNullOrEmpty(uri.Fragment) ||
+            !string.IsNullOrEmpty(uri.UserInfo))
         {
             throw new InvalidDataException("Plain HTTP proxy requests must use an absolute http:// URI.");
         }
@@ -672,9 +674,22 @@ internal sealed class ProxyServer
                 throw new InvalidDataException("Invalid HTTP proxy request line.");
             }
 
-            var method = requestLine[requestParts[0]].ToString();
+            var methodSpan = requestLine[requestParts[0]];
+            var versionSpan = requestLine[requestParts[2]];
+            if (!IsValidHeaderName(methodSpan))
+            {
+                throw new InvalidDataException("Invalid HTTP method token.");
+            }
+
+            if (!versionSpan.SequenceEqual("HTTP/1.0".AsSpan()) &&
+                !versionSpan.SequenceEqual("HTTP/1.1".AsSpan()))
+            {
+                throw new InvalidDataException("Unsupported HTTP request version.");
+            }
+
+            var method = methodSpan.ToString();
             var target = requestLine[requestParts[1]].ToString();
-            var version = requestLine[requestParts[2]].ToString();
+            var version = versionSpan.ToString();
             var offset = requestLineEnd + 2;
 
             if (method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
