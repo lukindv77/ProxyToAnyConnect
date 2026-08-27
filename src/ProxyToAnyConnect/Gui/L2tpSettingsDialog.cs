@@ -234,6 +234,17 @@ internal sealed class L2tpSettingsDialog : Form
             : WindowsSecretProtector.Protect(enteredPlaintext);
     }
 
+    internal static int ClampNumericValue(int value, int minimum, int maximum) =>
+        Math.Clamp(value, minimum, maximum);
+
+    private static void SetNumericValue(NumericUpDown control, int value)
+    {
+        control.Value = ClampNumericValue(
+            value,
+            decimal.ToInt32(control.Minimum),
+            decimal.ToInt32(control.Maximum));
+    }
+
     private void BuildExistingGroup()
     {
         var layout = InnerLayout();
@@ -323,23 +334,24 @@ internal sealed class L2tpSettingsDialog : Form
         _shared.Checked = existing?.Shared ?? false;
         SelectEnum(_mode, existing?.Mode ?? L2tpConnectionMode.ExistingWindowsProfile);
 
-        _monitorInterval.Value = existing?.MonitorIntervalMilliseconds ?? 1000;
-        _routeMonitorInterval.Value = existing?.RouteMonitorIntervalMilliseconds ?? 5000;
-        _reconnectCooldown.Value = existing?.ReconnectCooldownMilliseconds ?? 5000;
+        SetNumericValue(_monitorInterval, existing?.MonitorIntervalMilliseconds ?? 1000);
+        SetNumericValue(_routeMonitorInterval, existing?.RouteMonitorIntervalMilliseconds ?? 5000);
+        SetNumericValue(_reconnectCooldown, existing?.ReconnectCooldownMilliseconds ?? 5000);
 
         _publicAddress.Text = existing?.Verification.PublicAddress ?? string.Empty;
         _probeHost.Text = existing?.Verification.ProbeHost ?? "api.ipify.org";
-        _probePort.Value = existing?.Verification.ProbePort ?? 443;
+        SetNumericValue(_probePort, existing?.Verification.ProbePort ?? 443);
         _probePath.Text = existing?.Verification.ProbePath ?? "/";
-        _verificationTimeout.Value = existing?.Verification.TimeoutSeconds ?? 10;
-        _verificationMaxResponse.Value = existing?.Verification.MaxResponseBytes
-            ?? VerificationOptions.DefaultResponseLimitBytes;
+        SetNumericValue(_verificationTimeout, existing?.Verification.TimeoutSeconds ?? 10);
+        SetNumericValue(
+            _verificationMaxResponse,
+            existing?.Verification.MaxResponseBytes ?? VerificationOptions.DefaultResponseLimitBytes);
 
         SelectEnum(_keepaliveMode, existing?.Keepalive.Mode ?? L2tpKeepaliveMode.Off);
         _keepaliveCustomIPv4.Text = existing?.Keepalive.CustomIPv4 ?? string.Empty;
-        _keepaliveInterval.Value = existing?.Keepalive.IntervalSeconds ?? 10;
-        _keepaliveTimeout.Value = existing?.Keepalive.TimeoutMilliseconds ?? 2000;
-        _keepaliveFailures.Value = existing?.Keepalive.FailureThreshold ?? 3;
+        SetNumericValue(_keepaliveInterval, existing?.Keepalive.IntervalSeconds ?? 10);
+        SetNumericValue(_keepaliveTimeout, existing?.Keepalive.TimeoutMilliseconds ?? 2000);
+        SetNumericValue(_keepaliveFailures, existing?.Keepalive.FailureThreshold ?? 3);
 
         _serverAddress.Text = existing?.Custom.ServerAddress ?? string.Empty;
         _userName.Text = existing?.Custom.UserName ?? string.Empty;
