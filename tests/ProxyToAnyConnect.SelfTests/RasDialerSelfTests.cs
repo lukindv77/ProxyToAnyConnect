@@ -15,13 +15,15 @@ internal static class RasDialerSelfTests
             await ConnectedNotificationReturnsExactHandleAsync();
             await CallerCancellationHangsUpAndDrainsAsync();
             await CallerCancellationSurvivesHangupFailureAsync();
+            await CallerCancellationSurvivesDrainTimeoutAsync();
+            await HangUpDrainAttemptIsBoundedAsync();
             await InitialFailureWithHandleStillDrainsAsync();
             await TerminalDialFailureHangsUpAndDrainsAsync();
             await DisconnectedBeforeConnectedHangsUpAndDrainsAsync();
             await RepeatedCancellationDoesNotDuplicateOwnershipAsync();
 
             Console.WriteLine(
-                "PASS: asynchronous RAS dial ownership clears managed passwords, preserves cancellation and drains exact connection handles");
+                "PASS: asynchronous RAS dial ownership clears managed passwords, preserves cancellation and bounds exact-handle teardown");
             return 0;
         }
         catch (Exception ex)
@@ -176,6 +178,71 @@ internal static class RasDialerSelfTests
 
         throw new InvalidOperationException(
             "A RasHangUp cleanup failure replaced or swallowed caller cancellation.");
+    }
+
+    private static async Task CallerCancellationSurvivesDrainTimeoutAsync()
+    {
+        var native = new FakeRasDialNative(statusSuccessesBeforeInvalid: int.MaxValue);
+        var dialer = new RasDialer(native, TimeSpan.FromMilliseconds(40));
+        using var cancellation = new CancellationTokenSource();
+        var dialTask = dialer.DialAsync(null, CreateDialParams(), cancellation.Token);
+
+        await native.WaitUntilDialStartedAsync();
+        cancellation.Cancel();
+
+        try
+        {
+            _ = await dialTask;
+        }
+        catch (OperationCanceledException ex) when (cancellation.IsCancellationRequested)
+        {
+            if (native.HangUpCount != 1 || native.StatusCount < 1 || native.InvalidHandleObserved)
+            {
+                throw new InvalidOperationException(
+                    "Timed-out cancellation teardown did not preserve exact non-terminal RAS ownership.");
+            }
+
+            if (ex.Data["RasTeardownError"] is not string teardownError ||
+                !teardownError.Contains("Timed out", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "Caller cancellation survived drain timeout but lost its secondary timeout diagnostic.");
+            }
+
+            return;
+        }
+
+        throw new InvalidOperationException(
+            "A bounded RAS drain timeout replaced or swallowed caller cancellation.");
+    }
+
+    private static async Task HangUpDrainAttemptIsBoundedAsync()
+    {
+        var native = new FakeRasDialNative(statusSuccessesBeforeInvalid: int.MaxValue);
+        var dialer = new RasDialer(native, TimeSpan.FromMilliseconds(40));
+        var startedAt = Environment.TickCount64;
+
+        try
+        {
+            await dialer.HangUpAndDrainAsync(native.Handle);
+            throw new InvalidOperationException(
+                "Non-terminal synthetic RAS state unexpectedly drained without invalid-handle proof.");
+        }
+        catch (TimeoutException ex) when (
+            ex.Message.Contains("ERROR_INVALID_HANDLE", StringComparison.Ordinal))
+        {
+        }
+
+        var elapsed = Environment.TickCount64 - startedAt;
+        if (elapsed > 1500 ||
+            native.HangUpCount != 1 ||
+            native.StatusCount < 1 ||
+            native.InvalidHandleObserved)
+        {
+            throw new InvalidOperationException(
+                $"Bounded RAS drain had unexpected ownership/timing: elapsed={elapsed}ms, " +
+                $"hangups={native.HangUpCount}, status={native.StatusCount}, invalid={native.InvalidHandleObserved}.");
+        }
     }
 
     private static async Task InitialFailureWithHandleStillDrainsAsync()
