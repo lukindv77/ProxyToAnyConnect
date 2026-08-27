@@ -1,0 +1,190 @@
+name: dev-issue25
+
+on:
+  push:
+    branches: [ dev/issue25-connect-authority-audit ]
+    paths:
+      - '.github/workflows/dev-issue25.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact dev head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Apply CONNECT authority hardening and run aggregate tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $proxy = 'src/ProxyToAnyConnect/Proxy/ProxyServer.cs'
+          $dns = 'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs'
+          $runner = 'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          if ((git hash-object $proxy).Trim() -ne '0e7fb2493af0cbaa47d87199f137d7e97baa93f5') {
+            throw 'ProxyServer.cs no longer matches issue #25 audited blob.'
+          }
+          if ((git hash-object $dns).Trim() -ne '75cc3e14d6dadd8a5b696afc745ad5c97a1aa385') {
+            throw 'L2tpDnsResolver.cs no longer matches issue #25 audited blob.'
+          }
+          if ((git hash-object $runner).Trim() -ne 'b9f4a666d7b16ecb2ec68f99159adebfa48a1cdc') {
+            throw 'CombinedTestRunner.cs no longer matches issue #25 audited blob.'
+          }
+
+          @'
+          from pathlib import Path
+
+          proxy = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = proxy.read_text(encoding='utf-8')
+          start = text.index('    internal static (string Host, int Port) ParseAuthority(string authority, int defaultPort)\n')
+          end = text.index('    private static Uri ParseAbsoluteHttpUri(string target)\n', start)
+          replacement = '''    internal static (string Host, int Port) ParseAuthority(string authority, int defaultPort)
+              {
+                  if (string.IsNullOrWhiteSpace(authority))
+                  {
+                      throw new InvalidDataException("CONNECT target is empty.");
+                  }
+
+                  if (authority.StartsWith("[", StringComparison.Ordinal))
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  var separator = authority.IndexOf(':');
+                  if (separator >= 0 && authority.IndexOf(':', separator + 1) >= 0)
+                  {
+                      throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                  }
+
+                  var host = separator < 0 ? authority : authority[..separator];
+                  var port = defaultPort;
+                  if (separator >= 0 &&
+                      (!int.TryParse(authority[(separator + 1)..], out port) || port is < 1 or > 65535))
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                  }
+
+                  if (host.Length == 0)
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                  }
+
+                  foreach (var character in host)
+                  {
+                      if (character <= 0x20 || character == 0x7F ||
+                          character is '@' or '/' or '?' or '#' or '\\\\' or ':')
+                      {
+                          throw new InvalidDataException($"Invalid CONNECT target '{authority}'.");
+                      }
+                  }
+
+                  if (IPAddress.TryParse(host, out var literal))
+                  {
+                      if (literal.AddressFamily != AddressFamily.InterNetwork)
+                      {
+                          throw new NotSupportedException("IPv6 proxy targets are not supported yet.");
+                      }
+
+                      return (literal.ToString(), port);
+                  }
+
+                  try
+                  {
+                      return (L2tpDnsResolver.NormalizeDnsHostStrict(host), port);
+                  }
+                  catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+                  {
+                      throw new InvalidDataException($"Invalid CONNECT target '{authority}'.", ex);
+                  }
+              }
+
+          '''
+          text = text[:start] + replacement + text[end:]
+          proxy.write_text(text, encoding='utf-8', newline='')
+
+          dns = Path('src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs')
+          dns_text = dns.read_text(encoding='utf-8')
+          old = '''    private static string NormalizeDnsName(string host) =>
+                  IdnMapping.GetAscii(host.Trim().TrimEnd('.')).ToLowerInvariant();'''
+          new = '''    private static string NormalizeDnsName(string host) =>
+                  NormalizeDnsHostStrict(host.Trim().TrimEnd('.'));
+
+              internal static string NormalizeDnsHostStrict(string host)
+              {
+                  if (string.IsNullOrEmpty(host))
+                  {
+                      throw new InvalidOperationException("DNS host is empty.");
+                  }
+
+                  var asciiHost = IdnMapping.GetAscii(host).ToLowerInvariant();
+                  if (asciiHost.Length > 253)
+                  {
+                      throw new InvalidOperationException("DNS host exceeds 253 ASCII characters.");
+                  }
+
+                  var labelStart = 0;
+                  for (var i = 0; i <= asciiHost.Length; i++)
+                  {
+                      if (i < asciiHost.Length && asciiHost[i] != '.')
+                      {
+                          continue;
+                      }
+
+                      var labelLength = i - labelStart;
+                      if (labelLength is 0 or > 63 ||
+                          asciiHost[labelStart] == '-' ||
+                          asciiHost[i - 1] == '-')
+                      {
+                          throw new InvalidOperationException($"Invalid DNS label in '{host}'.");
+                      }
+
+                      for (var j = labelStart; j < i; j++)
+                      {
+                          var character = asciiHost[j];
+                          if (!char.IsAsciiLetterOrDigit(character) && character != '-')
+                          {
+                              throw new InvalidOperationException($"Invalid DNS label in '{host}'.");
+                          }
+                      }
+
+                      labelStart = i + 1;
+                  }
+
+                  return asciiHost;
+              }'''
+          if dns_text.count(old) != 1:
+              raise SystemExit(f'expected one DNS normalization helper, got {dns_text.count(old)}')
+          dns.write_text(dns_text.replace(old, new), encoding='utf-8', newline='')
+
+          runner = Path('tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs')
+          runner_text = runner.read_text(encoding='utf-8')
+          anchor = '        Run(nameof(ProxyConnectSetupSelfTests), ProxyConnectSetupSelfTests.Run);\n'
+          addition = anchor + '        await RunAsync(nameof(ProxyConnectAuthoritySelfTests), ProxyConnectAuthoritySelfTests.RunAsync);\n'
+          if runner_text.count(anchor) != 1:
+              raise SystemExit(f'expected one CONNECT runner anchor, got {runner_text.count(anchor)}')
+          runner.write_text(runner_text.replace(anchor, addition), encoding='utf-8', newline='')
+          '@ | python -
+
+          git diff --check
+          $changed = @(git diff --name-only)
+          $expected = @($proxy, $dns, $runner)
+          if ($changed.Count -ne 3 -or @($changed | Where-Object { $_ -notin $expected }).Count -ne 0) {
+            throw "Unexpected issue #25 patch result: $($changed -join ', ')"
+          }
+
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add $proxy $dns $runner
+          git commit -m 'proxy: enforce strict CONNECT authority grammar'
+          git push origin HEAD:refs/heads/dev/issue25-connect-authority-audit
