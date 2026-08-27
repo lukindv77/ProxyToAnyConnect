@@ -269,5 +269,7 @@ internal static class EditableConfigurationWorkflowSelfTests
             Custom = source.Custom
         };
 
-    private sealed class SyntheticRuntimeFailureException : Exception;
+    private sealed class SyntheticRuntimeFailureException : Exception
+    {
+    }
 }
