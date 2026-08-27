@@ -23,7 +23,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           python .github/scripts/dev-issue36.py
-          git diff --check
+          git -c core.whitespace=cr-at-eol diff --check
           $changed = @(git diff --name-only)
           $expected = @('.github/workflows/build.yml', '.github/workflows/handoff.yml')
           if ($changed.Count -ne 2) {
