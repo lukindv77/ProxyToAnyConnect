@@ -40,30 +40,48 @@ $outputPath = [IO.Path]::GetFullPath($OutputDirectory)
 $metadataPath = Join-Path $outputPath 'metadata.json'
 $samplesPath = Join-Path $outputPath 'process-samples.jsonl'
 $summaryPath = Join-Path $outputPath 'summary.json'
+$resultPath = Join-Path $outputPath 'result.json'
 $manifestPath = Join-Path $outputPath 'manifest.json'
 
 $metadata = Read-JsonFile -Path $metadataPath
 $summary = Read-JsonFile -Path $summaryPath
+$resultFile = Read-JsonFile -Path $resultPath
 $manifest = Read-JsonFile -Path $manifestPath
 
-if ($metadata.schemaVersion -ne 1 -or $summary.schemaVersion -ne 1 -or $manifest.schemaVersion -ne 1) {
+if ($metadata.schemaVersion -ne 1 -or
+    $summary.schemaVersion -ne 1 -or
+    $resultFile.schemaVersion -ne 1 -or
+    $manifest.schemaVersion -ne 1) {
     throw 'Unsupported Windows soak evidence schema version.'
 }
 
-if (-not $summary.completed) {
+if (-not $summary.completed -or -not $resultFile.completed) {
     throw "Soak evidence collector did not complete: $($summary.failureType): $($summary.failureMessage)"
 }
 
 if (-not ([string]$metadata.executableSha256).Equals($expectedHash, [StringComparison]::Ordinal) -or
-    -not ([string]$summary.executableSha256).Equals($expectedHash, [StringComparison]::Ordinal)) {
+    -not ([string]$summary.executableSha256).Equals($expectedHash, [StringComparison]::Ordinal) -or
+    -not ([string]$resultFile.executableSha256).Equals($expectedHash, [StringComparison]::Ordinal)) {
     throw 'Soak evidence executable SHA-256 does not match the expected release binary.'
 }
 
+# Every emitted payload except the manifest itself must be covered by the manifest.
+# This makes the directory portable and tamper-evident without embedding any host path.
+$requiredManifestNames = @('metadata.json', 'process-samples.jsonl', 'summary.json', 'result.json')
 $manifestEntries = @($manifest.files)
-foreach ($requiredName in @('metadata.json', 'process-samples.jsonl', 'summary.json')) {
+if ($manifestEntries.Count -ne $requiredManifestNames.Count) {
+    throw "Manifest contains $($manifestEntries.Count) file entry/entries; exactly $($requiredManifestNames.Count) are required."
+}
+
+foreach ($requiredName in $requiredManifestNames) {
     $entry = @($manifestEntries | Where-Object { $_.path -eq $requiredName })
     if ($entry.Count -ne 1) {
         throw "Manifest must contain exactly one '$requiredName' entry."
+    }
+
+    if ([IO.Path]::IsPathRooted([string]$entry[0].path) -or
+        -not ([string]$entry[0].path).Equals($requiredName, [StringComparison]::Ordinal)) {
+        throw "Manifest path '$($entry[0].path)' is not a portable bundle-relative path."
     }
 
     $filePath = Join-Path $outputPath $requiredName
@@ -77,6 +95,12 @@ foreach ($requiredName in @('metadata.json', 'process-samples.jsonl', 'summary.j
     }
 }
 
+# result.json is intentionally transport-neutral. Reject reintroduction of the old
+# absolute outputDirectory field so a copied bundle remains machine-independent.
+if ($null -ne $resultFile.PSObject.Properties['outputDirectory']) {
+    throw 'Soak result.json must not contain a host-specific outputDirectory field.'
+}
+
 if (-not (Test-Path -LiteralPath $samplesPath -PathType Leaf)) {
     throw "Required soak sample stream is missing: $samplesPath"
 }
@@ -85,8 +109,9 @@ $sampleLines = @(Get-Content -LiteralPath $samplesPath | Where-Object { -not [st
 if ($sampleLines.Count -lt $MinimumSamples) {
     throw "Soak evidence contains $($sampleLines.Count) sample(s); at least $MinimumSamples are required."
 }
-if ($sampleLines.Count -ne [int]$summary.sampleCount) {
-    throw 'Soak summary sampleCount does not match the sample stream.'
+if ($sampleLines.Count -ne [int]$summary.sampleCount -or
+    $sampleLines.Count -ne [int]$resultFile.sampleCount) {
+    throw 'Soak sample count does not match summary/result metadata.'
 }
 
 $previousTimestamp = $null
@@ -117,6 +142,9 @@ for ($index = 0; $index -lt $sampleLines.Count; $index++) {
 if ([double]$summary.observedDurationSeconds -lt $MinimumObservedDurationSeconds) {
     throw "Observed soak duration $($summary.observedDurationSeconds)s is below required ${MinimumObservedDurationSeconds}s."
 }
+if ([Math]::Abs([double]$summary.observedDurationSeconds - [double]$resultFile.observedDurationSeconds) -gt 0.001) {
+    throw 'Soak result observedDurationSeconds does not match summary.json.'
+}
 
 $result = [ordered]@{
     schemaVersion = 1
@@ -132,7 +160,8 @@ $result = [ordered]@{
     maxPrivateBytes = [long]$summary.maxPrivateBytes
     maxHandleCount = [int]$summary.maxHandleCount
     maxThreadCount = [int]$summary.maxThreadCount
-    assessment = 'Integrity and process identity validated. Memory-leak acceptance still requires workload-aware review of the series and application managed-heap logs.'
+    manifestFileCount = $manifestEntries.Count
+    assessment = 'Integrity, portability and process identity validated. Memory-leak acceptance still requires workload-aware review of the series and application managed-heap logs.'
 }
 
 ConvertTo-Json -InputObject $result -Depth 4
