@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Diagnostics;
 
@@ -175,10 +176,19 @@ internal sealed class ProxyRuntimeHost : IAsyncDisposable
             return;
         }
 
+        Exception? cleanupFailure = null;
+
         // Wake any foreground Start/Pause/Apply operation before waiting for the
-        // host gate it may currently own. Otherwise host shutdown could never reach
-        // the coordinator's own cancellation/drain path.
-        _lifetime.Cancel();
+        // host gate it may currently own. A throwing linked-token callback is a
+        // cleanup defect, but it must not prevent disposal of the exact coordinator.
+        try
+        {
+            _lifetime.Cancel();
+        }
+        catch (Exception ex)
+        {
+            CaptureHostCleanupFailure(ref cleanupFailure, ex, "lifetime-cancel");
+        }
 
         await _gate.WaitAsync();
         try
@@ -186,14 +196,61 @@ internal sealed class ProxyRuntimeHost : IAsyncDisposable
             var runtime = Interlocked.Exchange(ref _current, null);
             if (runtime is not null)
             {
-                await runtime.DisposeAsync();
+                try
+                {
+                    await runtime.DisposeAsync();
+                }
+                catch (Exception ex)
+                {
+                    CaptureHostCleanupFailure(ref cleanupFailure, ex, "coordinator-dispose");
+                }
             }
         }
         finally
         {
             _gate.Release();
-            _gate.Dispose();
-            _lifetime.Dispose();
+            try
+            {
+                _gate.Dispose();
+            }
+            catch (Exception ex)
+            {
+                CaptureHostCleanupFailure(ref cleanupFailure, ex, "gate-token");
+            }
+
+            try
+            {
+                _lifetime.Dispose();
+            }
+            catch (Exception ex)
+            {
+                CaptureHostCleanupFailure(ref cleanupFailure, ex, "lifetime-token");
+            }
+        }
+
+        RethrowHostCleanupFailure(cleanupFailure);
+    }
+
+    private static void CaptureHostCleanupFailure(
+        ref Exception? primaryFailure,
+        Exception failure,
+        string phase)
+    {
+        if (primaryFailure is null)
+        {
+            primaryFailure = failure;
+            return;
+        }
+
+        primaryFailure.Data[$"RuntimeHostCleanup:{phase}"] =
+            $"{failure.GetType().FullName}: {failure.Message}";
+    }
+
+    private static void RethrowHostCleanupFailure(Exception? cleanupFailure)
+    {
+        if (cleanupFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
         }
     }
 }
