@@ -1,0 +1,139 @@
+name: dev-issue23-perf2
+
+on:
+  push:
+    branches: [ dev/issue23-connect-perf2 ]
+    paths:
+      - '.github/workflows/dev-issue23-perf2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  optimize-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact dev head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Apply linear CONNECT validation and run aggregate tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = 'src/ProxyToAnyConnect/Proxy/ProxyServer.cs'
+          if ((git hash-object $source).Trim() -ne '0e7fb2493af0cbaa47d87199f137d7e97baa93f5') {
+            throw 'ProxyServer.cs no longer matches the exact issue #23 main blob.'
+          }
+
+          @'
+          from pathlib import Path
+
+          source = Path('src/ProxyToAnyConnect/Proxy/ProxyServer.cs')
+          text = source.read_text(encoding='utf-8')
+
+          old_char = '''        private static bool IsValidHeaderNameCharacter(char character) =>
+                      character <= 0x7F &&
+                      (char.IsAsciiLetterOrDigit(character) ||
+                       character is '!' or '#' or '$' or '%' or '&' or '\\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~');'''
+          new_char = '''        private static bool IsValidHeaderNameCharacter(char character) =>
+                      (uint)(character - '0') <= 9 ||
+                      (uint)((character | 0x20) - 'a') <= 25 ||
+                      character is '!' or '#' or '$' or '%' or '&' or '\\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~';'''
+          if text.count(old_char) != 1:
+              raise SystemExit(f'expected one tchar helper, got {text.count(old_char)}')
+          text = text.replace(old_char, new_char)
+
+          start = text.index('        private static void ValidateHeaderLines(string text, int offset)\n')
+          end = text.index('        public byte[] BuildOriginHeader(string pathAndQuery)\n', start)
+          replacement = '''        private static void ValidateHeaderLines(string text, int offset)
+                  {
+                      var lineHasName = false;
+                      var seenColon = false;
+
+                      for (var i = offset; i < text.Length; i++)
+                      {
+                          var character = text[i];
+                          if (character == '\\r')
+                          {
+                              if (i + 1 >= text.Length || text[i + 1] != '\\n')
+                              {
+                                  throw new InvalidDataException("Invalid HTTP header line.");
+                              }
+
+                              if (!lineHasName && !seenColon)
+                              {
+                                  return;
+                              }
+
+                              if (!seenColon)
+                              {
+                                  throw new InvalidDataException("Invalid HTTP header line.");
+                              }
+
+                              lineHasName = false;
+                              seenColon = false;
+                              i++;
+                              continue;
+                          }
+
+                          if (character == '\\n')
+                          {
+                              throw new InvalidDataException("Invalid HTTP header line.");
+                          }
+
+                          if (!seenColon)
+                          {
+                              if (character == ':')
+                              {
+                                  if (!lineHasName)
+                                  {
+                                      throw new InvalidDataException("Invalid HTTP header line.");
+                                  }
+
+                                  seenColon = true;
+                                  continue;
+                              }
+
+                              if (!IsValidHeaderNameCharacter(character))
+                              {
+                                  throw new InvalidDataException("Invalid HTTP header name.");
+                              }
+
+                              lineHasName = true;
+                              continue;
+                          }
+
+                          if ((character < 0x20 && character != '\\t') || character == 0x7F)
+                          {
+                              throw new InvalidDataException("Invalid HTTP header field value.");
+                          }
+                      }
+
+                      throw new InvalidDataException("Invalid HTTP header line.");
+                  }
+
+          '''
+          text = text[:start] + replacement + text[end:]
+          source.write_text(text, encoding='utf-8', newline='')
+          '@ | python -
+
+          git diff --check
+          $changed = @(git diff --name-only)
+          if ($changed.Count -ne 1 -or $changed[0] -ne $source) {
+            throw "Unexpected issue #23 perf2 patch result: $($changed -join ', ')"
+          }
+
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+
+          git config user.name 'ProxyToAnyConnect CI'
+          git config user.email 'actions@github.com'
+          git add $source
+          git commit -m 'proxy: scan CONNECT headers in one linear pass'
+          git push origin HEAD:refs/heads/dev/issue23-connect-perf2
