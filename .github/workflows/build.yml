@@ -158,40 +158,68 @@ jobs:
             throw 'Soak evidence validator accepted a post-manifest result.json mutation.'
           }
 
-          # Correlate a schema-faithful managed-memory log record with the exact
-          # external soak PID/start-time identity. Production emits these fields from
-          # ProcessMemoryHealthMonitor; the smoke avoids launching the GUI/VPN stack.
+          # Correlate schema-faithful managed-memory records with the exact external
+          # soak PID/start-time identity. Split records across multiple files and
+          # deliberately provide them out of chronological order: the correlation
+          # validator must use bounded timestamp-extreme aggregation, not input order.
           $metadata = Get-Content -LiteralPath (Join-Path $output 'metadata.json') -Raw | ConvertFrom-Json
-          $memoryLog = './artifacts/windows-soak-memory-smoke.jsonl'
-          $memoryEntry = [ordered]@{
-            TimestampUtc = ([DateTimeOffset]::Parse([string]$metadata.startedAtUtc)).AddMilliseconds(500).ToString('O')
-            Level = 'Information'
-            Event = 'process.memory.periodic'
-            Message = 'synthetic hosted correlation smoke'
-            Data = [ordered]@{
-              ProcessId = [int]$metadata.processId
-              ProcessStartTimeUtc = [string]$metadata.processStartTimeUtc
-              ManagedHeapBytes = 1
-              TotalAllocatedBytes = 2
-              WorkingSetBytes = 3
-              PrivateBytes = 4
-              Gen0Collections = 0
-              Gen1Collections = 0
-              Gen2Collections = 0
-              HandleCount = 5
-              ThreadCount = 6
+          $started = [DateTimeOffset]::Parse([string]$metadata.startedAtUtc)
+          function New-MemoryEntry([int]$offsetMilliseconds, [long]$heap, [long]$allocated, [long]$working, [long]$private, [int]$handles, [int]$threads) {
+            [ordered]@{
+              TimestampUtc = $started.AddMilliseconds($offsetMilliseconds).ToString('O')
+              Level = 'Information'
+              Event = 'process.memory.periodic'
+              Message = 'synthetic hosted correlation smoke'
+              Data = [ordered]@{
+                ProcessId = [int]$metadata.processId
+                ProcessStartTimeUtc = [string]$metadata.processStartTimeUtc
+                ManagedHeapBytes = $heap
+                TotalAllocatedBytes = $allocated
+                WorkingSetBytes = $working
+                PrivateBytes = $private
+                Gen0Collections = 0
+                Gen1Collections = 0
+                Gen2Collections = 0
+                HandleCount = $handles
+                ThreadCount = $threads
+              }
+              Exception = $null
             }
-            Exception = $null
           }
-          $memoryEntry | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $memoryLog -Encoding utf8
 
-          ./tools/Test-WindowsSoakLogCorrelation.ps1 `
+          $early = New-MemoryEntry 250 10 100 30 40 5 6
+          $middle = New-MemoryEntry 500 20 200 90 80 15 16
+          $late = New-MemoryEntry 750 30 300 60 120 10 26
+          $memoryLogA = './artifacts/windows-soak-memory-late-early.jsonl'
+          $memoryLogB = './artifacts/windows-soak-memory-middle.jsonl'
+          @($late, $early) | ForEach-Object { $_ | ConvertTo-Json -Depth 6 -Compress } |
+            Set-Content -LiteralPath $memoryLogA -Encoding utf8
+          $middle | ConvertTo-Json -Depth 6 -Compress |
+            Set-Content -LiteralPath $memoryLogB -Encoding utf8
+
+          $correlationJson = ./tools/Test-WindowsSoakLogCorrelation.ps1 `
             -OutputDirectory $output `
-            -ApplicationLogPath $memoryLog `
-            -MinimumMemoryRecords 1 | Write-Host
+            -ApplicationLogPath @($memoryLogA, $memoryLogB) `
+            -MinimumMemoryRecords 3
+          $correlation = $correlationJson | ConvertFrom-Json
+          $correlation | ConvertTo-Json -Depth 4 | Write-Host
+          if (-not $correlation.correlated -or
+              $correlation.applicationLogCount -ne 2 -or
+              $correlation.memoryRecordCount -ne 3 -or
+              $correlation.firstManagedHeapBytes -ne 10 -or
+              $correlation.lastManagedHeapBytes -ne 30 -or
+              $correlation.managedHeapDeltaBytes -ne 20 -or
+              $correlation.firstTotalAllocatedBytes -ne 100 -or
+              $correlation.lastTotalAllocatedBytes -ne 300 -or
+              $correlation.maxWorkingSetBytes -ne 90 -or
+              $correlation.maxPrivateBytes -ne 120 -or
+              $correlation.maxHandleCount -ne 15 -or
+              $correlation.maxThreadCount -ne 26) {
+            throw 'Multi-file soak/log correlation did not preserve timestamp-extreme/scalar aggregate semantics.'
+          }
 
           $wrongIdentityLog = './artifacts/windows-soak-memory-wrong-identity.jsonl'
-          $wrongIdentityEntry = Get-Content -LiteralPath $memoryLog -Raw | ConvertFrom-Json
+          $wrongIdentityEntry = New-MemoryEntry 500 1 2 3 4 5 6
           $wrongIdentityEntry.Data.ProcessId = [int]$metadata.processId + 1
           $wrongIdentityEntry | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $wrongIdentityLog -Encoding utf8
           $identityMismatchRejected = $false
