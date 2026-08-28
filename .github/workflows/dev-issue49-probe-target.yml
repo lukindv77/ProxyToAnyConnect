@@ -44,6 +44,19 @@ jobs:
           }
 
           & ./.github/validation/issue49-transform.ps1
+
+          $requestTests = 'tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs'
+          $text = [IO.File]::ReadAllText($requestTests).Replace("`r`n", "`n")
+          $oldUsing = "using System.Diagnostics;`nusing System.Text;"
+          $newUsing = "using System.Diagnostics;`nusing System.Text;`nusing ProxyToAnyConnect.Configuration;"
+          if ([regex]::Matches($text, [regex]::Escape($oldUsing)).Count -ne 1) {
+            throw 'Unexpected VerificationProbeRequestSelfTests using surface.'
+          }
+          [IO.File]::WriteAllText(
+            $requestTests,
+            $text.Replace($oldUsing, $newUsing),
+            [Text.UTF8Encoding]::new($false))
+
           $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
           git add -- $expectedPaths
           git config core.whitespace cr-at-eol
