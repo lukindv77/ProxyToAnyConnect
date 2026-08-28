@@ -76,7 +76,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release --no-build
+          dotnet .\tests\ProxyToAnyConnect.SelfTests\bin\x64\Release\net10.0-windows\win-x64\ProxyToAnyConnect.SelfTests.dll
       - name: Publish validated issue 89 source
         shell: pwsh
         run: |
