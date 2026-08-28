@@ -1,0 +1,88 @@
+name: dev-issue95-unique-interface
+
+on:
+  push:
+    branches:
+      - dev/issue95-unique-interface
+    paths:
+      - .github/workflows/dev-issue95-unique-interface.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 95 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = 'f0763ec9337a0758c45a0add65e27d4b8f689482'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          $expected = @{
+            'src/ProxyToAnyConnect/Vpn/VpnInterfaceResolver.cs' = 'f73a4263e76ca200cd78c46a05c2a08ea6b17c3b'
+            'tests/ProxyToAnyConnect.SelfTests/NativeRouteSelfTests.cs' = '2f26baacb78721e115b8a3653d10da0a3b321af0'
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            if ((git rev-parse "$expectedBase`:$($entry.Key)").Trim() -ne $entry.Value) {
+              throw "Unexpected #95 base blob: $($entry.Key)"
+            }
+          }
+          if ((git rev-parse 'HEAD:.github/validation/issue95-transform.ps1').Trim() -ne '2cb143839910de18d3f0669354dce7f101f06e9e') {
+            throw 'Unexpected #95 transform blob.'
+          }
+
+          $expectedSurface = @(
+            '.github/validation/issue95-transform.ps1'
+            '.github/workflows/dev-issue95-unique-interface.yml'
+          ) | Sort-Object
+          $surface = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
+          if (($surface -join "`n") -ne ($expectedSurface -join "`n")) {
+            throw "Unexpected #95 branch surface: $($surface -join ', ')"
+          }
+
+          & ./.github/validation/issue95-transform.ps1
+          git add -- `
+            src/ProxyToAnyConnect/Vpn/VpnInterfaceResolver.cs `
+            tests/ProxyToAnyConnect.SelfTests/NativeRouteSelfTests.cs
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+
+          $expectedStaged = @(
+            'src/ProxyToAnyConnect/Vpn/VpnInterfaceResolver.cs'
+            'tests/ProxyToAnyConnect.SelfTests/NativeRouteSelfTests.cs'
+          ) | Sort-Object
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedStaged -join "`n")) {
+            throw "Unexpected #95 staged surface: $($staged -join ', ')"
+          }
+      - name: Build release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet build ProxyToAnyConnect.sln -c Release
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet .\tests\ProxyToAnyConnect.SelfTests\bin\x64\Release\net10.0-windows\win-x64\ProxyToAnyConnect.SelfTests.dll
+      - name: Publish validated issue 95 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'vpn: require unique PPP interface mapping'
+          git push origin HEAD:dev/issue95-unique-interface
