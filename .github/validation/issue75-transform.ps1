@@ -81,7 +81,10 @@ Replace-Exact $proxyPath @'
             await clientStream.WriteAsync(ConnectionEstablished, cancellationToken);
             if (!remainder.IsEmpty)
             {
-                await upstreamStream.WriteAsync(remainder, cancellationToken);
+                await WriteConnectRemainderAfterCommitAsync(
+                    upstreamStream,
+                    remainder,
+                    cancellationToken);
                 RecordSent(remainder.Length);
             }
 
@@ -116,6 +119,10 @@ Replace-Exact $proxyPath @'
             // Preserve explicit proxy Pause/Shutdown cancellation semantics.
             throw;
         }
+        catch (ProxyResponseCommittedException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             throw new ProxyResponseCommittedException(
@@ -127,7 +134,34 @@ Replace-Exact $proxyPath @'
 Replace-Exact $proxyPath @'
     private readonly record struct RequestReadResult(ParsedProxyRequest Request, byte[] Remainder);
 '@ @'
-    private sealed class ProxyResponseCommittedException : Exception
+    internal static async Task WriteConnectRemainderAfterCommitAsync(
+        Stream upstreamStream,
+        ReadOnlyMemory<byte> remainder,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(upstreamStream);
+        if (remainder.IsEmpty)
+        {
+            return;
+        }
+
+        try
+        {
+            await upstreamStream.WriteAsync(remainder, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new ProxyResponseCommittedException(
+                "CONNECT response was already committed before remainder forwarding failed.",
+                ex);
+        }
+    }
+
+    internal sealed class ProxyResponseCommittedException : Exception
     {
         public ProxyResponseCommittedException(string message, Exception innerException)
             : base(message, innerException)
