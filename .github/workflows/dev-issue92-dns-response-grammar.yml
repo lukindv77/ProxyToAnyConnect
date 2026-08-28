@@ -37,7 +37,7 @@ jobs:
               throw "Unexpected #92 base blob: $($entry.Key)"
             }
           }
-          if ((git rev-parse 'HEAD:.github/validation/issue92-transform.ps1').Trim() -ne '66d009e79009752f4da8ad59553bcc40b701c355') {
+          if ((git rev-parse 'HEAD:.github/validation/issue92-transform.ps1').Trim() -ne '58fe4b63c52c3c20942b68b43739ba2a4828e5e8') {
             throw 'Unexpected #92 transform blob.'
           }
 
