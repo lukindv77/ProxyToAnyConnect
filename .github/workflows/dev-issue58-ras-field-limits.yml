@@ -45,7 +45,33 @@ jobs:
             if ($actual -ne $entry.Value) { throw "Unexpected base blob for $($entry.Key): $actual" }
           }
 
+          # The original deterministic transform was authored against the previous
+          # one-parameter BuildEntry signature. Current production passes the selected
+          # RAS device explicitly. Normalize only that exact signature for transport,
+          # run the already-hashed transform, then restore the production signature so
+          # the validated source diff cannot accidentally regress device ownership.
+          $phonebookPath = 'src/ProxyToAnyConnect/Vpn/EphemeralRasPhonebook.cs'
+          $productionSignature = '    private static RasNative.RasEntry BuildEntry(L2tpOptions options, RasNative.RasDevInfo device)'
+          $transportSignature = '    private static RasNative.RasEntry BuildEntry(L2tpOptions options)'
+          $phonebookText = [IO.File]::ReadAllText($phonebookPath).Replace("`r`n", "`n")
+          if ([regex]::Matches($phonebookText, [regex]::Escape($productionSignature)).Count -ne 1) {
+            throw 'Unexpected production BuildEntry signature before issue58 transform.'
+          }
+          [IO.File]::WriteAllText(
+            $phonebookPath,
+            $phonebookText.Replace($productionSignature, $transportSignature),
+            [Text.UTF8Encoding]::new($false))
+
           & ./.github/validation/issue58-transform.ps1
+
+          $phonebookText = [IO.File]::ReadAllText($phonebookPath).Replace("`r`n", "`n")
+          if ([regex]::Matches($phonebookText, [regex]::Escape($transportSignature)).Count -ne 1) {
+            throw 'Issue58 transform did not preserve the expected BuildEntry transport signature.'
+          }
+          [IO.File]::WriteAllText(
+            $phonebookPath,
+            $phonebookText.Replace($transportSignature, $productionSignature),
+            [Text.UTF8Encoding]::new($false))
 
           $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
           git add -- $expectedPaths
