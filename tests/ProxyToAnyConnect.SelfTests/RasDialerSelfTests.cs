@@ -12,6 +12,8 @@ internal static class RasDialerSelfTests
         {
             await NativeHandoffDoesNotRetainManagedPasswordAsync();
             await NativeThrowStillClearsManagedPasswordAsync();
+            await PreCanceledDialClearsManagedPasswordAsync();
+            await PreDialScopeFailureClearsManagedPasswordAsync();
             await ConnectedNotificationReturnsExactHandleAsync();
             await CallerCancellationHangsUpAndDrainsAsync();
             await CallerCancellationSurvivesHangupFailureAsync();
@@ -94,6 +96,59 @@ internal static class RasDialerSelfTests
         {
             throw new InvalidOperationException(
                 "Managed RasDialParams retained plaintext password after native Dial threw.");
+        }
+    }
+
+    private static async Task PreCanceledDialClearsManagedPasswordAsync()
+    {
+        var native = new FakeRasDialNative();
+        var dialer = new RasDialer(native);
+        var dialParams = CreateDialParams(SyntheticPassword);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        try
+        {
+            _ = await dialer.DialAsync(null, dialParams, cancellation.Token);
+            throw new InvalidOperationException(
+                "Already-cancelled RasDial unexpectedly reached native handoff.");
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+        }
+
+        if (dialParams.SzPassword.Length != 0)
+        {
+            throw new InvalidOperationException(
+                "Already-cancelled RasDial retained the managed plaintext password carrier.");
+        }
+
+        if (native.PasswordObservedDuringDial is not null)
+        {
+            throw new InvalidOperationException(
+                "Already-cancelled RasDial invoked the native adapter before cancellation propagation.");
+        }
+    }
+
+    private static async Task PreDialScopeFailureClearsManagedPasswordAsync()
+    {
+        var dialParams = CreateDialParams(SyntheticPassword);
+        try
+        {
+            _ = await RasConnectionManager.ExecuteDialPasswordScopeAsync(
+                dialParams,
+                () => throw new SyntheticNativeDialException());
+            throw new InvalidOperationException(
+                "Synthetic pre-dial failure unexpectedly completed the password scope.");
+        }
+        catch (SyntheticNativeDialException)
+        {
+        }
+
+        if (dialParams.SzPassword.Length != 0)
+        {
+            throw new InvalidOperationException(
+                "RasConnectionManager pre-dial failure retained the managed plaintext password carrier.");
         }
     }
 

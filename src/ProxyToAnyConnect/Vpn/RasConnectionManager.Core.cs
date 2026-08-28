@@ -288,54 +288,60 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
         RasNative.RasDialParams? explicitDialParams,
         CancellationToken cancellationToken)
     {
-        RasNative.RasDialParams dialParams;
-        if (explicitDialParams is null)
+        var dialParams = explicitDialParams ?? new RasNative.RasDialParams
         {
-            dialParams = new RasNative.RasDialParams
-            {
-                DwSize = checked((uint)Marshal.SizeOf<RasNative.RasDialParams>()),
-                SzEntryName = entryName
-            };
+            DwSize = checked((uint)Marshal.SizeOf<RasNative.RasDialParams>()),
+            SzEntryName = entryName
+        };
 
-            var getParamsResult = RasNative.RasGetEntryDialParamsW(phoneBook, dialParams, out var hasSavedPassword);
-            if (getParamsResult != RasNative.ErrorSuccess)
-            {
-                throw new InvalidOperationException(
-                    $"Unable to load RAS entry '{entryName}': {RasNative.DescribeError(getParamsResult)}");
-            }
-
-            AppLog.Info(
-                "vpn.ras.parameters_loaded",
-                "RAS dial parameters were loaded from the Windows phone book.",
-                new
-                {
-                    VpnId = _options.Id,
-                    VpnName = _options.Name,
-                    EntryName = entryName,
-                    HasSavedPassword = hasSavedPassword,
-                    PhoneBookScope = phoneBook is null ? "CurrentUserDefault" : "ExplicitPhoneBook"
-                });
-        }
-        else
-        {
-            dialParams = explicitDialParams;
-            AppLog.Info(
-                "vpn.ras.parameters_loaded",
-                "RAS dial parameters were prepared from the custom ephemeral L2TP configuration.",
-                new
-                {
-                    VpnId = _options.Id,
-                    VpnName = _options.Name,
-                    EntryName = entryName,
-                    Mode = "CustomEphemeral",
-                    HasExplicitUserName = !_options.Custom.UseCurrentWindowsCredentials
-                });
-        }
-
-        var handle = await _dialer.DialAsync(
-            phoneBook,
+        var handle = await ExecuteDialPasswordScopeAsync(
             dialParams,
-            cancellationToken);
+            async () =>
+            {
+                if (explicitDialParams is null)
+                {
+                    var getParamsResult = RasNative.RasGetEntryDialParamsW(
+                        phoneBook,
+                        dialParams,
+                        out var hasSavedPassword);
+                    if (getParamsResult != RasNative.ErrorSuccess)
+                    {
+                        throw new InvalidOperationException(
+                            $"Unable to load RAS entry '{entryName}': {RasNative.DescribeError(getParamsResult)}");
+                    }
+
+                    AppLog.Info(
+                        "vpn.ras.parameters_loaded",
+                        "RAS dial parameters were loaded from the Windows phone book.",
+                        new
+                        {
+                            VpnId = _options.Id,
+                            VpnName = _options.Name,
+                            EntryName = entryName,
+                            HasSavedPassword = hasSavedPassword,
+                            PhoneBookScope = phoneBook is null ? "CurrentUserDefault" : "ExplicitPhoneBook"
+                        });
+                }
+                else
+                {
+                    AppLog.Info(
+                        "vpn.ras.parameters_loaded",
+                        "RAS dial parameters were prepared from the custom ephemeral L2TP configuration.",
+                        new
+                        {
+                            VpnId = _options.Id,
+                            VpnName = _options.Name,
+                            EntryName = entryName,
+                            Mode = "CustomEphemeral",
+                            HasExplicitUserName = !_options.Custom.UseCurrentWindowsCredentials
+                        });
+                }
+
+                return await _dialer.DialAsync(
+                    phoneBook,
+                    dialParams,
+                    cancellationToken);
+            });
 
         try
         {
@@ -376,6 +382,26 @@ internal sealed partial class RasConnectionManager : IAsyncDisposable
             }
 
             throw;
+        }
+    }
+
+    internal static async Task<nint> ExecuteDialPasswordScopeAsync(
+        RasNative.RasDialParams dialParams,
+        Func<Task<nint>> operation)
+    {
+        ArgumentNullException.ThrowIfNull(dialParams);
+        ArgumentNullException.ThrowIfNull(operation);
+
+        try
+        {
+            return await operation();
+        }
+        finally
+        {
+            // RasGetEntryDialParamsW and custom DPAPI materialization both use this
+            // managed carrier. Drop its plaintext reference on every pre-/post-dial
+            // exit even if the operation failed before RasDialer took ownership.
+            dialParams.SzPassword = string.Empty;
         }
     }
 
