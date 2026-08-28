@@ -9,21 +9,27 @@ function Write-Lf([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, [System.Text.UTF8Encoding]::new($false))
 }
 
-function Replace-LiteralOnce([string]$Text, [string]$Old, [string]$New, [string]$Description) {
-    $first = $Text.IndexOf($Old, [StringComparison]::Ordinal)
-    if ($first -lt 0) { throw "Missing $Description anchor." }
-    if ($Text.IndexOf($Old, $first + $Old.Length, [StringComparison]::Ordinal) -ge 0) {
-        throw "Expected exactly one $Description anchor."
+function Replace-RegexOnce(
+    [string]$Text,
+    [string]$Pattern,
+    [string]$Replacement,
+    [string]$Description) {
+    $matches = [regex]::Matches($Text, $Pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
+    if ($matches.Count -ne 1) {
+        throw "Expected exactly one $Description anchor, found $($matches.Count)."
     }
-    return $Text.Substring(0, $first) + $New + $Text.Substring($first + $Old.Length)
+    return [regex]::Replace(
+        $Text,
+        $Pattern,
+        $Replacement,
+        [System.Text.RegularExpressions.RegexOptions]::Multiline)
 }
 
 $resolverPath = 'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs'
 $resolver = Read-Lf $resolverPath
-$resolver = Replace-LiteralOnce $resolver @'
-        var truncated = (flags & 0x0200) != 0;
-        var responseCode = flags & 0x000F;
-'@ @'
+$resolver = Replace-RegexOnce $resolver `
+    '^        var truncated = \(flags & 0x0200\) != 0;\n        var responseCode = flags & 0x000F;$' `
+    @'
         var opcode = flags & 0x7800;
         if (opcode != 0)
         {
@@ -32,12 +38,11 @@ $resolver = Replace-LiteralOnce $resolver @'
 
         var truncated = (flags & 0x0200) != 0;
         var responseCode = flags & 0x000F;
-'@ 'DNS response opcode validation'
-$resolver = Replace-LiteralOnce $resolver @'
-            if (ownedByQuery && recordClass == 1 && type == 1 && dataLength == 4)
-            {
-                if (canonicalName is not null)
-'@ @'
+'@ `
+    'DNS response opcode validation'
+$resolver = Replace-RegexOnce $resolver `
+    '^            if \(ownedByQuery && recordClass == 1 && type == 1 && dataLength == 4\)\n            \{\n                if \(canonicalName is not null\)$' `
+    @'
             if (ownedByQuery && recordClass == 1 && type == 1)
             {
                 if (dataLength != 4)
@@ -46,24 +51,25 @@ $resolver = Replace-LiteralOnce $resolver @'
                 }
 
                 if (canonicalName is not null)
-'@ 'owned A RDATA validation'
+'@ `
+    'owned A RDATA validation'
 Write-Lf $resolverPath $resolver
 
 $testsPath = 'tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs'
 $tests = Read-Lf $testsPath
-$tests = Replace-LiteralOnce $tests @'
-            NonSingleQuestionIsRejected();
-            UnrelatedAnswerOwnersAreIgnored();
-'@ @'
+$tests = Replace-RegexOnce $tests `
+    '^            NonSingleQuestionIsRejected\(\);\n            UnrelatedAnswerOwnersAreIgnored\(\);$' `
+    @'
             NonSingleQuestionIsRejected();
             NonQueryOpcodeIsRejected();
             OrdinaryResponseFlagsRemainAccepted();
             MalformedOwnedAddressRdataIsRejected();
             UnrelatedAnswerOwnersAreIgnored();
-'@ 'DNS response grammar test registration'
-$tests = Replace-LiteralOnce $tests @'
-    private static void UnrelatedAnswerOwnersAreIgnored()
-'@ @'
+'@ `
+    'DNS response grammar test registration'
+$tests = Replace-RegexOnce $tests `
+    '^    private static void UnrelatedAnswerOwnersAreIgnored\(\)$' `
+    @'
     private static void NonQueryOpcodeIsRejected()
     {
         var packet = BuildResponse(ExpectedHost, 1, 1, null, 1, 1, [203, 0, 113, 7]);
@@ -100,5 +106,6 @@ $tests = Replace-LiteralOnce $tests @'
     }
 
     private static void UnrelatedAnswerOwnersAreIgnored()
-'@ 'DNS response grammar regression methods'
+'@ `
+    'DNS response grammar regression methods'
 Write-Lf $testsPath $tests
