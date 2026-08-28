@@ -109,6 +109,7 @@ internal static class CombinedTestRunner
         await RunAsync(nameof(RuntimeTopologyRecoverySelfTests), RuntimeTopologyRecoverySelfTests.RunAsync);
         await RunAsync(nameof(CoordinatorOperationLifetimeSelfTests), CoordinatorOperationLifetimeSelfTests.RunAsync);
         await RunAsync(nameof(CoordinatorCleanupFailureSelfTests), CoordinatorCleanupFailureSelfTests.RunAsync);
+        await RunAsync(nameof(TerminalRuntimeCleanupRetrySelfTests), TerminalRuntimeCleanupRetrySelfTests.RunAsync);
         await RunAsync(nameof(RuntimeHostOperationLifetimeSelfTests), RuntimeHostOperationLifetimeSelfTests.RunAsync);
         await RunAsync(nameof(ProxyTransactionalStartupSelfTests), ProxyTransactionalStartupSelfTests.RunAsync);
         await RunAsync(nameof(ProxyRejectedStartupCleanupFailureSelfTests), ProxyRejectedStartupCleanupFailureSelfTests.RunAsync);
