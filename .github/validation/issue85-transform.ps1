@@ -207,8 +207,8 @@ Write-PreservingNewlines $coordinatorPath $coordinatorOriginal $coordinator
 
 $hostPath = 'src/ProxyToAnyConnect/Runtime/ProxyRuntimeHost.cs'
 $hostOriginal = [IO.File]::ReadAllText($hostPath)
-$host = $hostOriginal.Replace("`r`n", "`n")
-$host = Replace-Exact $host @'
+$hostText = $hostOriginal.Replace("`r`n", "`n")
+$hostText = Replace-Exact $hostText @'
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
 '@ @'
@@ -216,7 +216,7 @@ $host = Replace-Exact $host @'
     private readonly SemaphoreSlim _disposeGate = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
 '@ 'host dispose gate'
-$host = Replace-Exact $host @'
+$hostText = Replace-Exact $hostText @'
     private string? _configurationError;
     private int _disposed;
 '@ @'
@@ -224,7 +224,7 @@ $host = Replace-Exact $host @'
     private int _disposed;
     private int _terminalCleanupCompleted;
 '@ 'host terminal cleanup field'
-$host = Replace-Exact $host @'
+$hostText = Replace-Exact $hostText @'
     public ProxyRuntimeCoordinator? Current => Volatile.Read(ref _current);
 '@ @'
     public ProxyRuntimeCoordinator? Current =>
@@ -340,8 +340,8 @@ $hostReplacement = @'
         }
     }
 '@
-$host = Replace-Range $host "    public async ValueTask DisposeAsync()`n    {" "`n    private static void CaptureHostCleanupFailure(" $hostReplacement 'host DisposeAsync'
-Write-PreservingNewlines $hostPath $hostOriginal $host
+$hostText = Replace-Range $hostText "    public async ValueTask DisposeAsync()`n    {" "`n    private static void CaptureHostCleanupFailure(" $hostReplacement 'host DisposeAsync'
+Write-PreservingNewlines $hostPath $hostOriginal $hostText
 
 $runnerPath = 'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
 $runnerOriginal = [IO.File]::ReadAllText($runnerPath)
