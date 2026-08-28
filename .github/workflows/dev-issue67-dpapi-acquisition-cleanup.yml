@@ -1,0 +1,55 @@
+name: dev-issue67-dpapi-acquisition-cleanup
+
+on:
+  push:
+    branches:
+      - dev/issue67-dpapi-acquisition-cleanup
+    paths:
+      - .github/workflows/dev-issue67-dpapi-acquisition-cleanup.yml
+      - src/ProxyToAnyConnect/Security/DpapiBlobMemory.cs
+      - src/ProxyToAnyConnect/Security/WindowsSecretProtector.cs
+      - src/ProxyToAnyConnect/Configuration/DpapiSecretProtector.cs
+      - tests/ProxyToAnyConnect.SelfTests/DpapiAcquisitionCleanupSelfTests.cs
+      - tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Verify issue 67 source surface
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = 'c0833662d88b3817693d979bf135dbba0093489f'
+          git merge-base --is-ancestor $expectedBase HEAD
+          git config core.whitespace cr-at-eol
+          git diff --check "$expectedBase...HEAD"
+
+          $expectedPaths = @(
+            '.github/workflows/dev-issue67-dpapi-acquisition-cleanup.yml'
+            'src/ProxyToAnyConnect/Configuration/DpapiSecretProtector.cs'
+            'src/ProxyToAnyConnect/Security/DpapiBlobMemory.cs'
+            'src/ProxyToAnyConnect/Security/WindowsSecretProtector.cs'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+            'tests/ProxyToAnyConnect.SelfTests/DpapiAcquisitionCleanupSelfTests.cs'
+          ) | Sort-Object
+          $changed = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
+          if (($changed -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #67 branch surface: $($changed -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
