@@ -3,13 +3,13 @@
 Canonical startup prompt: `docs/handoff/NEW_CHAT_PROMPT.md`.
 
 Accepted production code baseline before this docs commit:
-- main `ddbdc95e3b9e7080a31c2b631da1c1f187a1f1a3`;
-- tree `4f11a13a1ac0d1839b86671dc0b7ccae7eed0d40`;
-- exact build #580 / `33132200561` green through artifact publication;
-- exact handoff #375 / `33132200498` green.
+- main `5811900dfbf7488bd8ac53af20348c462681eeef`;
+- tree `e44bf16408da3abade0c0f4d04708e6fd5ccd4ac`;
+- exact build #616 / `33152272544` green, artifact `9678213447`, digest `sha256:bd31b7f143d11c56cfc6794e55760e156341ca07bdd8fcbb52691d5010e9c1e7`;
+- exact handoff #393 / `33152272516` green, artifact `9678172387`, digest `sha256:bef544b5997914274001b50fce35684dcdd633d44c6230de654c0769db0a77c9`.
 
-#49/#50 are closed completed after clean PR #51. Their earlier dev branch `dev/issue49-probe-target` and source commit `1684718295944ecdb28216ae02c32365ff7b2b0c` are validation lineage only, not a branch to merge wholesale.
+Latest completed blocks: #79 outbound deadline/504; #80 client-header 408; #85 terminal exact cleanup owner retention + one real application-shutdown retry. Earlier deterministic hardening through #52–#77 is also closed completed; live issue comments are authoritative lineage.
 
-Open external boundaries remain #2/#4/#5/#6/#7/#13; #11 remains a permanent performance/memory architecture requirement.
+Open external/architecture boundaries are exactly #2/#4/#5/#6/#7/#11/#13 at this checkpoint.
 
-This handoff-doc commit moves `main`. The next chat must fetch live main/tree and exact-head `build`/`handoff` first, then read the handoff docs and current issue comments before continuing a broad deterministic audit block.
+This docs commit moves `main`. A new chat must fetch live main/tree and exact-head `build`/`handoff` first, then continue broad deterministic audit/development without fabricating real Windows/L2TP or soak evidence.

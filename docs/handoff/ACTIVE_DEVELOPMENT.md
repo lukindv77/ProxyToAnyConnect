@@ -1,37 +1,32 @@
 # Active development — 2026-08-28
 
-## Completed production block: #49 + #50
+## Current production baseline before this docs commit
 
-#49/#50 are production-accepted and closed completed.
+`main` `5811900dfbf7488bd8ac53af20348c462681eeef`, tree `e44bf16408da3abade0c0f4d04708e6fd5ccd4ac`.
 
-Accepted lineage:
-- dev Windows validation run `33130832271`, source commit `1684718295944ecdb28216ae02c32365ff7b2b0c`;
-- clean acceptance commit `c67a29a0c82a5eb6f5bdee4e20ece39c426ac652`, exactly four production/test files and no dev workflow/transport history;
-- permanent PR #51;
-- PR build #579 / run `33131957422`: attempt 1 hit only the previously documented hosted-runner-sensitive DNS setup timing gate at 1.30x; no threshold or code was changed; identical-head attempt 2 passed build + aggregate self-tests;
-- rebase-merged production SHA `ddbdc95e3b9e7080a31c2b631da1c1f187a1f1a3`, tree `4f11a13a1ac0d1839b86671dc0b7ccae7eed0d40`;
-- exact-main build #580 / `33132200561`: success through publish/artifact;
-- exact-main handoff #375 / `33132200498`: success.
+Exact acceptance:
+- build #616 / `33152272544`: success; artifact `9678213447`, digest `sha256:bd31b7f143d11c56cfc6794e55760e156341ca07bdd8fcbb52691d5010e9c1e7`;
+- handoff #393 / `33152272516`: success; artifact `9678172387`, digest `sha256:bef544b5997914274001b50fce35684dcdd633d44c6230de654c0769db0a77c9`.
 
-Accepted behavior:
-- `verification.probePath` is byte-exact ASCII HTTP origin-form; `%HH` must be valid; fragment, controls, SP/HTAB, non-ASCII and malformed/lossy forms reject; request builder independently revalidates before ASCII wire encoding.
-- verification DNS host is canonicalized once to an IDNA A-label and checked using explicit strict ASCII LDH-label grammar; the same canonical authority is used for L2TP DNS, TLS `TargetHost`/SNI and HTTP `Host`.
-- `münich.example` becomes `xn--mnich-kva.example`; `_`, empty/oversized labels and leading/trailing hyphens reject.
-- proxy transfer hot path and existing verification allocation/timing guard are unchanged.
+## Last completed engineering sequence
 
-## Current engineering priority: broad deterministic audit
+- #79: configured outbound acquisition deadline is now real, with owner/VPN cancellation precedence preserved and genuine pre-commit deadline mapped to HTTP 504.
+- #80: incomplete client header deadline maps to HTTP 408 before outbound ownership; Pause/Shutdown remains lifecycle cancellation.
+- #85: terminal coordinator/host cleanup keeps only failed exact VPN ownership for serialized retry; runtime never becomes usable again; top-level application shutdown retries the same runtime host at most once after independent first-pass cleanup.
 
-Continue coherent multi-file/multi-boundary audits rather than cosmetic churn. Prioritize concrete fail-closed, identity-consistency, lifecycle/resource ownership and performance/memory findings that can be proven in deterministic Windows CI without fabricating real VPN evidence.
+All three are closed completed with permanent PR CI and exact-main acceptance.
 
-For a new finding:
-1. open an issue first with explicit acceptance criteria;
-2. implement production/test changes without weakening routing/security/performance invariants;
-3. require permanent Windows PR CI;
-4. merge/rebase and require exact-main `build` + `handoff`;
-5. record exact SHA/run IDs in the issue and handoff docs.
+## Current engineering priority
 
-Do not reopen or churn #45/#47/#49/#50 or the already-audited #6 cleanup/secret-carrier boundaries without a new concrete finding.
+Continue broad deterministic review rather than cosmetic churn. Highest-value blocks:
+1. proxy/session shutdown, cancellation and response-commit ownership after #75/#77/#79/#80/#85;
+2. RAS/native interop lifetime, helper-process termination, fixed-width/buffer boundaries and exact generation ownership;
+3. verification HTTP response parser/framing and pooled response ownership;
+4. DNS response binding, failover/deadline composition, CNAME/cache/time semantics;
+5. process-wide bounded retention, metrics/logging and #11 performance/memory invariants.
 
-## External acceptance remains blocked on real environment
+For each new finding: open an issue first with explicit acceptance criteria; implement deterministic production/tests; preserve fail-closed routing and the existing 1.25x timing policy; require permanent Windows PR CI; merge only green; then require exact-main build + handoff and record SHA/run/artifact evidence.
 
-#2/#4/#5/#6/#7 require real Windows 11 + real L2TP/operator evidence. #13 requires a representative 12–24 h exact-binary soak with traffic/reconnect/Pause/Resume/reconfigure and correlated managed/native resource series. #11 remains permanently open as the latency/throughput/process-memory architecture contract.
+## External acceptance remains separate
+
+Open live issues: #2/#4/#5/#6/#7/#11/#13. Do not close #2/#4/#5/#6/#7 without real Windows/L2TP/operator evidence. Do not close #13 without representative 12–24 h exact-binary soak evidence. #11 remains permanently open as the latency/throughput/memory architecture requirement.

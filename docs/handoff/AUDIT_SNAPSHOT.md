@@ -2,31 +2,39 @@
 
 Live production source and issue comments remain authoritative.
 
-## Recently resolved/accepted
+## Accepted hardening state
 
-- #45: HTTP/1.x request-line separator grammar is strict: exactly two ASCII SP separators; ambiguity rejects before outbound ownership.
-- #47: soak observed duration is derived and revalidated from first/last serialized sample timestamps; the existing 50 ms consistency tolerance remains unchanged.
-- #6 re-audit: CustomEphemeral cleanup already uses canonical names, regular-directory/reparse checks, exact managed-leaf whitelist, lock-first ownership and non-recursive deletion. RAS password/PSK carriers are cleared after native handoff. No duplicate patch warranted.
-- #49: verification request-target is byte-exact ASCII HTTP origin-form with strict `%HH`; fragment, controls, SP/HTAB, non-ASCII and malformed/lossy forms reject both in settings validation and builder-level wire construction.
-- #50: verification host is canonicalized to IDNA/A-label form, then validated using explicit ASCII LDH DNS-label grammar; one canonical authority is used for L2TP DNS, TLS `TargetHost`/SNI and HTTP `Host`. `münich.example` becomes `xn--mnich-kva.example`; `_` and malformed labels reject.
+The current deterministic audit chain now covers:
+- strict request-line/header/framing/Host/authority parsing and canonical routing;
+- no post-commit proxy-generated HTTP response for CONNECT or plain HTTP;
+- explicit 408 client-header and 504 outbound deadline semantics with owner/VPN cancellation precedence;
+- canonical verification request target/authority and strict HTTP response framing;
+- DNS exact question/owner binding, canonical CNAME/IPv4 identity, monotonic TTL and bounded context-scoped cache;
+- DPAPI managed/unmanaged cleanup, acquisition-failure cleanup and fixed-width RAS field limits;
+- reparse-safe CustomEphemeral/log filesystem ownership;
+- fail-closed monitor invalidation before cleanup joins;
+- exact residual VPN ownership retention across reconfigure and terminal shutdown;
+- one bounded top-level retry of the same runtime host during application exit;
+- pooled 32 KiB proxy transfer path, bounded state and unchanged performance policy.
 
-## #49/#50 production proof
+## Clean audit results immediately around #85
 
-- dev validation: run `33130832271`, source commit `1684718295944ecdb28216ae02c32365ff7b2b0c`;
-- clean permanent PR #51, head `c67a29a0c82a5eb6f5bdee4e20ece39c426ac652`, four files only;
-- PR build #579 / `33131957422`, attempt 2 success on identical head; attempt 1's unrelated DNS setup 1.30x timing result was treated as hosted-runner variance without widening the 1.25x policy or changing production;
-- merged main `ddbdc95e3b9e7080a31c2b631da1c1f187a1f1a3`, exact build #580 / `33132200561` success and handoff #375 / `33132200498` success.
+- DNS failover/deadline composition: each DNS attempt retains its lower-level timeout, while the whole outbound acquisition is now bounded by #79; no unbounded admitted-session path found.
+- Windows VPN PowerShell helper: `-EncodedCommand` + `ArgumentList`, process-tree termination, independent stdout/stderr drain and bounded cleanup are coherent; no concrete new defect found.
+- ICMP async native lifetime: documentation does not prove `IcmpCloseHandle` joins arbitrary pending I/O, so an existing comment is stronger than the public contract; however no deterministic post-timeout write/UAF path was established. Treat as documentation-risk, not a production issue, unless future evidence makes it reproducible.
+- Proxy lease/session terminal ownership: residual native VPN ownership is retained by the VPN manager/coordinator path after #85; no separate proxy-owner retry issue was justified.
 
-## Next audit direction
+## Next audit directions
 
-Continue source-level fail-closed and identity/ownership review across coherent boundaries, with emphasis on:
-- authority/endpoint canonicalization before DNS/TLS/socket ownership;
-- cancellation/lifetime ordering across proxy sessions, VPN contexts and reconnect maintenance;
-- bounded caches/registries/diagnostic work and process-wide memory retention;
-- regression harnesses that preserve security/performance policy instead of loosening thresholds for hosted-runner noise.
+Prioritize new reproducible defects only:
+1. response/deadline/cancellation precedence under mixed failures after #79/#80;
+2. RAS/native interop size/version/output-buffer boundaries and callback/helper ownership;
+3. verification parser edge cases that could alter Ready-state evidence;
+4. DNS TCP fallback/CNAME/cache/failover exactness under cancellation;
+5. bounded diagnostics/logging/metrics and process-wide #11 memory/latency behavior.
 
-New findings must be issue-first with acceptance criteria, deterministic regressions, permanent Windows PR CI and exact-main CI.
+Any new finding must be issue-first, deterministic, permanent-Windows-CI green, then exact-main build/handoff. Never widen the 1.25x policy merely for hosted-runner noise.
 
 ## Remaining evidence boundary
 
-Do not fabricate release acceptance. #2/#4/#5/#6/#7 require real Windows 11/L2TP/operator runs; #13 requires representative 12–24 h exact-binary soak; #11 remains an ongoing performance/memory constraint.
+#2/#4/#5/#6/#7 require real Windows 11/L2TP/operator runs; #13 requires representative 12–24 h exact-binary soak; #11 remains an ongoing performance/memory constraint.
