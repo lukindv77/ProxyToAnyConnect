@@ -31,16 +31,20 @@ jobs:
           $expected = @{
             'src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs' = 'c40c84231cfd6421b01ac49f8af175694b761fa5'
             'src/ProxyToAnyConnect/Runtime/ProxyRuntimeHost.cs' = 'e400eb42324ef6aa49d779a56c8a8d0dd4fdc363'
+            'src/ProxyToAnyConnect/Gui/ApplicationShutdownSequence.cs' = 'd60d2deb3a2d4153af127a3db79fee2f339512dc'
+            'tests/ProxyToAnyConnect.SelfTests/ApplicationShutdownSequenceSelfTests.cs' = '401df1f648f82b7e63120f95956201cdd75eb6b6'
             'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs' = 'fc7bc9c3e4ec32e16e68a82e983fe3a2c4574e8f'
           }
           foreach ($entry in $expected.GetEnumerator()) {
             if ((git rev-parse "$expectedBase`:$($entry.Key)").Trim() -ne $entry.Value) { throw "Unexpected #85 base blob: $($entry.Key)" }
           }
-          if ((git rev-parse 'HEAD:.github/validation/issue85-transform.ps1').Trim() -ne '116abbafb8e3955f41c5342177482660a4c79f55') { throw 'Unexpected #85 transform blob.' }
-          if ((git rev-parse 'HEAD:tests/ProxyToAnyConnect.SelfTests/TerminalRuntimeCleanupRetrySelfTests.cs').Trim() -ne 'c5830950a24312640e22320b99b3301b1c7ed8e8') { throw 'Unexpected #85 regression-test blob.' }
+          if ((git rev-parse 'HEAD:.github/validation/issue85-transform.ps1').Trim() -ne '116abbafb8e3955f41c5342177482660a4c79f55') { throw 'Unexpected #85 primary transform blob.' }
+          if ((git rev-parse 'HEAD:.github/validation/issue85-finalize-transform.ps1').Trim() -ne 'dd08901de6e15279afd66a3f35c94418939a7f10') { throw 'Unexpected #85 finalizer transform blob.' }
+          if ((git rev-parse 'HEAD:tests/ProxyToAnyConnect.SelfTests/TerminalRuntimeCleanupRetrySelfTests.cs').Trim() -ne 'a18596885f767da95d8345880e3db33ab2260bda') { throw 'Unexpected #85 regression-test blob.' }
 
           $expectedSurface = @(
             '.github/validation/issue85-transform.ps1'
+            '.github/validation/issue85-finalize-transform.ps1'
             '.github/workflows/dev-issue85-terminal-cleanup-retry.yml'
             'tests/ProxyToAnyConnect.SelfTests/TerminalRuntimeCleanupRetrySelfTests.cs'
           ) | Sort-Object
@@ -48,15 +52,20 @@ jobs:
           if (($surface -join "`n") -ne ($expectedSurface -join "`n")) { throw "Unexpected #85 branch surface: $($surface -join ', ')" }
 
           & ./.github/validation/issue85-transform.ps1
+          & ./.github/validation/issue85-finalize-transform.ps1
           git add -- `
             src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs `
             src/ProxyToAnyConnect/Runtime/ProxyRuntimeHost.cs `
+            src/ProxyToAnyConnect/Gui/ApplicationShutdownSequence.cs `
+            tests/ProxyToAnyConnect.SelfTests/ApplicationShutdownSequenceSelfTests.cs `
             tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs
           git config core.whitespace cr-at-eol
           git diff --cached --check
           $expectedStaged = @(
             'src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs'
             'src/ProxyToAnyConnect/Runtime/ProxyRuntimeHost.cs'
+            'src/ProxyToAnyConnect/Gui/ApplicationShutdownSequence.cs'
+            'tests/ProxyToAnyConnect.SelfTests/ApplicationShutdownSequenceSelfTests.cs'
             'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
           ) | Sort-Object
           $staged = @(git diff --cached --name-only | Sort-Object)
