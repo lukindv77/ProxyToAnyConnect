@@ -23,12 +23,12 @@ internal static class DnsResponseAddressListSelfTests
 
             for (var i = 0; i < WarmupIterations; i++)
             {
-                GC.KeepAlive(L2tpDnsResolver.ParseResponse(cnameResponse, TransactionId));
+                GC.KeepAlive(L2tpDnsResolver.ParseResponse(cnameResponse, TransactionId, "example.com"));
                 GC.KeepAlive(EagerAddressListPredecessor(cnameResponse));
             }
 
             var optimizedBytes = MeasureAllocatedBytes(() =>
-                GC.KeepAlive(L2tpDnsResolver.ParseResponse(cnameResponse, TransactionId)));
+                GC.KeepAlive(L2tpDnsResolver.ParseResponse(cnameResponse, TransactionId, "example.com")));
             var predecessorBytes = MeasureAllocatedBytes(() =>
                 GC.KeepAlive(EagerAddressListPredecessor(cnameResponse)));
             if (optimizedBytes >= predecessorBytes)
@@ -39,7 +39,7 @@ internal static class DnsResponseAddressListSelfTests
             }
 
             Action optimized = () =>
-                GC.KeepAlive(L2tpDnsResolver.ParseResponse(cnameResponse, TransactionId));
+                GC.KeepAlive(L2tpDnsResolver.ParseResponse(cnameResponse, TransactionId, "example.com"));
             Action predecessor = () => GC.KeepAlive(EagerAddressListPredecessor(cnameResponse));
             var timing = MeasurePaired(optimized, predecessor);
             if (timing.PairedRatioMedian > MaxMedianSlowdownRatio)
@@ -67,7 +67,7 @@ internal static class DnsResponseAddressListSelfTests
 
     private static void ResponseSemanticsRemainEquivalent()
     {
-        var cname = L2tpDnsResolver.ParseResponse(BuildCnameResponse(), TransactionId);
+        var cname = L2tpDnsResolver.ParseResponse(BuildCnameResponse(), TransactionId, "example.com");
         if (cname.Addresses.Count != 0 ||
             cname.CanonicalName != "alias.example.com" ||
             cname.MinimumTtlSeconds != 60)
@@ -75,7 +75,7 @@ internal static class DnsResponseAddressListSelfTests
             throw new InvalidOperationException("DNS CNAME response semantics changed.");
         }
 
-        var a = L2tpDnsResolver.ParseResponse(BuildAResponse(), TransactionId);
+        var a = L2tpDnsResolver.ParseResponse(BuildAResponse(), TransactionId, "example.com");
         if (a.Addresses.Count != 1 ||
             !a.Addresses[0].Equals(IPAddress.Parse("203.0.113.7")) ||
             a.CanonicalName is not null ||
@@ -84,7 +84,7 @@ internal static class DnsResponseAddressListSelfTests
             throw new InvalidOperationException("DNS A response semantics changed.");
         }
 
-        var mixed = L2tpDnsResolver.ParseResponse(BuildMixedResponse(), TransactionId);
+        var mixed = L2tpDnsResolver.ParseResponse(BuildMixedResponse(), TransactionId, "example.com");
         if (mixed.Addresses.Count != 1 ||
             !mixed.Addresses[0].Equals(IPAddress.Parse("198.51.100.9")) ||
             mixed.CanonicalName != "edge.example.com" ||
@@ -97,7 +97,7 @@ internal static class DnsResponseAddressListSelfTests
     private static ParsedDnsResponse EagerAddressListPredecessor(byte[] response)
     {
         var eagerAddresses = new List<IPAddress>();
-        var parsed = L2tpDnsResolver.ParseResponse(response, TransactionId);
+        var parsed = L2tpDnsResolver.ParseResponse(response, TransactionId, "example.com");
         GC.KeepAlive(eagerAddresses);
         return parsed;
     }
