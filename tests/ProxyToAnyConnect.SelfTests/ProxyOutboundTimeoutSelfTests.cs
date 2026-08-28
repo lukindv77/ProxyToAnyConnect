@@ -81,9 +81,7 @@ internal static class ProxyOutboundTimeoutSelfTests
                 ownerCancellation.Token);
             throw new InvalidOperationException("Owner cancellation did not stop blocked outbound acquisition.");
         }
-        catch (OperationCanceledException ex) when (
-            ex is not ProxyServer.OutboundConnectTimeoutException &&
-            ownerCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (ownerCancellation.IsCancellationRequested)
         {
         }
 
