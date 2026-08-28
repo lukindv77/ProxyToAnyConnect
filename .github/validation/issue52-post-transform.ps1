@@ -3,36 +3,23 @@ $ErrorActionPreference = 'Stop'
 
 $path = 'tests/ProxyToAnyConnect.SelfTests/DnsQuerySetupSelfTests.cs'
 $text = [IO.File]::ReadAllText($path).Replace("`r`n", "`n")
-$old = @'
-    private static bool ThrowsInvalidHost(Action action)
-    {
-        try
-        {
-            action();
-            return false;
-        }
-        catch (InvalidOperationException)
-        {
-            return true;
-        }
-    }
-'@.TrimEnd("`r", "`n")
-$new = @'
-    private static bool ThrowsInvalidHost(Action action)
-    {
-        try
-        {
-            action();
-            return false;
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
-        {
-            return true;
-        }
-    }
-'@.TrimEnd("`r", "`n")
-$count = [regex]::Matches($text, [regex]::Escape($old)).Count
-if ($count -ne 1) {
-    throw "Expected one resolver rejection helper target, found $count."
+$helper = 'private static bool ThrowsInvalidHost(Action action)'
+$helperIndex = $text.IndexOf($helper, [StringComparison]::Ordinal)
+if ($helperIndex -lt 0) {
+    throw 'Resolver rejection helper was not produced by the issue52 transform.'
 }
-[IO.File]::WriteAllText($path, $text.Replace($old, $new), [Text.UTF8Encoding]::new($false))
+
+$oldCatch = 'catch (InvalidOperationException)'
+$catchIndex = $text.IndexOf($oldCatch, $helperIndex, [StringComparison]::Ordinal)
+if ($catchIndex -lt 0) {
+    throw 'Expected resolver rejection catch was not produced by the issue52 transform.'
+}
+
+$nextMethodIndex = $text.IndexOf('private static ', $helperIndex + $helper.Length, [StringComparison]::Ordinal)
+if ($nextMethodIndex -ge 0 -and $catchIndex -ge $nextMethodIndex) {
+    throw 'Resolver rejection catch escaped the ThrowsInvalidHost helper boundary.'
+}
+
+$newCatch = 'catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)'
+$updated = $text.Remove($catchIndex, $oldCatch.Length).Insert($catchIndex, $newCatch)
+[IO.File]::WriteAllText($path, $updated, [Text.UTF8Encoding]::new($false))
