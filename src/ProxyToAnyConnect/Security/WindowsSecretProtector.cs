@@ -148,13 +148,20 @@ internal static class WindowsSecretProtector
             return;
         }
 
-        if (localAlloc)
+        try
         {
-            _ = LocalFree(blob.Data);
+            UnmanagedSecretMemory.Zero(blob.Data, blob.Size);
         }
-        else
+        finally
         {
-            Marshal.FreeHGlobal(blob.Data);
+            if (localAlloc)
+            {
+                _ = LocalFree(blob.Data);
+            }
+            else
+            {
+                Marshal.FreeHGlobal(blob.Data);
+            }
         }
     }
 
