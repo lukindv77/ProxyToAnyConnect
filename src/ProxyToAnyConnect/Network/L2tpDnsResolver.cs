@@ -383,6 +383,12 @@ internal sealed class L2tpDnsResolver
             throw new IOException("DNS packet is not a response.");
         }
 
+        var opcode = flags & 0x7800;
+        if (opcode != 0)
+        {
+            throw new IOException("DNS response opcode does not match the standard QUERY request.");
+        }
+
         var truncated = (flags & 0x0200) != 0;
         var responseCode = flags & 0x000F;
         if (responseCode != 0)
@@ -437,8 +443,13 @@ internal sealed class L2tpDnsResolver
             EnsureRemaining(response, offset, dataLength);
             var ownedByQuery = DnsNameEqualsAscii(response, ownerOffset, expectedHost);
 
-            if (ownedByQuery && recordClass == 1 && type == 1 && dataLength == 4)
+            if (ownedByQuery && recordClass == 1 && type == 1)
             {
+                if (dataLength != 4)
+                {
+                    throw new IOException("DNS A RDATA for the queried owner must be exactly four bytes.");
+                }
+
                 if (canonicalName is not null)
                 {
                     throw new IOException(
