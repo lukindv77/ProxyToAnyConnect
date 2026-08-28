@@ -60,14 +60,14 @@ Replace-Exact $proxyPath @'
 
         if (request.ContentLength == 0)
         {
-            var responseDownload = PumpHttpResponseAsync(
+            var zeroBodyResponseDownload = PumpHttpResponseAsync(
                 upstreamStream,
                 clientStream,
                 RecordReceived,
                 responseCommit,
                 requestCancellation.Token);
             await AwaitHttpResponseDownloadAsync(
-                responseDownload,
+                zeroBodyResponseDownload,
                 responseCommit,
                 cancellationToken);
             return;
