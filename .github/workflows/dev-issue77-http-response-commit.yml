@@ -31,6 +31,7 @@ jobs:
           $expectedProxyBlob = '9b4557dbd4956db48c2879f714abe17b9b914004'
           $expectedRunnerBlob = '340d49a960a87154621b4556a83df2cf80aba204'
           $expectedTransformBlob = '9b8ce6f4ce71ee1124f80f5749c96234fbd53f1c'
+          $expectedPostTransformBlob = 'e61b80a283a32dda37003fa04caf97ea8c336ff4'
           $expectedTestBlob = 'd0dcf1466c77d4297cb85863a49be5f35df8f84e'
 
           if ((git rev-parse "$expectedBase`:src/ProxyToAnyConnect/Proxy/ProxyServer.cs").Trim() -ne $expectedProxyBlob) {
@@ -42,12 +43,16 @@ jobs:
           if ((git rev-parse 'HEAD:.github/validation/issue77-transform.ps1').Trim() -ne $expectedTransformBlob) {
             throw 'Unexpected #77 transform blob.'
           }
+          if ((git rev-parse 'HEAD:.github/validation/issue77-post-transform.ps1').Trim() -ne $expectedPostTransformBlob) {
+            throw 'Unexpected #77 post-transform blob.'
+          }
           if ((git rev-parse 'HEAD:tests/ProxyToAnyConnect.SelfTests/ProxyHttpResponseCommitBoundarySelfTests.cs').Trim() -ne $expectedTestBlob) {
             throw 'Unexpected #77 regression-test blob.'
           }
 
           $expectedBranchSurface = @(
             '.github/validation/issue77-transform.ps1'
+            '.github/validation/issue77-post-transform.ps1'
             '.github/workflows/dev-issue77-http-response-commit.yml'
             'tests/ProxyToAnyConnect.SelfTests/ProxyHttpResponseCommitBoundarySelfTests.cs'
           ) | Sort-Object
@@ -57,6 +62,7 @@ jobs:
           }
 
           & ./.github/validation/issue77-transform.ps1
+          & ./.github/validation/issue77-post-transform.ps1
 
           git add -- `
             src/ProxyToAnyConnect/Proxy/ProxyServer.cs `
