@@ -1,0 +1,69 @@
+name: dev-issue53-ui-wire-identity
+
+on:
+  push:
+    branches:
+      - dev/issue53-ui-wire-identity
+    paths:
+      - .github/workflows/dev-issue53-ui-wire-identity.yml
+      - .github/validation/issue53-transform.ps1
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 53 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '9c0cb3a32d7bb33cb83c6c20b2e8b4994c8b594e'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          if ((git rev-parse HEAD:.github/validation/issue53-transform.ps1).Trim() -ne '83f4fc2613e1f5382152bdcf85f07dac2983b09b') {
+            throw 'Unexpected issue53 transform blob.'
+          }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Gui/L2tpSettingsDialog.cs' = '7479c4cb61e173c6982bf25adb4f1555f9f641a7'
+            'tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs' = '5f88fea989b9c3d6b1e3dcd544d0770ecba1de5c'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) { throw "Unexpected base blob for $($entry.Key): $actual" }
+          }
+
+          & ./.github/validation/issue53-transform.ps1
+
+          $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #53 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 53 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'ui: preserve verification wire identity before validation'
+          git push origin HEAD:dev/issue53-ui-wire-identity
