@@ -75,9 +75,8 @@ internal static class DnsAResultStorageSelfTests
 
         using var context = CreateContext();
         var cache = new L2tpDnsCache(maxEntries: 4);
-        var now = new DateTimeOffset(2026, 8, 26, 12, 0, 0, TimeSpan.Zero);
-        cache.Set("one.example", context, one.Addresses, TimeSpan.FromSeconds(45), now);
-        if (!cache.TryGet("one.example", context, out var cached, now) ||
+        cache.Set("one.example", context, one.Addresses, TimeSpan.FromSeconds(45));
+        if (!cache.TryGet("one.example", context, out var cached) ||
             !ReferenceEquals(oneArray, cached))
         {
             throw new InvalidOperationException("DNS cache copied the direct single-A array instead of reusing its owned result.");
