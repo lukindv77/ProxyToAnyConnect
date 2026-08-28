@@ -58,6 +58,7 @@ internal static class CombinedTestRunner
         Run(nameof(VerificationPooledResponseOwnerSelfTests), VerificationPooledResponseOwnerSelfTests.Run);
         await RunAsync(nameof(ProxyLifetimeSelfTests), ProxyLifetimeSelfTests.RunAsync);
         await RunAsync(nameof(ProxyShutdownDrainSelfTests), ProxyShutdownDrainSelfTests.RunAsync);
+        await RunAsync(nameof(ProxyClientHeaderTimeoutSelfTests), ProxyClientHeaderTimeoutSelfTests.RunAsync);
         await RunAsync(nameof(AcceptedClientTransportSelfTests), AcceptedClientTransportSelfTests.RunAsync);
         await RunAsync(nameof(NativeRouteSelfTests), NativeRouteSelfTests.RunAsync);
         await RunAsync(nameof(WindowsVpnProfileInspectorLifetimeSelfTests), WindowsVpnProfileInspectorLifetimeSelfTests.RunAsync);

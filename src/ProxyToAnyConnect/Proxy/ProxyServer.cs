@@ -155,6 +155,10 @@ internal sealed class ProxyServer
             {
                 await TryWriteErrorAsync(client, 504, "Gateway Timeout", ex.Message, cancellationToken);
             }
+            catch (ClientHeaderTimeoutException ex)
+            {
+                await TryWriteErrorAsync(client, 408, "Request Timeout", ex.Message, cancellationToken);
+            }
             catch (InvalidDataException ex)
             {
                 await TryWriteErrorAsync(client, 400, "Bad Request", ex.Message, cancellationToken);
@@ -186,7 +190,24 @@ internal sealed class ProxyServer
 
         using var headerTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         headerTimeout.CancelAfter(TimeSpan.FromSeconds(_options.ClientHeaderTimeoutSeconds));
-        var readResult = await ReadRequestAsync(clientStream, _options.MaxHeaderBytes, headerTimeout.Token);
+        RequestReadResult readResult;
+        try
+        {
+            readResult = await ReadRequestAsync(
+                clientStream,
+                _options.MaxHeaderBytes,
+                headerTimeout.Token);
+        }
+        catch (OperationCanceledException ex)
+        {
+            ThrowIfClientHeaderCancellationRequiresAbort(
+                ex,
+                cancellationToken,
+                headerTimeout.Token,
+                _options.ClientHeaderTimeoutSeconds);
+            throw;
+        }
+
         var request = readResult.Request;
 
         if (request.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
@@ -621,6 +642,27 @@ internal sealed class ProxyServer
         }
     }
 
+    internal static void ThrowIfClientHeaderCancellationRequiresAbort(
+        OperationCanceledException failure,
+        CancellationToken ownerCancellation,
+        CancellationToken headerDeadline,
+        int timeoutSeconds)
+    {
+        ArgumentNullException.ThrowIfNull(failure);
+        if (timeoutSeconds <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeoutSeconds));
+        }
+
+        ownerCancellation.ThrowIfCancellationRequested();
+        if (headerDeadline.IsCancellationRequested)
+        {
+            throw new ClientHeaderTimeoutException(
+                $"Client request header timed out after {timeoutSeconds} second(s).",
+                failure);
+        }
+    }
+
     private static async Task<RequestReadResult> ReadRequestAsync(
         Stream stream,
         int maxHeaderBytes,
@@ -997,6 +1039,14 @@ internal sealed class ProxyServer
     internal sealed class OutboundConnectTimeoutException : TimeoutException
     {
         public OutboundConnectTimeoutException(string message, Exception innerException)
+            : base(message, innerException)
+        {
+        }
+    }
+
+    internal sealed class ClientHeaderTimeoutException : TimeoutException
+    {
+        public ClientHeaderTimeoutException(string message, Exception innerException)
             : base(message, innerException)
         {
         }
