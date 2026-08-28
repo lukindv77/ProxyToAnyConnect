@@ -69,9 +69,7 @@ internal static class ProxyClientHeaderTimeoutSelfTests
             throw new InvalidOperationException(
                 "Proxy owner cancellation did not win a simultaneous header-deadline race.");
         }
-        catch (OperationCanceledException ex) when (
-            ex.CancellationToken == owner.Token &&
-            ex is not ProxyServer.ClientHeaderTimeoutException)
+        catch (OperationCanceledException ex) when (ex.CancellationToken == owner.Token)
         {
         }
     }
