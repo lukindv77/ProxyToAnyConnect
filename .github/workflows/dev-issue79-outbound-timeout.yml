@@ -1,0 +1,89 @@
+name: dev-issue79-outbound-timeout
+
+on:
+  push:
+    branches:
+      - dev/issue79-outbound-timeout
+    paths:
+      - .github/workflows/dev-issue79-outbound-timeout.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 79 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '3e63a71ce822430f421e9002a564bac85167ff49'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          $expectedProxyBlob = 'ebae55546d38eb939d542562c2e5267c8d99b3da'
+          $expectedRunnerBlob = '3fd222b1c674f2028b8f645c0441d5532f4708b7'
+          $expectedTransformBlob = '768a94036936b9520a7e8d166ca46962189fbf1e'
+          $expectedTestBlob = 'bf4c2274c4ba121df362c30b08aca19a47f207b4'
+
+          if ((git rev-parse "$expectedBase`:src/ProxyToAnyConnect/Proxy/ProxyServer.cs").Trim() -ne $expectedProxyBlob) {
+            throw 'Unexpected #79 base ProxyServer blob.'
+          }
+          if ((git rev-parse "$expectedBase`:tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs").Trim() -ne $expectedRunnerBlob) {
+            throw 'Unexpected #79 base CombinedTestRunner blob.'
+          }
+          if ((git rev-parse 'HEAD:.github/validation/issue79-transform.ps1').Trim() -ne $expectedTransformBlob) {
+            throw 'Unexpected #79 transform blob.'
+          }
+          if ((git rev-parse 'HEAD:tests/ProxyToAnyConnect.SelfTests/ProxyOutboundTimeoutSelfTests.cs').Trim() -ne $expectedTestBlob) {
+            throw 'Unexpected #79 regression-test blob.'
+          }
+
+          $expectedBranchSurface = @(
+            '.github/validation/issue79-transform.ps1'
+            '.github/workflows/dev-issue79-outbound-timeout.yml'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyOutboundTimeoutSelfTests.cs'
+          ) | Sort-Object
+          $branchSurface = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
+          if (($branchSurface -join "`n") -ne ($expectedBranchSurface -join "`n")) {
+            throw "Unexpected #79 pre-transform branch surface: $($branchSurface -join ', ')"
+          }
+
+          & ./.github/validation/issue79-transform.ps1
+
+          git add -- `
+            src/ProxyToAnyConnect/Proxy/ProxyServer.cs `
+            tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+
+          $expectedStaged = @(
+            'src/ProxyToAnyConnect/Proxy/ProxyServer.cs'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          ) | Sort-Object
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedStaged -join "`n")) {
+            throw "Unexpected #79 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 79 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'proxy: enforce configured outbound connection timeout'
+          git push origin HEAD:dev/issue79-outbound-timeout
