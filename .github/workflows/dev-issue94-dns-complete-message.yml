@@ -1,0 +1,88 @@
+name: dev-issue94-dns-complete-message
+
+on:
+  push:
+    branches:
+      - dev/issue94-dns-complete-message
+    paths:
+      - .github/workflows/dev-issue94-dns-complete-message.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 94 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '24aa5eda93acd4f4111ccf2e584c85e668c03bcb'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          $expected = @{
+            'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs' = 'd2ee6df188c32d3f9693684fd2b638fc50731183'
+            'tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs' = 'ec6243ea9da4389321a1392220748e5523315d4f'
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            if ((git rev-parse "$expectedBase`:$($entry.Key)").Trim() -ne $entry.Value) {
+              throw "Unexpected #94 base blob: $($entry.Key)"
+            }
+          }
+          if ((git rev-parse 'HEAD:.github/validation/issue94-transform.ps1').Trim() -ne '025ae95acf1fce60341176836bb7d78d7713633d') {
+            throw 'Unexpected #94 transform blob.'
+          }
+
+          $expectedSurface = @(
+            '.github/validation/issue94-transform.ps1'
+            '.github/workflows/dev-issue94-dns-complete-message.yml'
+          ) | Sort-Object
+          $surface = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
+          if (($surface -join "`n") -ne ($expectedSurface -join "`n")) {
+            throw "Unexpected #94 branch surface: $($surface -join ', ')"
+          }
+
+          & ./.github/validation/issue94-transform.ps1
+          git add -- `
+            src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs `
+            tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+
+          $expectedStaged = @(
+            'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs'
+            'tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs'
+          ) | Sort-Object
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedStaged -join "`n")) {
+            throw "Unexpected #94 staged surface: $($staged -join ', ')"
+          }
+      - name: Build release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet build ProxyToAnyConnect.sln -c Release
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet .\tests\ProxyToAnyConnect.SelfTests\bin\x64\Release\net10.0-windows\win-x64\ProxyToAnyConnect.SelfTests.dll
+      - name: Publish validated issue 94 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'dns: validate complete response sections'
+          git push origin HEAD:dev/issue94-dns-complete-message
