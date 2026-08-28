@@ -1,0 +1,75 @@
+name: dev-issue52-dns-authority
+
+on:
+  push:
+    branches:
+      - dev/issue52-dns-authority
+    paths:
+      - .github/workflows/dev-issue52-dns-authority.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 52 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '2475a07fa79ce40da98d7f853220a30302d4ff7f'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          if ((git rev-parse HEAD:.github/validation/issue52-transform.ps1).Trim() -ne '24bf5ff4e99cb70e889015c81df986a6d320ba42') {
+            throw 'Unexpected issue52 transform blob.'
+          }
+          if ((git rev-parse HEAD:.github/validation/issue52-post-transform.ps1).Trim() -ne '12dc9d29e72e1fc175c057582a059127c772f201') {
+            throw 'Unexpected issue52 post-transform blob.'
+          }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Configuration/AppOptions.cs' = '35255495da09268cf1d89de6bd2ca2d304dd96df'
+            'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs' = '38f976ea90b3b76d2aa9692c2ac4822f63957e0e'
+            'tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs' = '9867262b78bd177e182ca3b120a0867839bde405'
+            'tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs' = 'fa78fb5f71ff34a288c022c45d18059ddb242563'
+            'tests/ProxyToAnyConnect.SelfTests/DnsQuerySetupSelfTests.cs' = 'e703fa71814a842f8af1da4e874595b47b2da00f'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) { throw "Unexpected base blob for $($entry.Key): $actual" }
+          }
+
+          & ./.github/validation/issue52-transform.ps1
+          & ./.github/validation/issue52-post-transform.ps1
+
+          $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #52 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 52 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'dns: fail closed on resolver authority identity'
+          git push origin HEAD:dev/issue52-dns-authority
