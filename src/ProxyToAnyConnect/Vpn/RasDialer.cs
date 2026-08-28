@@ -163,7 +163,6 @@ internal sealed class RasDialer
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(dialParams);
-        cancellationToken.ThrowIfCancellationRequested();
 
         var terminal = new TaskCompletionSource<RasDialTerminalState>(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -179,6 +178,11 @@ internal sealed class RasDialer
         nint handle = 0;
         try
         {
+            // The password carrier is already owned by this method. Keep the
+            // cancellation guard inside the clearing finally so a pre-cancelled
+            // operation cannot leave plaintext referenced until GC.
+            cancellationToken.ThrowIfCancellationRequested();
+
             uint initialResult;
             try
             {
