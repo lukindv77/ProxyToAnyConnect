@@ -42,7 +42,7 @@ jobs:
           if ((git rev-parse 'HEAD:.github/validation/issue89-transform.ps1').Trim() -ne '2b82335b506e7e66d51c162b968ab4ec44124030') {
             throw 'Unexpected #89 transform blob.'
           }
-          if ((git rev-parse 'HEAD:.github/validation/issue89-fixture-transform.ps1').Trim() -ne 'df09516e31a0eef2bc7adeeed7540cfcf87a9634') {
+          if ((git rev-parse 'HEAD:.github/validation/issue89-fixture-transform.ps1').Trim() -ne '7a679da466559d425b6a213a019224f8877689f7') {
             throw 'Unexpected #89 fixture transform blob.'
           }
 
