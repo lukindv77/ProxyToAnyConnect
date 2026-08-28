@@ -439,6 +439,12 @@ internal sealed class L2tpDnsResolver
 
             if (ownedByQuery && recordClass == 1 && type == 1 && dataLength == 4)
             {
+                if (canonicalName is not null)
+                {
+                    throw new IOException(
+                        "DNS response mixed CNAME and A data for the queried owner.");
+                }
+
                 var address = new IPAddress(response.Slice(offset, 4));
                 if (firstAddress is null)
                 {
@@ -453,6 +459,12 @@ internal sealed class L2tpDnsResolver
             }
             else if (ownedByQuery && recordClass == 1 && type == 5)
             {
+                if (firstAddress is not null || canonicalName is not null)
+                {
+                    throw new IOException(
+                        "DNS response returned an ambiguous CNAME RRset for the queried owner.");
+                }
+
                 var cnameOffset = offset;
                 var parsedCanonicalName = ReadName(response, ref cnameOffset);
                 if (cnameOffset != checked(offset + dataLength))
@@ -463,7 +475,6 @@ internal sealed class L2tpDnsResolver
                 canonicalName = parsedCanonicalName;
                 minimumTtlSeconds = MinTtl(minimumTtlSeconds, ttlSeconds);
             }
-
             offset += dataLength;
         }
 
