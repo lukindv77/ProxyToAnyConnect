@@ -260,9 +260,8 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
             // proxy leases have completed their cleanup attempt. Independent managers
             // then drain concurrently so one stuck dedicated RAS owner cannot serialize
             // its full timeout across unrelated groups.
-            cleanupFailure = await DisposeOwnedResourcesAsync(
-                vpnsToDispose.Cast<IAsyncDisposable>(),
-                "reconfigure-vpn",
+            cleanupFailure = await DisposeChangedVpnOwnersAsync(
+                vpnsToDispose,
                 cleanupFailure);
 
             RethrowCoordinatorCleanupFailure(cleanupFailure);
@@ -504,6 +503,48 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
 
     private static bool ConfigurationEquals<T>(T left, T right) =>
         JsonSerializer.Serialize(left) == JsonSerializer.Serialize(right);
+
+    private async Task<Exception?> DisposeChangedVpnOwnersAsync(
+        IReadOnlyList<VpnLeaseManager> vpns,
+        Exception? primaryFailure)
+    {
+        var attempts = new Task<Exception?>[vpns.Count];
+        for (var index = 0; index < vpns.Count; index++)
+        {
+            attempts[index] = DisposeOneOwnedResourceAsync(vpns[index]);
+        }
+
+        for (var index = 0; index < attempts.Length; index++)
+        {
+            var failure = await attempts[index];
+            if (failure is null)
+            {
+                continue;
+            }
+
+            var vpn = vpns[index];
+            lock (_collectionGate)
+            {
+                // Re-publish only cleanup ownership, not a usable generation. The
+                // manager is already disposed to new Acquire calls, but retaining the
+                // exact instance prevents missing-topology recovery from replacing it
+                // before its nested controller reaches terminal cleanup.
+                _vpnById.TryAdd(vpn.Id, vpn);
+            }
+
+            if (primaryFailure is null)
+            {
+                primaryFailure = failure;
+            }
+            else
+            {
+                primaryFailure.Data[$"CoordinatorCleanup:reconfigure-vpn:{index}"] =
+                    $"{failure.GetType().FullName}: {failure.Message}";
+            }
+        }
+
+        return primaryFailure;
+    }
 
     internal static async Task<Exception?> DisposeOwnedResourcesAsync(
         IEnumerable<IAsyncDisposable> resources,
