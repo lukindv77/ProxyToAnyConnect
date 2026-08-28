@@ -1,0 +1,71 @@
+name: dev-issue59-log-reparse-ownership
+
+on:
+  push:
+    branches:
+      - dev/issue59-log-reparse-ownership
+    paths:
+      - .github/workflows/dev-issue59-log-reparse-ownership.yml
+      - .github/validation/issue59-transform.ps1
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 59 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '4e13a7b572fa05a82d1d69c22ad802b398defe43'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          if ((git rev-parse HEAD:.github/validation/issue59-transform.ps1).Trim() -ne 'c4880deb9e80de0ad2c8b7c68c6cf80f53664738') {
+            throw 'Unexpected issue59 transform blob.'
+          }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Diagnostics/DailyJsonlLogStore.cs' = '5e26488697ba1d7559b2796c580c8036e3b376e4'
+            'tests/ProxyToAnyConnect.SelfTests/LoggingAndMetricsSelfTests.cs' = 'ff76acd9a68c0ddfd7a2e3a1e311377fa46d9c48'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) {
+              throw "Unexpected base blob for $($entry.Key): $actual"
+            }
+          }
+
+          & ./.github/validation/issue59-transform.ps1
+
+          $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #59 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 59 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'logging: reject reparse paths outside owned tree'
+          git push origin HEAD:dev/issue59-log-reparse-ownership
