@@ -10,12 +10,14 @@ function Replace-Exact {
     )
 
     $text = [IO.File]::ReadAllText($Path).Replace("`r`n", "`n")
-    $count = ([regex]::Matches($text, [regex]::Escape($Old))).Count
+    $oldNormalized = $Old.Replace("`r`n", "`n").TrimEnd("`n")
+    $newNormalized = $New.Replace("`r`n", "`n").TrimEnd("`n")
+    $count = ([regex]::Matches($text, [regex]::Escape($oldNormalized))).Count
     if ($count -ne $ExpectedCount) {
         throw "Expected $ExpectedCount exact match(es) in $Path, found $count."
     }
 
-    $updated = $text.Replace($Old, $New)
+    $updated = $text.Replace($oldNormalized, $newNormalized)
     [IO.File]::WriteAllText($Path, $updated, [Text.UTF8Encoding]::new($false))
 }
 
