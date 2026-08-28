@@ -8,6 +8,7 @@ on:
       - .github/workflows/dev-issue73-dns-cache-monotonic.yml
       - src/ProxyToAnyConnect/Network/L2tpDnsCache.cs
       - tests/ProxyToAnyConnect.SelfTests/DnsCacheSelfTests.cs
+      - tests/ProxyToAnyConnect.SelfTests/DnsAResultStorageSelfTests.cs
 
 permissions:
   contents: read
@@ -36,6 +37,7 @@ jobs:
             '.github/workflows/dev-issue73-dns-cache-monotonic.yml'
             'src/ProxyToAnyConnect/Network/L2tpDnsCache.cs'
             'tests/ProxyToAnyConnect.SelfTests/DnsCacheSelfTests.cs'
+            'tests/ProxyToAnyConnect.SelfTests/DnsAResultStorageSelfTests.cs'
           ) | Sort-Object
           $changed = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
           if (($changed -join "`n") -ne ($expectedPaths -join "`n")) {
