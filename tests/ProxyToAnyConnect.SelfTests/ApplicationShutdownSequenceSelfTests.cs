@@ -108,18 +108,20 @@ internal static class ApplicationShutdownSequenceSelfTests
                 return ValueTask.FromException(new ApplicationException("memory cleanup fault"));
             });
 
-        if (!phases.SequenceEqual(new[] { "configuration", "runtime", "memory" }))
+        if (!phases.SequenceEqual(new[] { "configuration", "runtime", "memory", "runtime" }))
         {
             throw new InvalidOperationException(
-                "An earlier shutdown fault skipped or reordered an independent cleanup owner.");
+                "An earlier shutdown fault skipped/reordered an independent owner or the bounded runtime retry.");
         }
 
-        if (failures.Count != 3 ||
+        if (failures.Count != 4 ||
             failures[0].Phase != "configuration-command-queue" || failures[0].Exception is not IOException ||
             failures[1].Phase != "runtime-host" || failures[1].Exception is not InvalidOperationException ||
-            failures[2].Phase != "memory-monitor" || failures[2].Exception is not ApplicationException)
+            failures[2].Phase != "memory-monitor" || failures[2].Exception is not ApplicationException ||
+            failures[3].Phase != "runtime-host-retry" || failures[3].Exception is not InvalidOperationException)
         {
-            throw new InvalidOperationException("Shutdown sequence did not retain every phase failure in owner order.");
+            throw new InvalidOperationException(
+                "Shutdown sequence did not retain first-pass and residual retry failures in deterministic owner order.");
         }
     }
 }
