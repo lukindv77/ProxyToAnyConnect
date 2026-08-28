@@ -34,7 +34,8 @@ jobs:
             '.github',
             'README.md',
             'ProxyToAnyConnect.sln',
-            '.gitignore'
+            '.gitignore',
+            'START_NEW_CHAT_PROMPT.md'
           )
 
           foreach ($item in $items) {
@@ -50,17 +51,17 @@ jobs:
             "WorkflowRun=$env:GITHUB_RUN_NUMBER",
             "CreatedUtc=$([DateTime]::UtcNow.ToString('O'))",
             'StartNewChatWith=docs/handoff/NEW_CHAT_PROMPT.md',
-            'ReadFirst=docs/handoff/CURRENT_STATE.md;docs/handoff/AUDIT_SNAPSHOT.md;docs/handoff/ACTIVE_DEVELOPMENT.md;docs/handoff/FINAL_CI_STATUS.md;docs/requirements.md;docs/architecture.md;docs/memory-stability.md;docs/windows-integration-evidence.md;docs/windows-soak-evidence.md'
+            'ReadFirst=docs/handoff/SESSION_2026-08-28.md;docs/handoff/CURRENT_STATE.md;docs/handoff/AUDIT_SNAPSHOT.md;docs/handoff/ACTIVE_DEVELOPMENT.md;docs/handoff/FINAL_CI_STATUS.md;docs/handoff/ISSUES_SNAPSHOT.md;docs/requirements.md;docs/architecture.md;docs/memory-stability.md;docs/windows-integration-evidence.md;docs/windows-soak-evidence.md'
           ) | Set-Content -Path (Join-Path $stage 'HANDOFF_BUILD_INFO.txt') -Encoding utf8
 
           git log --date=iso-strict --pretty=format:'%H%x09%ad%x09%s' -n 120 |
             Set-Content -Path (Join-Path $stage 'RECENT_COMMITS.tsv') -Encoding utf8
 
           @(
-            'Open live GitHub main before coding; it is authoritative over this archive.',
+            'Live GitHub main is authoritative over this archive.',
             'Start with docs/handoff/NEW_CHAT_PROMPT.md.',
-            'Then read CURRENT_STATE.md, AUDIT_SNAPSHOT.md, ACTIVE_DEVELOPMENT.md and FINAL_CI_STATUS.md.',
-            'Fetch live issues/comments and exact-head build + handoff Actions before claiming acceptance.'
+            'Then read SESSION_2026-08-28.md, CURRENT_STATE.md, AUDIT_SNAPSHOT.md, ACTIVE_DEVELOPMENT.md, FINAL_CI_STATUS.md and ISSUES_SNAPSHOT.md.',
+            'Fetch live issues/comments, dev/issue49-probe-target and exact-head build + handoff Actions before claiming acceptance.'
           ) | Set-Content -Path (Join-Path $stage 'START_HERE.txt') -Encoding utf8
 
           Get-ChildItem $stage -Recurse -Directory |

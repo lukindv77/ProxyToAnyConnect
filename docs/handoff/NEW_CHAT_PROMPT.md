@@ -4,18 +4,20 @@
 
 ---
 
-Продолжаем разработку публичного GitHub-репозитория **`lukindv77/ProxyToAnyConnect`** после длинного предыдущего чата. Не начинай проект заново. **Live GitHub `main` — главный source of truth.** Репозиторий защищён ruleset; прямые изменения `main` разрешены владельцу и ChatGPT Codex Connector.
+Продолжаем разработку публичного GitHub-репозитория **`lukindv77/ProxyToAnyConnect`** после длинной предыдущей сессии. Не начинай проект заново. **Live GitHub — главный source of truth.** Сначала синхронизируй exact current `main`, Actions, issues/comments и только потом продолжай код.
 
-## Обязательная синхронизация перед любой разработкой
+## Обязательная синхронизация
 
-1. Получи exact current `main` SHA.
-2. Прочитай на current `main`:
+1. Получи exact current `main` SHA и tree SHA.
+2. Прочитай на current `main` минимум:
    - `docs/handoff/NEW_CHAT_PROMPT.md`
+   - `docs/handoff/SESSION_2026-08-28.md`
    - `docs/handoff/CURRENT_STATE.md`
    - `docs/handoff/AUDIT_SNAPSHOT.md`
    - `docs/handoff/ACTIVE_DEVELOPMENT.md`
    - `docs/handoff/FINAL_CI_STATUS.md`
    - `docs/handoff/ISSUES_SNAPSHOT.md`
+   - `docs/handoff/CHAT_TRANSFER_CHECKPOINT.md`
    - `docs/requirements.md`
    - `docs/architecture.md`
    - `docs/memory-stability.md`
@@ -24,149 +26,107 @@
    - `docs/windows-soak-evidence.md`
    - `.github/workflows/build.yml`
    - `.github/workflows/handoff.yml`
-3. Получи live issues и последние comments для **#2, #4, #5, #6, #7, #11, #13**. #14 и #15 уже закрыты как completed.
-4. Проверь `build` и `handoff` Actions именно для current head. Не называй head green по старому SHA.
-5. Перед изменением блока перечитай его current production code и self-tests. Если этот prompt расходится с live GitHub, приоритет у live GitHub.
+3. Получи live issues и последние comments для **#2, #4, #5, #6, #7, #11, #13, #49, #50**. #45 и #47 закрыты completed; #14/#15 также закрыты и не требуют churn без нового finding.
+4. Проверь `build` и `handoff` именно для exact current head. Не называй head green по старому SHA.
+5. Проверь branch **`dev/issue49-probe-target`**, её latest SHA и Actions run lineage. Это незавершённая работа #49/#50, а не production baseline.
+6. Если prompt/docs расходятся с live GitHub, приоритет у live GitHub.
 
-## Product contract — не ослаблять
+## Последний принятый production checkpoint перед handoff-doc commit
 
-Windows 11 x64 GUI-приложение C# / .NET 10 `net10.0-windows`, WinForms + tray. Несколько локальных HTTP/HTTPS forward proxy; каждый отправляет трафик **только через выбранное L2TP**, без DIRECT fallback.
+Production `main` был **`2e56f8f76efda9047ec83f3cd0e58aee395de322`** после clean PR #48.
 
-Обязательные инварианты:
+Exact-main CI на этом SHA:
+- build #577 / run **`33097542082`** — success целиком: evidence smokes, restore/build, aggregate self-tests, self-contained win-x64 publish, binary integrity manifest, ZIP, artifact upload;
+- handoff #373 / run **`33097542206`** — success;
+- exact handoff artifact id `9657003054`, digest `sha256:a7fcf633740e12b2fa2dcde388567b7038ea48b4686a725986e0c517c40394f0`.
 
-- приложение всегда GUI/tray; `X` скрывает окно, процесс завершает только explicit Exit;
-- multiple independent proxy listeners с отдельными bind IPv4/port/timeouts/max concurrency/state/RX/TX/Pause/Resume;
-- shared/dedicated L2TP leases; first active lease dial+verify, last release disconnect;
-- ExistingWindowsProfile + CustomEphemeral private temporary RAS phonebook;
-- password/PSK — Windows user-bound DPAPI only, never plaintext in config/logs;
-- никакого DIRECT fallback;
-- outbound proxy TCP всегда `Bind()` к L2TP source IPv4 + `IP_UNICAST_IF` L2TP ifIndex;
-- proxied DNS только custom L2TP-bound resolver, не `System.Net.Dns`;
-- existing profile preflight требует L2TP + split tunnel;
-- IPv4 default-route guard before/after dial и continuously;
-- `Disconnected -> Dialing -> Verifying -> Ready`; usable `VpnContext` не публикуется до Ready;
-- verification — реальный HTTPS через L2TP-bound socket; expected public IPv4 должен совпадать, если задан;
-- L2TP loss cancels dependent proxy sessions fail-closed;
-- HTTPS CONNECT — opaque tunnel, без MITM;
-- 32 KiB transfer buffers; bounded process memory/latency — first-class requirements;
-- production forced GC запрещён;
-- `ProxyServer.RunAsync` обязан drain accepted sessions до того, как higher runtime release-ит L2TP lease.
+Handoff commit с этим prompt/archive намеренно двигает `main`, поэтому **первым действием перепроверь новый live head и его exact-head Actions**.
 
-## Текущий проверенный инженерный baseline
+## Что принято в последней сессии
 
-Перед финальной handoff-упаковкой substantive head был **`4b100f3bb6c744b08918ce122ab75982fa263740`** (`evidence: support per-proxy and direct egress expectations`). Windows build **#534** полностью success; handoff **#340** success. Build artifact `9637762202`, digest `sha256:be01041fefa07c4fe4dd39f4a02e5c038b9e729b97049a7da4880d685aedf239`.
+- **#45**: inbound HTTP request-line теперь строго `method SP request-target SP HTTP-version` с ровно двумя ASCII SP; ambiguous/repeated/alternate whitespace reject до outbound ownership. #45 closed completed.
+- **#47**: soak `observedDurationSeconds` producer/validator согласованы по first/last **serialized sample timestamps**; существующая 50 ms consistency tolerance не расширена; tamper/mismatch остаётся fail-closed. #47 closed completed.
+- **#6 audit**: current main уже содержит canonical/reparse-safe/exact-leaf/non-recursive CustomEphemeral orphan cleanup и соответствующие Windows regressions. Managed RAS password/PSK carriers также очищаются сразу после native handoff. Нового duplicate patch не делали. #6 остаётся open только на real Windows/L2TP acceptance и новые конкретные findings.
 
-После handoff-doc/workflow commits SHA будет новее; поэтому новый чат обязан повторно проверить exact live head. Handoff archive содержит `HANDOFF_BUILD_INFO.txt` с exact SHA своей сборки.
+## Незавершённый новый audit/development block: #49 + #50
 
-## Что уже реализовано и принято Windows CI
+### #49
+`verification.probePath` в production сейчас слишком lenient: только leading `/`, затем ASCII wire builder. Control/space/CRLF могут менять framing, non-ASCII молча превращается в `?`. Issue #49 требует byte-exact ASCII origin-form, корректных `%HH`, запрета fragment/controls/non-ASCII/raw ambiguous characters и builder-level fail-closed validation.
 
-### Proxy / HTTP / data path
+### #50
+Windows/.NET 10 diagnostic доказал, что `Uri.CheckHostName("münich.example") == Dns`. Production DNS/TLS получают Unicode host, а HTTP Host через ASCII encoder получает `m?nich.example`, поэтому authority может расходиться. Issue #50 требует единой IDNA/A-label canonicalization для L2TP DNS + TLS SNI/TargetHost + HTTP Host. Дополнительный Windows aggregate показал, что `Uri.CheckHostName` также принимает `bad_.example`, поэтому security boundary должен использовать явную strict DNS-label grammar, а не только platform classifier.
 
-- HTTP forward proxy + HTTPS CONNECT без MITM;
-- strict HTTP request framing/request-smuggling boundary: single valid Content-Length, reject ambiguous CL/TE, exact body forwarding, no post-CL leakage; #14 закрыт;
-- pooled 32 KiB transfer buffers, bounded connection admission/backpressure, incremental header scan, allocation/timing/data-path regressions;
-- accepted sessions deterministically drain before listener run completion and lease release.
+### Где лежит работа
 
-### Transactional proxy lifecycle
+Branch: **`dev/issue49-probe-target`**, base production SHA `2e56f8f76efda9047ec83f3cd0e58aee395de322`.
 
-- startup publication boundary — listener readiness;
-- rejected/cancelled start cancels exact run CTS, drains exact task, clears same-generation ownership and only затем releases exact lease; #15 закрыт;
-- Pause/Dispose preserves `cancel -> drain -> release lease` ordering;
-- caller cancellation remains control flow and does not get replaced by secondary cleanup defects.
+Ключевые validation assets:
+- `.github/validation/issue49-transform.ps1` blob `8986e4461c3a2098be6a4519b1b42e9ad124c7d5`;
+- `.github/validation/issue49-post-transform.ps1` blob `ef2db77e477b49cde12f63ad51f0d5a2c19d663f`;
+- workflow setup commit before final run: `545351d2cb7871f3b903b6242c82d494a0cde17d`;
+- validation run7 `33130832271`: **SUCCESS**;
+- bot-published validated source commit: **`1684718295944ecdb28216ae02c32365ff7b2b0c`**.
 
-### RAS / L2TP / native ownership
+История failures важна, не теряй её:
+- run1 `33098221153`: transport failed before compile, но подтвердил Unicode DNS classification = Dns;
+- run2 `33098523188`: patch hunk transport failure;
+- run3 `33098768040`: transform passed, compile caught missing namespace import in new test;
+- run4 `33130656615`: compile + aggregate ran; only new suites failed because `bad_.example` escaped `Uri.CheckHostName`, что подтвердило необходимость explicit LDH label grammar;
+- run5/run6: YAML parse-only failures при переносе strict-label transform; не считать semantic regression;
+- run7 `33130832271`: exact transforms + full aggregate + source publish all success.
 
-- callback-driven async `RasDialW` with exact `HRASCONN` ownership;
-- managed password carrier cleared immediately after native handoff; PSK carrier cleared after `RasSetCredentialsW`;
-- callback root stays alive until Connected or proven terminal `ERROR_INVALID_HANDLE`;
-- one hangup/drain attempt is bounded (production 10 s); timeout does **not** release callback root or falsely declare terminal state; exact handle remains retryable;
-- native callback-root registry has deterministic churn coverage and current/high-watermark diagnostics;
-- RAS manager cleanup, monitor cancellation and residual-handle retry preserve primary failure while draining independent owners;
-- CustomEphemeral uses private temporary PBK, lock-first ownership marker protocol, orphan recovery and stale entry deletion; repeated partial-creation failure cycles leave no accumulating managed session directories;
-- ExistingWindowsProfile enumeration owns and kills/drains its PowerShell helper process tree on cancellation/timeout; L2TP settings dialog owns exact profile-load task and shutdown waits it.
+Validated source commit `1684718295944ecdb28216ae02c32365ff7b2b0c` меняет ровно четыре production/test файла:
+- `src/ProxyToAnyConnect/Configuration/AppOptions.cs`
+- `src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs`
+- `tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs`
+- `tests/ProxyToAnyConnect.SelfTests/VerificationProbeRequestSelfTests.cs`
 
-### VPN leases / keepalive / reconnect
+**Не merge dev workflow/validation transport в main.** Сначала reconstruct clean acceptance commit только из этих четырёх файлов от current `main`, затем clean PR → permanent Windows CI → merge/rebase → exact-main build + handoff. Только после этого закрывать #49/#50.
 
-- shared/dedicated `VpnLeaseManager` semantics;
-- first lease connects/verifies, last release disconnects and clears L2TP DNS cache;
-- shared failure invalidates dependents fail-closed while unrelated VPN groups remain independent;
-- reconnect cooldown is observed without exception/log churn; maintenance stops promptly after last lease;
-- cleanup failures do not prevent release of independent DNS/status/lifetime owners.
+## Product/architecture invariants — не ослаблять
 
-### Runtime coordinator / concurrency / recovery
+Windows 11 x64, C#/.NET 10 WinForms+tray, multiple local HTTP/HTTPS forward proxies. Каждый proxy связан с выбранным L2TP и **никогда не имеет DIRECT fallback**.
 
-- Start/Pause/Reconfigure serialized at runtime-generation boundaries;
-- independent proxy start/restart generations may run concurrently inside one coordinator operation; failure of one group remains isolated/pending while unrelated group may reach Running;
-- independent proxy cleanup owners drain concurrently inside proxy phase; all proxy cleanup completes before VPN-manager phase; independent VPN managers then drain concurrently;
-- cleanup primary/secondary failure ordering is deterministic by input order, not scheduler completion order;
-- same-config apply detects missing topology as drift and recreates missing VPN/proxy generations;
-- pending desired starts survive interrupted startup/reconfigure and retry on identical config;
-- host/coordinator/VPN/RAS cleanup continues through throwing cancellation callbacks.
+Сохранять:
+- GUI/tray lifecycle, explicit Exit only;
+- multiple independent proxies, Pause/Resume, bounded concurrency and exact session drain;
+- shared/dedicated L2TP lease semantics;
+- ExistingWindowsProfile + private CustomEphemeral PBK;
+- DPAPI-protected password/PSK, no plaintext persistence/logging;
+- outbound TCP source `Bind()` + `IP_UNICAST_IF` selected L2TP interface;
+- proxied DNS only custom L2TP-bound resolver;
+- split-tunnel/default-route guards;
+- `Disconnected -> Dialing -> Verifying -> Ready`, no usable context before verification;
+- verification via real L2TP-bound HTTPS;
+- L2TP loss cancels dependents fail-closed;
+- no TLS MITM for CONNECT;
+- pooled 32 KiB data path, bounded memory and low latency as first-class requirements;
+- no production forced GC and no memory optimization that regresses proxy latency/throughput;
+- `ProxyServer.RunAsync` drains accepted sessions before higher ownership releases VPN lease.
 
-### GUI / configuration (#5)
+## Real release boundaries — не подменять hosted smoke
 
-- strict FIFO GUI generation queue for Add/Edit/Remove/Logging **и Start/Pause**;
-- unique-temp transactional `appsettings.json` save; file changes only after complete serialization and cancellation boundary;
-- persisted desired state is authoritative after durable save even if runtime reconciliation fails;
-- `desired ∪ actual` grid projection shows desired-but-missing runtime and residual cleanup drift;
-- legacy invalid config supports multi-step in-memory staged repair: incomplete invalid generations do not reach disk/runtime; final repair publishes the whole accumulated valid generation;
-- logging and runtime consume the same persisted desired generation independently; logging edit completing the last invalid field also applies staged proxy/VPN repairs;
-- caller cancellation wins over secondary persisted-consumer faults;
-- explicit Exit closes active configuration modal, stops new queue admission, cancels/drains exact config generations/profile helper, then disposes runtime and memory monitor;
-- loaded invalid numeric settings are clamped in editors so repair UI remains usable;
-- unused protected password/PSK are pruned when auth/mode changes.
+Open external/evidence-critical work remains:
+- #2 real Windows 11 + real L2TP E2E;
+- #4 real shared/dedicated multi-proxy lease behavior;
+- #5 real operator GUI/profile/selective live behavior;
+- #6 real CustomEphemeral auth/PSK/cert/cleanup;
+- #7 real keepalive failure → hangup → cooldown → reconnect;
+- #11 permanent performance/memory requirement;
+- #13 representative 12–24 h exact-binary soak with traffic/reconnect/Pause/Resume/reconfigure and correlated managed/native resource series.
 
-#5 remains open because real operator-facing Windows 11 GUI + actual VPN profile/L2TP acceptance is still required.
+Hosted Actions smoke — tooling mechanics only. Не выдумывай real L2TP/soak evidence.
 
-### Evidence / long-run stability (#2/#13)
+## Порядок продолжения
 
-- Baseline -> Ready -> Final Windows evidence with route/profile/interface/process snapshots, proxy/direct probes and aggregate acceptance summary;
-- exact running `ProxyToAnyConnect.exe` SHA-256 captured and can be matched to CI `build-identity.json` / `.sha256`;
-- latest evidence extension supports per-proxy expected public IPv4 overrides for heterogeneous shared/dedicated egress and an explicit expected direct-host public IPv4;
-- portable manifest-protected soak bundle with exact PID/start-time/executable SHA, PID-reuse rejection and streaming bounded-memory validation;
-- external working/private bytes/handles/threads soak data correlates to application `process.memory.*` managed heap/GC records using the same PID + process start time;
-- process memory monitor retains only bounded current state; no forced GC in production;
-- 250-cycle proxy/reconfigure/lifetime stress and large native callback-root churn regressions exist.
+1. Live sync exact `main` + exact-head build/handoff.
+2. Read handoff docs and issue comments.
+3. Verify live `dev/issue49-probe-target` still contains validated source commit `1684718295944ecdb28216ae02c32365ff7b2b0c`, then finish #49/#50 clean acceptance.
+4. Update issues with concrete result SHA/run IDs.
+5. Update handoff docs after every accepted engineering block.
+6. Continue широкими связанными блоками, а не одной мелкой задачей, но не churn уже доказанных #45/#47/#6 boundaries без нового finding.
+7. Для новых findings: issue-first с acceptance, затем code/tests, permanent Windows CI, exact-head CI.
 
-Hosted smoke validates mechanics only. #13 still needs representative **12–24 h real soak** with traffic/reconnect/Pause/Resume/reconfigure.
-
-## Open release boundary
-
-Open issues: **#2, #4, #5, #6, #7, #11, #13**.
-
-Main blockers to first real beta/RC are external acceptance, not missing core architecture:
-
-1. Windows 11 x64 + real L2TP endpoint E2E (#2).
-2. Multi-proxy shared/dedicated real lease behavior (#4).
-3. Manual GUI/operator acceptance with actual profiles and selective live effects (#5).
-4. Real CustomEphemeral authentication/PSK/certificate and cleanup (#6).
-5. Real PPP-server/CustomIPv4 keepalive failure -> hangup -> cooldown -> reconnect behavior (#7).
-6. 12–24 h representative exact-binary soak and memory/resource trend review (#13).
-7. Continue #11 performance/memory hardening only when it does not weaken fail-closed or data-path latency/throughput.
-
-## Immediate continuation order in the new chat
-
-1. Fetch live `main`, issues/comments and exact-head Actions; state the exact SHA and verdict before coding.
-2. Inspect the latest per-proxy/direct egress expectation work around `4b100f3...`; ensure `Invoke/Test/Complete-WindowsIntegrationEvidence.ps1` and hosted positive/negative smoke all enforce the new contract end-to-end. Do not assume a single collector commit completes the validator path.
-3. Move the authoritative checkpoint only after exact-head Windows build + publish/upload success.
-4. Continue broad deterministic lifecycle/stress work where real endpoint is not required; do not duplicate already-closed RAS hangup timeout, #14 or #15 work.
-5. When a real Windows 11/L2TP endpoint is available, execute the release-critical #2/#4/#5/#6/#7 matrix and capture the exact-binary evidence bundle.
-6. Run the documented 12–24 h #13 soak and correlate external/native + managed memory series.
-7. Fix findings in multiple coherent commits, update GitHub issues/docs as work proceeds, and keep `main` + handoff archive synchronized.
-
-## Handoff archive
-
-`.github/workflows/handoff.yml` creates artifact **`ProxyToAnyConnect-handoff-<sha>`**. The archive includes `src/`, `tests/`, `tools/`, `docs/`, `.github/`, solution/README, `HANDOFF_BUILD_INFO.txt`, `RECENT_COMMITS.tsv` and `START_HERE.txt`. Use the latest artifact whose embedded SHA equals current `main` (or explicitly treat a newer live `main` as authoritative).
-
-## Рабочий стиль
-
-- Общайся с пользователем по-русски.
-- Не ограничивайся одной мелкой задачей/одним коммитом: пользователь просит широкие функциональные блоки.
-- Новые findings, цели, acceptance и результаты фиксируй в GitHub issues/docs.
-- Не задавай вопросы, ответ на которые уже есть в requirements/live GitHub.
-- Не утверждай локальную компиляцию: authoritative compile/test — Windows GitHub Actions.
-- Никогда не ослабляй fail-closed invariants ради удобства тестов или performance.
-
-Начни сразу с live GitHub synchronization и продолжай разработку от фактического current head.
+Общайся с пользователем по-русски. Не задавай вопросы, ответы на которые уже есть в live GitHub/requirements. Начни сразу с синхронизации GitHub и продолжай от фактического current state.
 
 ---

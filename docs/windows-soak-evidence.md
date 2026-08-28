@@ -6,46 +6,17 @@ It complements, but does not replace, the real Windows 11 + L2TP integration acc
 
 ## What the collector proves
 
-`tools/Invoke-WindowsSoakEvidence.ps1` attaches to one already-running process by PID and first verifies:
+`tools/Invoke-WindowsSoakEvidence.ps1` attaches to one already-running process by PID and verifies process name, process start time on every sample (rejecting PID reuse), and SHA-256 of the exact executable. It samples working set, private bytes, handle count and thread count. Samples are written immediately to JSONL while the collector retains only scalar min/max/first/last aggregates, so a 12–24 hour run does not create an unbounded in-memory history.
 
-- the process name expected by the operator;
-- the process start time, which is retained and checked on every sample so PID reuse is rejected;
-- SHA-256 of the executable backing that process against the exact expected release binary hash.
-
-After identity is established, the collector samples only process-level diagnostics outside the proxy byte-transfer path:
-
-- working set;
-- private bytes;
-- Windows handle count;
-- process thread count.
-
-The collector writes each sample immediately to JSONL and retains only scalar min/max/first/last aggregates in its own process. A 12-24 hour run therefore does not create an unbounded in-memory history.
-
-The application itself already records `process.memory.startup` and `process.memory.periodic` JSONL events containing managed heap, total allocated bytes, GC counts, working set, private bytes, handles and threads. Keep those application logs for the same time window and correlate them with the external soak series. The external collector intentionally does not inject diagnostics into the target process merely to obtain managed-heap data.
+The application separately records `process.memory.startup` and `process.memory.periodic` events with managed heap/allocation/GC, working/private bytes, handles and threads. Preserve those logs for correlation with the external series.
 
 ## Required release identity
 
-Use the self-contained Windows artifact produced by GitHub Actions. The artifact contains:
-
-- `ProxyToAnyConnect.exe`;
-- `ProxyToAnyConnect.exe.sha256`;
-- `build-identity.json` containing the Git commit and executable SHA-256.
-
-Do not type or copy a hash from a different build. The soak evidence is valid only for the executable actually running during the soak.
-
-Example PowerShell setup after starting the release binary:
-
-```powershell
-$identity = Get-Content .\build-identity.json -Raw | ConvertFrom-Json
-$process = @(Get-Process -Name ProxyToAnyConnect -ErrorAction Stop)
-if ($process.Count -ne 1) {
-    throw "Expected exactly one ProxyToAnyConnect process, found $($process.Count)."
-}
-```
+Use the self-contained Windows artifact produced by GitHub Actions and its `ProxyToAnyConnect.exe.sha256` / `build-identity.json`. Evidence is valid only for the executable actually running during the soak.
 
 ## 12-hour collection
 
-A five-minute interval yields approximately 145 external samples during a 12-hour run while adding negligible monitoring overhead:
+Example:
 
 ```powershell
 .\tools\Invoke-WindowsSoakEvidence.ps1 `
@@ -57,13 +28,9 @@ A five-minute interval yields approximately 145 external samples during a 12-hou
   -OutputDirectory .\artifacts\soak-12h
 ```
 
-For a 24-hour acceptance run use `-DurationSeconds 86400`.
-
-The collector fails if the target process exits, its PID is reused, its process name changes, or its executable hash does not match the expected release identity.
+Use `-DurationSeconds 86400` for 24 hours. The collector fails if the target exits, its PID is reused, its process name changes, or its executable hash no longer matches.
 
 ## Validate bundle integrity
-
-After collection:
 
 ```powershell
 .\tools\Test-WindowsSoakEvidence.ps1 `
@@ -73,64 +40,28 @@ After collection:
   -MinimumObservedDurationSeconds 42600
 ```
 
-The small duration tolerance accounts for time between collector initialization and the first external sample. For a 24-hour run choose corresponding minimums appropriate to the configured interval.
+### Canonical observed-duration contract (#47)
 
-The validator checks:
+`observedDurationSeconds` has one canonical representation: the UTC span between the **first and last timestamps exactly as serialized into `process-samples.jsonl`**. The collector summary/result derives the value from those serialized timestamps. The validator reparses the same serialized sample stream and requires the recomputed span to match within the existing 50 ms consistency tolerance.
 
-- evidence schema versions;
-- exact executable SHA-256 in metadata, summary and result;
-- exactly four emitted payloads in the manifest;
-- bundle-relative, non-absolute manifest paths;
-- manifest file lengths and SHA-256 values for every emitted payload;
-- absence of a host-specific absolute output path in `result.json`;
-- sample count against both summary and result;
-- contiguous sample indexes;
-- stable PID, process name and process start time across every sample;
-- monotonic sample timestamps;
-- non-negative memory/handle/thread measurements;
-- requested minimum sample count and observed duration;
-- summary/result observed-duration consistency.
+Do **not** derive acceptance duration from a separate higher-precision in-memory clock path, and do **not** widen the tolerance to hide representation mismatches. The minimum observed-duration threshold is independent of this internal consistency check.
 
-Validation means the evidence bundle is internally consistent, portable between machines/directories and belongs to the expected process binary. It does **not** automatically declare the application leak-free.
+The validator also checks schema versions, exact executable SHA in metadata/summary/result, complete portable manifest paths/lengths/hashes, sample count/index continuity, stable PID/name/start-time identity, monotonic timestamps, non-negative resource metrics, requested minimum samples/duration, and summary/result duration consistency against the serialized first/last sample timestamps.
 
-## Evidence files and portability contract
+Validation proves bundle identity/integrity/consistency; it does **not** by itself prove that the application is leak-free.
 
-The output directory contains exactly these four manifested payload files plus the manifest itself:
+## Evidence files and portability
 
-- `metadata.json` — exact process/binary identity and requested sampling parameters;
-- `process-samples.jsonl` — append-only external sample stream;
-- `summary.json` — first/last/min/max/delta process metrics and collection status;
-- `result.json` — compact successful-collection result with no absolute host path;
-- `manifest.json` — SHA-256 and byte length for all four payload files above.
+The bundle contains `metadata.json`, append-only `process-samples.jsonl`, `summary.json`, `result.json`, and `manifest.json`. Payloads deliberately avoid host-specific absolute paths. Editing any manifested payload after collection must make validation fail; do not regenerate only the manifest around edited evidence.
 
-The collector deliberately does not store the executable path or output-directory path in the evidence payloads. Release identity is represented by process name, PID/start time and SHA-256, while all manifest paths are relative to the bundle root. The completed directory can therefore be copied or archived without invalidating its internal identity/integrity contract.
+## Workload for release-grade soak
 
-Any post-collection change to `metadata.json`, `process-samples.jsonl`, `summary.json` or `result.json` must make validation fail until a new evidence run produces a new manifest. Operators must not regenerate only the manifest around edited evidence.
-
-## Workload to exercise during the soak
-
-A release-grade #13 soak should include representative traffic and lifecycle churn rather than an idle-only process. Where the real endpoint permits it, exercise:
-
-- multiple concurrently configured proxy listeners;
-- sustained HTTP and CONNECT traffic;
-- repeated client connect/disconnect cycles;
-- shared and dedicated L2TP usage;
-- Pause/Resume cycles;
-- selective proxy-only and L2TP-dependent configuration changes;
-- L2TP reconnects and full verification cycles;
-- keepalive success and controlled failure/recovery cases;
-- CustomEphemeral create/disconnect cleanup when that mode is under acceptance.
-
-Keep timestamps or operational notes for deliberate lifecycle events so changes in process metrics can be related to actual workload transitions.
+Exercise representative traffic and lifecycle churn: multiple proxies, sustained HTTP/CONNECT, client churn, shared/dedicated L2TP, Pause/Resume, selective reconfiguration, reconnect/verification cycles, keepalive success/failure/recovery, and CustomEphemeral cleanup where applicable.
 
 ## Acceptance interpretation
 
-Do not use a machine-specific absolute working-set number as the sole pass/fail criterion. Windows socket buffers, runtime GC policy, current traffic and OS memory pressure can change the working set without representing retained application ownership.
-
-Review the external sample series together with the application's `process.memory.*` records and lifecycle logs. Repeated session/reconnect/reconfigure cycles must not create monotonic retained growth in managed heap, handles, threads or other owned state after the workload returns to a comparable steady condition.
-
-If a suspected retention pattern appears, reproduce it with the deterministic ownership/collectability self-tests first. Production code must not add forced `GC.Collect`, working-set trimming, synchronous hot-path cleanup or smaller transfer buffers merely to make soak graphs look smaller.
+Do not use a machine-specific working-set number as the sole pass/fail criterion. Review external series with application `process.memory.*` records and lifecycle logs. Repeated comparable steady states must not show monotonic retained growth in managed heap, handles, threads or other owned state. If retention is suspected, reproduce it with deterministic ownership tests first. Do not add forced `GC.Collect`, working-set trimming, synchronous hot-path cleanup, or smaller transfer buffers merely to improve graphs.
 
 ## Hosted CI coverage
 
-The Windows build workflow performs a short smoke run of both soak scripts against the current PowerShell process. The smoke validates script syntax, process identity/hash checking, sample emission, complete four-payload manifest integrity, result/summary consistency and validator execution. It also mutates a copied payload after collection and requires the validator to reject that tampered bundle. This hosted smoke does not pretend to replace the required multi-hour Windows 11/L2TP soak.
+Hosted Windows CI performs a short smoke of collector/validator identity, sampling, manifest integrity, duration consistency and tamper rejection. It is tooling mechanics only and does not replace the required multi-hour Windows 11/L2TP soak.

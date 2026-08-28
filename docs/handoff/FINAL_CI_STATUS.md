@@ -1,51 +1,20 @@
-# Final CI status at handoff — 2026-08-27
+# CI status — handoff checkpoint
 
-Live protected `main` is authoritative. A source block is called accepted only after an exact-head Windows build completes successfully.
+## Last fully accepted production SHA before handoff-doc commit
 
-## Last fully verified substantive source checkpoint before handoff-only commits
+`2e56f8f76efda9047ec83f3cd0e58aee395de322`
 
-Commit `4b100f3bb6c744b08918ce122ab75982fa263740` — `evidence: support per-proxy and direct egress expectations`.
+- permanent PR #48 build run `33097205158`: success;
+- exact-main build #577 / run `33097542082`: success;
+- exact-main handoff #373 / run `33097542206`: success;
+- handoff artifact id `9657003054`, digest `sha256:a7fcf633740e12b2fa2dcde388567b7038ea48b4686a725986e0c517c40394f0`.
 
-Windows build #534, run `33051353263`, completed successfully on `windows-latest`:
+The docs/archive handoff commit moves main, so the next chat must fetch the new exact head and require its own build/handoff verdict rather than relying on these older exact-head runs.
 
-- PowerShell tool validation: PASS;
-- Baseline -> Ready -> Final integration-evidence smoke: PASS;
-- exact binary/process identity smoke: PASS;
-- Windows soak + managed-log correlation smoke: PASS;
-- restore/build: PASS;
-- aggregate self-tests: PASS;
-- self-contained win-x64 publish: PASS;
-- binary identity manifest / ZIP / artifact upload: PASS.
+## #49/#50 dev validation
 
-Build artifact `9637762202`, `ProxyToAnyConnect-win-x64`, digest:
-`sha256:be01041fefa07c4fe4dd39f4a02e5c038b9e729b97049a7da4880d685aedf239`.
+- run `33130832271`: success across exact source transforms, full Windows aggregate self-tests and source publish;
+- validated source commit `1684718295944ecdb28216ae02c32365ff7b2b0c`;
+- source commit changes exactly four expected production/test files and does not include dev workflow/transport files.
 
-Handoff #340 for the same SHA also succeeded. Its historical archive artifact was `9637723727`, digest `sha256:a5f6938cd10c8ba1cede68e96c4e57968f12c3a0f3bc8d7bca6182f14061b948`.
-
-## What this checkpoint includes
-
-This checkpoint includes all previously accepted fail-closed, HTTP framing, transactional proxy startup, configuration, RAS/VPN, GUI shutdown and evidence work plus the current broad hardening state:
-
-- staged multi-step repair of invalid loaded configuration before one complete durable publication;
-- one persisted desired generation consumed independently by logging + runtime, with caller-cancellation precedence;
-- GUI Start/Pause serialized with configuration generations;
-- L2TP dialog-owned Windows-profile helper cancellation/drain before config-generation release;
-- bounded/streaming exact-binary soak evidence and managed-log correlation;
-- process-memory monitor and cleanup ownership resilient to cancellation callback faults;
-- process-wide native RAS callback-root current count + high-watermark telemetry;
-- bounded RAS hangup/drain attempt that retains exact native ownership on timeout rather than risking callback-after-free;
-- independent proxy start/restart generations running concurrently inside one serialized coordinator operation;
-- independent cleanup owners running concurrently inside dependency phases, with proxy phase completed before VPN-manager phase;
-- failed independent proxy start isolated/pending while unrelated generation can become Running;
-- cleanup primary/secondary diagnostics deterministic by input order;
-- integration evidence collector support for per-proxy expected public IPv4 plus a separate expected direct-host public IPv4.
-
-## Handoff-only commits after this checkpoint
-
-The handoff preparation intentionally updates documentation and `.github/workflows/handoff.yml`, moving the live SHA forward without changing the accepted runtime/data path. The new handoff workflow includes `tools/`, `RECENT_COMMITS.tsv`, `START_HERE.txt` and 90-day artifact retention.
-
-The new chat must fetch the exact live head and its Actions. Do not call a handoff-only head green solely because `4b100f3...` was green; verify current Actions explicitly.
-
-## Release boundary still open
-
-Hosted CI cannot replace real Windows 11 + real L2TP endpoint acceptance. Issues #2/#4/#5/#6/#7 remain open for endpoint/UI validation. Issue #13 additionally requires a representative 12–24 h exact-binary soak under CONNECT/HTTP traffic, shared/dedicated L2TP, reconnect, Pause/Resume and reconfigure activity, with external soak samples correlated to `process.memory.*` logs. #11 remains an ongoing performance/memory architecture requirement.
+This is dev validation, not production acceptance. #49/#50 remain open until clean permanent PR and exact-main CI.
