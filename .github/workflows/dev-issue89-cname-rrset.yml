@@ -31,6 +31,8 @@ jobs:
           $expected = @{
             'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs' = '5de77e2aae48fafaa544069c4ce31bb21987b432'
             'tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs' = '167a9f5002f0a328cfce36f61297ea033126e5a4'
+            'tests/ProxyToAnyConnect.SelfTests/DnsResponseAddressListSelfTests.cs' = '9790851585cdf199f89057494c6c4dc11bea4446'
+            'tests/ProxyToAnyConnect.SelfTests/DnsAResultStorageSelfTests.cs' = '35c712a5d3dbed5d1f0c28347c3ec2091e5208a9'
           }
           foreach ($entry in $expected.GetEnumerator()) {
             if ((git rev-parse "$expectedBase`:$($entry.Key)").Trim() -ne $entry.Value) {
@@ -40,9 +42,13 @@ jobs:
           if ((git rev-parse 'HEAD:.github/validation/issue89-transform.ps1').Trim() -ne '2b82335b506e7e66d51c162b968ab4ec44124030') {
             throw 'Unexpected #89 transform blob.'
           }
+          if ((git rev-parse 'HEAD:.github/validation/issue89-fixture-transform.ps1').Trim() -ne 'df09516e31a0eef2bc7adeeed7540cfcf87a9634') {
+            throw 'Unexpected #89 fixture transform blob.'
+          }
 
           $expectedSurface = @(
             '.github/validation/issue89-transform.ps1'
+            '.github/validation/issue89-fixture-transform.ps1'
             '.github/workflows/dev-issue89-cname-rrset.yml'
           ) | Sort-Object
           $surface = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
@@ -51,15 +57,20 @@ jobs:
           }
 
           & ./.github/validation/issue89-transform.ps1
+          & ./.github/validation/issue89-fixture-transform.ps1
           git add -- `
             src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs `
-            tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs
+            tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs `
+            tests/ProxyToAnyConnect.SelfTests/DnsResponseAddressListSelfTests.cs `
+            tests/ProxyToAnyConnect.SelfTests/DnsAResultStorageSelfTests.cs
           git config core.whitespace cr-at-eol
           git diff --cached --check
 
           $expectedStaged = @(
             'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs'
             'tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs'
+            'tests/ProxyToAnyConnect.SelfTests/DnsResponseAddressListSelfTests.cs'
+            'tests/ProxyToAnyConnect.SelfTests/DnsAResultStorageSelfTests.cs'
           ) | Sort-Object
           $staged = @(git diff --cached --name-only | Sort-Object)
           if (($staged -join "`n") -ne ($expectedStaged -join "`n")) {
