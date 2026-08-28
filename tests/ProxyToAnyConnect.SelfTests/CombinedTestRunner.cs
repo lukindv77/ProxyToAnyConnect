@@ -79,6 +79,7 @@ internal static class CombinedTestRunner
         Run(nameof(SecuritySelfTests), SecuritySelfTests.Run);
         Run(nameof(EphemeralRasPhonebookSelfTests), EphemeralRasPhonebookSelfTests.Run);
         Run(nameof(DnsCacheSelfTests), DnsCacheSelfTests.Run);
+        Run(nameof(DnsResponseBindingSelfTests), DnsResponseBindingSelfTests.Run);
         Run(nameof(DnsQuerySetupSelfTests), DnsQuerySetupSelfTests.Run);
         Run(nameof(DnsNameSkipSelfTests), DnsNameSkipSelfTests.Run);
         Run(nameof(DnsResponseAddressListSelfTests), DnsResponseAddressListSelfTests.Run);

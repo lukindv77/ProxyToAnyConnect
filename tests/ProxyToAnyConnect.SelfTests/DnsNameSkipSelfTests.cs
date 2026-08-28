@@ -132,7 +132,7 @@ internal static class DnsNameSkipSelfTests
         AddUInt16(packet, 4);
         packet.AddRange([203, 0, 113, 7]);
 
-        var parsed = L2tpDnsResolver.ParseResponse(packet.ToArray(), transactionId);
+        var parsed = L2tpDnsResolver.ParseResponse(packet.ToArray(), transactionId, "www.example.com");
         if (parsed.Addresses.Count != 1 || parsed.Addresses[0].ToString() != "203.0.113.7")
         {
             throw new InvalidOperationException("DNS A response changed after discard-name optimization.");
