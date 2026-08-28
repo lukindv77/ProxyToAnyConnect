@@ -15,27 +15,65 @@ internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
         _dnsResolver = dnsResolver;
     }
 
-    public async Task<IProxyOutboundConnection> ConnectAsync(
+    public Task<IProxyOutboundConnection> ConnectAsync(
         string host,
         int port,
+        CancellationToken cancellationToken) =>
+        ConnectCoreAsync(host, port, outboundTimeout: null, cancellationToken);
+
+    public Task<IProxyOutboundConnection> ConnectAsync(
+        string host,
+        int port,
+        TimeSpan timeout,
         CancellationToken cancellationToken)
+    {
+        if (timeout <= TimeSpan.Zero || timeout.TotalMilliseconds > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        return ConnectCoreAsync(host, port, timeout, cancellationToken);
+    }
+
+    private async Task<IProxyOutboundConnection> ConnectCoreAsync(
+        string host,
+        int port,
+        TimeSpan? outboundTimeout,
+        CancellationToken ownerCancellation)
     {
         if (port is < 1 or > 65535)
         {
             throw new ArgumentOutOfRangeException(nameof(port));
         }
 
-        // Pause/shutdown cancellation is an ownership boundary, not an ordinary
-        // outbound failure. Observe it before touching VPN or socket state so a
-        // cancelled proxy session never starts new network work.
-        cancellationToken.ThrowIfCancellationRequested();
+        ownerCancellation.ThrowIfCancellationRequested();
+
+        using var deadline = outboundTimeout is null
+            ? null
+            : CancellationTokenSource.CreateLinkedTokenSource(ownerCancellation);
+        if (deadline is not null)
+        {
+            deadline.CancelAfter(outboundTimeout!.Value);
+        }
+        var deadlineToken = deadline?.Token ?? default;
+        var operationCancellation = deadline?.Token ?? ownerCancellation;
 
         var context = _connectionManager.Current;
         if (context is null || !context.IsAlive)
         {
             try
             {
-                context = await _connectionManager.ConnectAsync(cancellationToken);
+                context = await _connectionManager.ConnectAsync(operationCancellation);
+            }
+            catch (OperationCanceledException ex)
+            {
+                ownerCancellation.ThrowIfCancellationRequested();
+                if (deadlineToken.IsCancellationRequested)
+                {
+                    throw new OutboundConnectTimeoutException(
+                        "Configured outbound connection deadline expired while acquiring L2TP.", ex);
+                }
+                throw;
             }
             catch (Exception ex) when (ex is InvalidOperationException or IOException or TimeoutException)
             {
@@ -43,8 +81,13 @@ internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
             }
         }
 
+        ThrowIfOutboundSetupCancellationRequiresAbort(
+            ownerCancellation,
+            context,
+            deadlineToken);
+
         using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken,
+            operationCancellation,
             context.LifetimeToken);
 
         IReadOnlyList<IPAddress> addresses;
@@ -54,16 +97,11 @@ internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
         }
         catch (OperationCanceledException ex)
         {
-            // If both the proxy/session owner and VPN context were cancelled at
-            // nearly the same time, caller ownership wins so Pause/Shutdown stays
-            // cancellation rather than being rewritten to an HTTP 502 path.
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (context.LifetimeToken.IsCancellationRequested)
-            {
-                throw new VpnUnavailableException("L2TP connection disappeared during DNS resolution.", ex);
-            }
-
+            ThrowIfConnectCancellationRequiresAbort(
+                ex,
+                ownerCancellation,
+                context,
+                deadlineToken);
             throw;
         }
         catch (InvalidOperationException ex)
@@ -72,10 +110,12 @@ internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
         }
 
         Exception? lastError = null;
-
         foreach (var address in addresses)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            ThrowIfOutboundSetupCancellationRequiresAbort(
+                ownerCancellation,
+                context,
+                deadlineToken);
 
             var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
             {
@@ -84,15 +124,16 @@ internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
 
             try
             {
-                // Two independent routing constraints are applied before connect():
-                // 1) the socket source address is the IPv4 assigned by this RAS session;
-                // 2) IP_UNICAST_IF explicitly selects the same Windows interface.
-                // There is no code path that creates an unbound/direct Internet socket.
                 socket.Bind(new IPEndPoint(context.LocalIPv4, 0));
                 WindowsSocketInterfaceBinder.BindToIPv4Interface(socket, context.InterfaceIndex);
                 await socket.ConnectAsync(new IPEndPoint(address, port), linkedCancellation.Token);
 
-                if (!context.IsAlive || !context.TryAcquireConnectionReference())
+                ThrowIfOutboundSetupCancellationRequiresAbort(
+                    ownerCancellation,
+                    context,
+                    deadlineToken);
+
+                if (!context.TryAcquireConnectionReference())
                 {
                     socket.Dispose();
                     throw new VpnUnavailableException("L2TP connection disappeared while connecting.");
@@ -103,7 +144,11 @@ internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
             catch (Exception ex) when (ex is SocketException or OperationCanceledException)
             {
                 socket.Dispose();
-                ThrowIfConnectCancellationRequiresAbort(ex, cancellationToken, context);
+                ThrowIfConnectCancellationRequiresAbort(
+                    ex,
+                    ownerCancellation,
+                    context,
+                    deadlineToken);
                 lastError = ex;
             }
         }
@@ -111,25 +156,57 @@ internal sealed class L2tpSocketFactory : IProxyOutboundConnectionFactory
         throw new IOException($"Unable to connect to {host}:{port} through L2TP.", lastError);
     }
 
+    private static void ThrowIfOutboundSetupCancellationRequiresAbort(
+        CancellationToken ownerCancellation,
+        VpnContext context,
+        CancellationToken deadlineCancellation)
+    {
+        ownerCancellation.ThrowIfCancellationRequested();
+        if (!context.IsAlive || context.LifetimeToken.IsCancellationRequested)
+        {
+            throw new VpnUnavailableException("L2TP connection disappeared while connecting.");
+        }
+        if (deadlineCancellation.IsCancellationRequested)
+        {
+            throw new OutboundConnectTimeoutException("Configured outbound connection deadline expired.");
+        }
+    }
+
     internal static void ThrowIfConnectCancellationRequiresAbort(
         Exception connectFailure,
         CancellationToken callerCancellation,
-        VpnContext context)
+        VpnContext context,
+        CancellationToken deadlineCancellation = default)
     {
         ArgumentNullException.ThrowIfNull(connectFailure);
         ArgumentNullException.ThrowIfNull(context);
 
-        // Caller cancellation is checked first intentionally. Proxy Pause/Shutdown
-        // owns the session and must retain cancellation semantics even when the VPN
-        // lifetime is invalidated in the same race window.
         callerCancellation.ThrowIfCancellationRequested();
-
         if (context.LifetimeToken.IsCancellationRequested)
         {
             throw new VpnUnavailableException(
                 "L2TP connection disappeared while connecting.",
                 connectFailure);
         }
+        if (deadlineCancellation.IsCancellationRequested)
+        {
+            throw new OutboundConnectTimeoutException(
+                "Configured outbound connection deadline expired.",
+                connectFailure);
+        }
+    }
+}
+
+internal sealed class OutboundConnectTimeoutException : TimeoutException
+{
+    public OutboundConnectTimeoutException(string message)
+        : base(message)
+    {
+    }
+
+    public OutboundConnectTimeoutException(string message, Exception innerException)
+        : base(message, innerException)
+    {
     }
 }
 
