@@ -15,6 +15,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
@@ -22,8 +24,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          git merge-base --is-ancestor 4437e8df614271d8e2fd666979dab6a3e85c803c HEAD
           if ((git rev-parse '4437e8df614271d8e2fd666979dab6a3e85c803c:src/ProxyToAnyConnect/Vpn/RasNative.cs').Trim() -ne 'ca367e9f3f3ef615dd4ba4da3bc3c952508166ae') {
             throw 'Unexpected RasNative.cs baseline.'
+          }
+          if ((git rev-parse 'HEAD:src/ProxyToAnyConnect/Vpn/RasNative.cs').Trim() -ne 'ca367e9f3f3ef615dd4ba4da3bc3c952508166ae') {
+            throw 'Audit branch changed RasNative.cs.'
           }
       - name: Build Windows SDK layout probe
         shell: pwsh
