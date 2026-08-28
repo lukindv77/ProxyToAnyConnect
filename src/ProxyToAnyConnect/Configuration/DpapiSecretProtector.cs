@@ -17,45 +17,39 @@ internal static class DpapiSecretProtector
         }
 
         var plaintextBytes = Encoding.UTF8.GetBytes(plaintext);
-        var input = AllocateBlob(plaintextBytes);
-        var entropy = AllocateBlob(OptionalEntropy);
-
-        try
-        {
-            if (!CryptProtectData(
-                    ref input,
-                    "ProxyToAnyConnect custom L2TP secret",
-                    ref entropy,
-                    0,
-                    0,
-                    CryptProtectUiForbidden,
-                    out var output))
+        return DpapiBlobMemory.WithInputBlobs(
+            plaintextBytes,
+            OptionalEntropy,
+            DpapiBlobMemory.Allocate,
+            static blob => DpapiBlobMemory.Free(blob, localAlloc: false),
+            static (inputValue, entropyValue) =>
             {
-                throw new InvalidOperationException(
-                    $"Windows DPAPI CryptProtectData failed with Win32 error {Marshal.GetLastWin32Error()}.");
-            }
-
-            try
-            {
-                var protectedBytes = new byte[output.Size];
-                if (output.Size > 0)
+                var input = inputValue;
+                var entropy = entropyValue;
+                if (!CryptProtectData(
+                        ref input,
+                        "ProxyToAnyConnect custom L2TP secret",
+                        ref entropy,
+                        0,
+                        0,
+                        CryptProtectUiForbidden,
+                        out var output))
                 {
-                    Marshal.Copy(output.Data, protectedBytes, 0, output.Size);
+                    throw new InvalidOperationException(
+                        $"Windows DPAPI CryptProtectData failed with Win32 error {Marshal.GetLastWin32Error()}.");
                 }
 
-                return Convert.ToBase64String(protectedBytes);
-            }
-            finally
-            {
-                FreeBlob(output, localAlloc: true);
-            }
-        }
-        finally
-        {
-            FreeBlob(input);
-            FreeBlob(entropy);
-            Array.Clear(plaintextBytes);
-        }
+                try
+                {
+                    var protectedBytes = DpapiBlobMemory.CopyToManaged(output);
+                    return Convert.ToBase64String(protectedBytes);
+                }
+                finally
+                {
+                    DpapiBlobMemory.Free(output, localAlloc: true);
+                }
+            },
+            static bytes => Array.Clear(bytes));
     }
 
     public static string Unprotect(string protectedBase64)
@@ -75,119 +69,67 @@ internal static class DpapiSecretProtector
             throw new InvalidOperationException("Stored custom L2TP secret is not a valid DPAPI blob.", ex);
         }
 
-        var input = AllocateBlob(protectedBytes);
-        var entropy = AllocateBlob(OptionalEntropy);
-
-        try
-        {
-            if (!CryptUnprotectData(
-                    ref input,
-                    0,
-                    ref entropy,
-                    0,
-                    0,
-                    CryptProtectUiForbidden,
-                    out var output))
+        return DpapiBlobMemory.WithInputBlobs(
+            protectedBytes,
+            OptionalEntropy,
+            DpapiBlobMemory.Allocate,
+            static blob => DpapiBlobMemory.Free(blob, localAlloc: false),
+            static (inputValue, entropyValue) =>
             {
-                throw new InvalidOperationException(
-                    $"Windows DPAPI CryptUnprotectData failed with Win32 error {Marshal.GetLastWin32Error()}.");
-            }
-
-            try
-            {
-                var plaintextBytes = new byte[output.Size];
-                if (output.Size > 0)
+                var input = inputValue;
+                var entropy = entropyValue;
+                if (!CryptUnprotectData(
+                        ref input,
+                        0,
+                        ref entropy,
+                        0,
+                        0,
+                        CryptProtectUiForbidden,
+                        out var output))
                 {
-                    Marshal.Copy(output.Data, plaintextBytes, 0, output.Size);
+                    throw new InvalidOperationException(
+                        $"Windows DPAPI CryptUnprotectData failed with Win32 error {Marshal.GetLastWin32Error()}.");
                 }
 
                 try
                 {
-                    return Encoding.UTF8.GetString(plaintextBytes);
+                    var plaintextBytes = DpapiBlobMemory.CopyToManaged(output);
+                    try
+                    {
+                        return Encoding.UTF8.GetString(plaintextBytes);
+                    }
+                    finally
+                    {
+                        Array.Clear(plaintextBytes);
+                    }
                 }
                 finally
                 {
-                    Array.Clear(plaintextBytes);
+                    DpapiBlobMemory.Free(output, localAlloc: true);
                 }
-            }
-            finally
-            {
-                FreeBlob(output, localAlloc: true);
-            }
-        }
-        finally
-        {
-            FreeBlob(input);
-            FreeBlob(entropy);
-            Array.Clear(protectedBytes);
-        }
-    }
-
-    private static DataBlob AllocateBlob(byte[] bytes)
-    {
-        if (bytes.Length == 0)
-        {
-            return default;
-        }
-
-        var pointer = Marshal.AllocHGlobal(bytes.Length);
-        Marshal.Copy(bytes, 0, pointer, bytes.Length);
-        return new DataBlob { Size = bytes.Length, Data = pointer };
-    }
-
-    private static void FreeBlob(DataBlob blob, bool localAlloc = false)
-    {
-        if (blob.Data == 0)
-        {
-            return;
-        }
-
-        try
-        {
-            UnmanagedSecretMemory.Zero(blob.Data, blob.Size);
-        }
-        finally
-        {
-            if (localAlloc)
-            {
-                _ = LocalFree(blob.Data);
-            }
-            else
-            {
-                Marshal.FreeHGlobal(blob.Data);
-            }
-        }
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct DataBlob
-    {
-        public int Size;
-        public nint Data;
+            },
+            static bytes => Array.Clear(bytes));
     }
 
     [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CryptProtectData(
-        ref DataBlob dataIn,
+        ref DpapiDataBlob dataIn,
         string? dataDescription,
-        ref DataBlob optionalEntropy,
+        ref DpapiDataBlob optionalEntropy,
         nint reserved,
         nint promptStruct,
         uint flags,
-        out DataBlob dataOut);
+        out DpapiDataBlob dataOut);
 
     [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CryptUnprotectData(
-        ref DataBlob dataIn,
+        ref DpapiDataBlob dataIn,
         nint dataDescription,
-        ref DataBlob optionalEntropy,
+        ref DpapiDataBlob optionalEntropy,
         nint reserved,
         nint promptStruct,
         uint flags,
-        out DataBlob dataOut);
-
-    [DllImport("kernel32.dll")]
-    private static extern nint LocalFree(nint memory);
+        out DpapiDataBlob dataOut);
 }
