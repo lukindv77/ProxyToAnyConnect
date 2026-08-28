@@ -288,14 +288,20 @@ internal sealed class ProxyServer
         using var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             upstream.LifetimeToken);
+        var responseCommit = new HttpResponseCommitState();
 
         if (request.ContentLength == 0)
         {
-            await PumpAsync(
+            var zeroBodyResponseDownload = PumpHttpResponseAsync(
                 upstreamStream,
                 clientStream,
                 RecordReceived,
+                responseCommit,
                 requestCancellation.Token);
+            await AwaitHttpResponseDownloadAsync(
+                zeroBodyResponseDownload,
+                responseCommit,
+                cancellationToken);
             return;
         }
 
@@ -307,10 +313,11 @@ internal sealed class ProxyServer
             remainder,
             request.ContentLength,
             bodyCancellation.Token);
-        var responseDownload = PumpAsync(
+        var responseDownload = PumpHttpResponseAsync(
             upstreamStream,
             clientStream,
             RecordReceived,
+            responseCommit,
             requestCancellation.Token);
 
         var firstCompleted = await Task.WhenAny(bodyUpload, responseDownload);
@@ -320,7 +327,10 @@ internal sealed class ProxyServer
             // Stop reading client body bytes, but preserve the origin response/failure.
             bodyCancellation.Cancel();
             await IgnoreCancellationAsync(bodyUpload);
-            await responseDownload;
+            await AwaitHttpResponseDownloadAsync(
+                responseDownload,
+                responseCommit,
+                cancellationToken);
             return;
         }
 
@@ -328,17 +338,21 @@ internal sealed class ProxyServer
         {
             await bodyUpload;
         }
-        catch
+        catch (Exception ex)
         {
             requestCancellation.Cancel();
             await IgnoreCancellationAsync(responseDownload);
+            RethrowIfHttpResponseCommitted(responseCommit, ex, cancellationToken);
             throw;
         }
 
         // The proxy handles exactly one plain-HTTP request per client connection.
         // Once Content-Length bytes have been forwarded, no later client bytes are
         // read or sent upstream; only the origin response remains active.
-        await responseDownload;
+        await AwaitHttpResponseDownloadAsync(
+            responseDownload,
+            responseCommit,
+            cancellationToken);
     }
 
     internal static void EnsureInitialBodyRemainderFits(long contentLength, int remainderLength)
@@ -404,6 +418,98 @@ internal sealed class ProxyServer
         {
             ArrayPool<byte>.Shared.Return(buffer, clearArray: false);
         }
+    }
+
+    private static async Task PumpHttpResponseAsync(
+        Stream source,
+        Stream destination,
+        Action<int> onTransferred,
+        HttpResponseCommitState responseCommit,
+        CancellationToken cancellationToken)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(TransferBufferSize);
+        try
+        {
+            while (true)
+            {
+                var read = await source.ReadAsync(buffer.AsMemory(0, TransferBufferSize), cancellationToken);
+                if (read == 0)
+                {
+                    if (!responseCommit.IsCommitted)
+                    {
+                        throw new IOException("Origin closed before beginning an HTTP response.");
+                    }
+
+                    return;
+                }
+
+                await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                // Mark only after the client write completed successfully. An origin
+                // read failure before this point can still be represented by the
+                // proxy's normal pre-response 5xx mapping.
+                responseCommit.MarkCommitted();
+                onTransferred(read);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer, clearArray: false);
+        }
+    }
+
+    private static async Task AwaitHttpResponseDownloadAsync(
+        Task responseDownload,
+        HttpResponseCommitState responseCommit,
+        CancellationToken ownerCancellation)
+    {
+        try
+        {
+            await responseDownload;
+        }
+        catch (OperationCanceledException) when (ownerCancellation.IsCancellationRequested)
+        {
+            // Explicit proxy Pause/Shutdown remains lifecycle control flow even when
+            // origin bytes were already forwarded.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (responseCommit.IsCommitted)
+            {
+                throw new ProxyResponseCommittedException(
+                    "Plain HTTP origin response was already committed; closing the client transport.",
+                    ex);
+            }
+
+            throw;
+        }
+    }
+
+    private static void RethrowIfHttpResponseCommitted(
+        HttpResponseCommitState responseCommit,
+        Exception failure,
+        CancellationToken ownerCancellation)
+    {
+        if (failure is OperationCanceledException && ownerCancellation.IsCancellationRequested)
+        {
+            return;
+        }
+
+        if (responseCommit.IsCommitted)
+        {
+            throw new ProxyResponseCommittedException(
+                "Plain HTTP origin response was already committed before request-side failure cleanup completed.",
+                failure);
+        }
+    }
+
+    private sealed class HttpResponseCommitState
+    {
+        private int _committed;
+
+        public bool IsCommitted => Volatile.Read(ref _committed) != 0;
+
+        public void MarkCommitted() => Volatile.Write(ref _committed, 1);
     }
 
     private static async Task PumpAsync(
