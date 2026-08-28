@@ -36,7 +36,7 @@ jobs:
           foreach ($entry in $expected.GetEnumerator()) {
             if ((git rev-parse "$expectedBase`:$($entry.Key)").Trim() -ne $entry.Value) { throw "Unexpected #85 base blob: $($entry.Key)" }
           }
-          if ((git rev-parse 'HEAD:.github/validation/issue85-transform.ps1').Trim() -ne 'e975248276c591bb57ea94f9b3c88908ba9f8c72') { throw 'Unexpected #85 transform blob.' }
+          if ((git rev-parse 'HEAD:.github/validation/issue85-transform.ps1').Trim() -ne '116abbafb8e3955f41c5342177482660a4c79f55') { throw 'Unexpected #85 transform blob.' }
           if ((git rev-parse 'HEAD:tests/ProxyToAnyConnect.SelfTests/TerminalRuntimeCleanupRetrySelfTests.cs').Trim() -ne 'c5830950a24312640e22320b99b3301b1c7ed8e8') { throw 'Unexpected #85 regression-test blob.' }
 
           $expectedSurface = @(
