@@ -155,12 +155,18 @@ internal sealed class L2tpDnsResolver
         var transactionId = (ushort)Random.Shared.Next(1, ushort.MaxValue + 1);
         var query = BuildQuery(host, transactionId);
 
-        var parsed = await QueryUdpAsync(query, transactionId, dnsServer, context, cancellationToken);
+        var parsed = await QueryUdpAsync(
+            query,
+            transactionId,
+            host,
+            dnsServer,
+            context,
+            cancellationToken);
 
         if (parsed.Truncated)
         {
             var tcpResponse = await QueryTcpAsync(query, dnsServer, context, cancellationToken);
-            parsed = ParseResponse(tcpResponse, transactionId);
+            parsed = ParseResponse(tcpResponse, transactionId, host);
         }
 
         if (parsed.Addresses.Count > 0)
@@ -212,6 +218,7 @@ internal sealed class L2tpDnsResolver
     private static async Task<ParsedDnsResponse> QueryUdpAsync(
         byte[] query,
         ushort transactionId,
+        string expectedHost,
         IPAddress dnsServer,
         VpnContext context,
         CancellationToken cancellationToken)
@@ -236,7 +243,7 @@ internal sealed class L2tpDnsResolver
                 return new ParsedDnsResponse([], null, Truncated: true, MinimumTtlSeconds: null);
             }
 
-            return ParseResponse(buffer.AsSpan(0, received), transactionId);
+            return ParseResponse(buffer.AsSpan(0, received), transactionId, expectedHost);
         }
         finally
         {
@@ -353,8 +360,13 @@ internal sealed class L2tpDnsResolver
         return query;
     }
 
-    internal static ParsedDnsResponse ParseResponse(ReadOnlySpan<byte> response, ushort transactionId)
+    internal static ParsedDnsResponse ParseResponse(
+        ReadOnlySpan<byte> response,
+        ushort transactionId,
+        string expectedHost)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedHost);
+
         if (response.Length < 12)
         {
             throw new IOException("DNS response is too short.");
@@ -384,15 +396,28 @@ internal sealed class L2tpDnsResolver
         }
 
         var questionCount = BinaryPrimitives.ReadUInt16BigEndian(response[4..]);
+        if (questionCount != 1)
+        {
+            throw new IOException("DNS response must contain exactly one question.");
+        }
+
         var answerCount = BinaryPrimitives.ReadUInt16BigEndian(response[6..]);
         var offset = 12;
-
-        for (var i = 0; i < questionCount; i++)
+        var questionNameOffset = offset;
+        SkipName(response, ref offset);
+        if (!DnsNameEqualsAscii(response, questionNameOffset, expectedHost))
         {
-            SkipName(response, ref offset);
-            EnsureRemaining(response, offset, 4);
-            offset += 4;
+            throw new IOException("DNS response question name does not match the query.");
         }
+
+        EnsureRemaining(response, offset, 4);
+        var questionType = BinaryPrimitives.ReadUInt16BigEndian(response[offset..]);
+        var questionClass = BinaryPrimitives.ReadUInt16BigEndian(response[(offset + 2)..]);
+        if (questionType != 1 || questionClass != 1)
+        {
+            throw new IOException("DNS response question is not the requested A/IN question.");
+        }
+        offset += 4;
 
         IPAddress? firstAddress = null;
         List<IPAddress>? additionalAddresses = null;
@@ -401,15 +426,18 @@ internal sealed class L2tpDnsResolver
 
         for (var i = 0; i < answerCount; i++)
         {
+            var ownerOffset = offset;
             SkipName(response, ref offset);
             EnsureRemaining(response, offset, 10);
             var type = BinaryPrimitives.ReadUInt16BigEndian(response[offset..]);
+            var recordClass = BinaryPrimitives.ReadUInt16BigEndian(response[(offset + 2)..]);
             var ttlSeconds = BinaryPrimitives.ReadUInt32BigEndian(response[(offset + 4)..]);
             var dataLength = BinaryPrimitives.ReadUInt16BigEndian(response[(offset + 8)..]);
             offset += 10;
             EnsureRemaining(response, offset, dataLength);
+            var ownedByQuery = DnsNameEqualsAscii(response, ownerOffset, expectedHost);
 
-            if (type == 1 && dataLength == 4)
+            if (ownedByQuery && recordClass == 1 && type == 1 && dataLength == 4)
             {
                 var address = new IPAddress(response.Slice(offset, 4));
                 if (firstAddress is null)
@@ -423,10 +451,16 @@ internal sealed class L2tpDnsResolver
 
                 minimumTtlSeconds = MinTtl(minimumTtlSeconds, ttlSeconds);
             }
-            else if (type == 5)
+            else if (ownedByQuery && recordClass == 1 && type == 5)
             {
                 var cnameOffset = offset;
-                canonicalName = ReadName(response, ref cnameOffset);
+                var parsedCanonicalName = ReadName(response, ref cnameOffset);
+                if (cnameOffset != checked(offset + dataLength))
+                {
+                    throw new IOException("DNS CNAME RDATA length does not match its encoded name.");
+                }
+
+                canonicalName = parsedCanonicalName;
                 minimumTtlSeconds = MinTtl(minimumTtlSeconds, ttlSeconds);
             }
 
@@ -456,6 +490,77 @@ internal sealed class L2tpDnsResolver
             Truncated: false,
             MinimumTtlSeconds: minimumTtlSeconds);
     }
+
+    private static bool DnsNameEqualsAscii(
+        ReadOnlySpan<byte> packet,
+        int offset,
+        ReadOnlySpan<char> expectedHost)
+    {
+        var current = offset;
+        var expectedOffset = 0;
+        var hasLabel = false;
+        var jumps = 0;
+
+        while (true)
+        {
+            EnsureRemaining(packet, current, 1);
+            var length = packet[current++];
+            if (length == 0)
+            {
+                return expectedOffset == expectedHost.Length;
+            }
+
+            if ((length & 0xC0) == 0xC0)
+            {
+                EnsureRemaining(packet, current, 1);
+                var pointer = ((length & 0x3F) << 8) | packet[current++];
+                if (pointer >= packet.Length || ++jumps > 32)
+                {
+                    throw new IOException("Invalid DNS name compression pointer.");
+                }
+
+                current = pointer;
+                continue;
+            }
+
+            if ((length & 0xC0) != 0 || length > 63)
+            {
+                throw new IOException("Invalid DNS label length.");
+            }
+
+            EnsureRemaining(packet, current, length);
+            if (hasLabel)
+            {
+                if (expectedOffset >= expectedHost.Length || expectedHost[expectedOffset] != '.')
+                {
+                    return false;
+                }
+
+                expectedOffset++;
+            }
+
+            if (expectedOffset > expectedHost.Length - length)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < length; i++)
+            {
+                var expected = expectedHost[expectedOffset + i];
+                if (expected > 0x7F || FoldAsciiCase(packet[current + i]) != FoldAsciiCase((byte)expected))
+                {
+                    return false;
+                }
+            }
+
+            expectedOffset += length;
+            current += length;
+            hasLabel = true;
+        }
+    }
+
+    private static byte FoldAsciiCase(byte value) =>
+        value is >= 0x41 and <= 0x5A ? (byte)(value + 0x20) : value;
 
     private static uint MinTtl(uint? current, uint candidate) =>
         current is null ? candidate : Math.Min(current.Value, candidate);

@@ -134,7 +134,7 @@ internal static class Program
             answerType: 1,
             answerData: [203, 0, 113, 7]);
 
-        var parsed = L2tpDnsResolver.ParseResponse(packet, DnsTransactionId);
+        var parsed = L2tpDnsResolver.ParseResponse(packet, DnsTransactionId, "example.com");
         if (parsed.Truncated ||
             parsed.Addresses.Count != 1 ||
             !parsed.Addresses[0].Equals(IPAddress.Parse("203.0.113.7")))
@@ -150,7 +150,7 @@ internal static class Program
             answerType: 5,
             answerData: cnameData);
 
-        var parsed = L2tpDnsResolver.ParseResponse(packet, DnsTransactionId);
+        var parsed = L2tpDnsResolver.ParseResponse(packet, DnsTransactionId, "example.com");
         if (parsed.Truncated ||
             !string.Equals(parsed.CanonicalName, "target.example.com", StringComparison.OrdinalIgnoreCase))
         {
@@ -166,7 +166,7 @@ internal static class Program
         packet[2] = 0x82; // QR + TC.
         packet[3] = 0x00;
 
-        var parsed = L2tpDnsResolver.ParseResponse(packet, DnsTransactionId);
+        var parsed = L2tpDnsResolver.ParseResponse(packet, DnsTransactionId, "example.com");
         if (!parsed.Truncated)
         {
             throw new InvalidOperationException("DNS TC flag was not detected.");

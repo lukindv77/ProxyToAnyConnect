@@ -66,7 +66,7 @@ internal static class DnsAResultStorageSelfTests
     {
         var one = L2tpDnsResolver.ParseResponse(
             BuildResponse([(Type: (ushort)1, Ttl: 45u, Data: new byte[] { 203, 0, 113, 7 })]),
-            TransactionId);
+            TransactionId, "example.com");
         AssertAddresses(one, ["203.0.113.7"], expectedTtl: 45);
         if (one.Addresses is not IPAddress[] oneArray)
         {
@@ -90,7 +90,7 @@ internal static class DnsAResultStorageSelfTests
                 (Type: (ushort)1, Ttl: 30u, Data: new byte[] { 198, 51, 100, 9 }),
                 (Type: (ushort)1, Ttl: 90u, Data: new byte[] { 192, 0, 2, 44 })
             ]),
-            TransactionId);
+            TransactionId, "example.com");
         AssertAddresses(multi, ["203.0.113.7", "198.51.100.9", "192.0.2.44"], expectedTtl: 30);
         if (multi.Addresses is not IPAddress[])
         {
@@ -103,7 +103,7 @@ internal static class DnsAResultStorageSelfTests
                 (Type: (ushort)5, Ttl: 20u, Data: EncodeName("edge.example.com")),
                 (Type: (ushort)1, Ttl: 50u, Data: new byte[] { 198, 51, 100, 9 })
             ]),
-            TransactionId);
+            TransactionId, "example.com");
         AssertAddresses(mixed, ["198.51.100.9"], expectedTtl: 20);
         if (mixed.CanonicalName != "edge.example.com")
         {
