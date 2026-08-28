@@ -77,6 +77,7 @@ internal static class CombinedTestRunner
         Run(nameof(DailyLogEncodingSelfTests), DailyLogEncodingSelfTests.Run);
         await RunAsync(nameof(RetentionCleanupSchedulerSelfTests), RetentionCleanupSchedulerSelfTests.RunAsync);
         Run(nameof(SecuritySelfTests), SecuritySelfTests.Run);
+        Run(nameof(DpapiAcquisitionCleanupSelfTests), DpapiAcquisitionCleanupSelfTests.Run);
         Run(nameof(EphemeralRasPhonebookSelfTests), EphemeralRasPhonebookSelfTests.Run);
         Run(nameof(DnsCacheSelfTests), DnsCacheSelfTests.Run);
         Run(nameof(DnsQuerySetupSelfTests), DnsQuerySetupSelfTests.Run);
@@ -134,7 +135,7 @@ internal static class CombinedTestRunner
             return 1;
         }
 
-        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, bounded-settings/secret-pruning, configuration-persistence/persisted-desired-state/editable-draft-repair/persisted-live-consumers/GUI-topology-projection/GUI-command-generation-serialization/GUI-modal-ownership/L2TP-dialog-helper-drain/application-shutdown-ordering, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation/desired-start-reconciliation/topology-recovery/generation-serialization/coordinator-cleanup/host-shutdown, Windows-profile-helper ownership, native-ICMP keepalive/native-callback-root-churn, cancellable-RAS-dial/manager-cleanup/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle/cleanup-failure, shared-VPN fail-closed/reconnect ownership, reconnect-cooldown maintenance, transactional proxy startup/rejected-cleanup/shutdown, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, stress, DNS-cache and data-path self-tests passed.");
+        Console.WriteLine("All extended fail-closed, lifetime, shutdown-drain, response-safe accepted-close, bounded-status, memory-health, bounded-settings/secret-pruning, configuration-persistence/persisted-desired-state/editable-draft-repair/persisted-live-consumers/GUI-topology-projection/GUI-command-generation-serialization/GUI-modal-ownership/L2TP-dialog-helper-drain/application-shutdown-ordering, daily-log-path/io-lifecycle, configuration/reconfigure/cancellation-reconciliation/desired-start-reconciliation/topology-recovery/generation-serialization/coordinator-cleanup/host-shutdown, Windows-profile-helper ownership, native-ICMP keepalive/native-callback-root-churn, cancellable-RAS-dial/manager-cleanup/Ready-publication, L2TP-outbound-cancellation, VPN-lease-owner/shared/dedicated lifecycle/cleanup-failure, shared-VPN fail-closed/reconnect ownership, reconnect-cooldown maintenance, transactional proxy startup/rejected-cleanup/shutdown, incremental-header, parser-allocation/timing, verification-parser/read/chunk/request/body-view/owner, CONNECT-setup/HTTP-framing, DNS-query/name-skip/address-list/name-materialization/cname-loop/value-result/a-storage, DPAPI-acquisition-cleanup, stress, DNS-cache and data-path self-tests passed.");
         return 0;
     }
 }
