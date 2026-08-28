@@ -1,0 +1,72 @@
+name: dev-issue58-ras-field-limits
+
+on:
+  push:
+    branches:
+      - dev/issue58-ras-field-limits
+    paths:
+      - .github/workflows/dev-issue58-ras-field-limits.yml
+      - .github/validation/issue58-transform.ps1
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 58 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '4e13a7b572fa05a82d1d69c22ad802b398defe43'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          if ((git rev-parse HEAD:.github/validation/issue58-transform.ps1).Trim() -ne 'e5aa4ccd1ce1d6eaefb91f8c14dc086982890c57') {
+            throw 'Unexpected issue58 transform blob.'
+          }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Configuration/AppOptions.cs' = '8412c79b1014091ba1af0a8c21d99bcf4f821edd'
+            'src/ProxyToAnyConnect/Gui/L2tpSettingsDialog.cs' = 'b0116ef06ad4c0a8a788ec6ddb480added731c35'
+            'src/ProxyToAnyConnect/Vpn/EphemeralRasPhonebook.cs' = 'dc0bc2c76e296007e07758f5e026d33649f1b5e1'
+            'tests/ProxyToAnyConnect.SelfTests/SettingsValidationSelfTests.cs' = 'a048ca704c326e022d9bef4f6f6741185fdac14b'
+            'tests/ProxyToAnyConnect.SelfTests/EphemeralRasPhonebookSelfTests.cs' = 'e9f8c10bbf5fb8614e9a3c6f7af8c329622cc868'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) { throw "Unexpected base blob for $($entry.Key): $actual" }
+          }
+
+          & ./.github/validation/issue58-transform.ps1
+
+          $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #58 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 58 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'ras: fail closed on fixed-width native fields'
+          git push origin HEAD:dev/issue58-ras-field-limits
