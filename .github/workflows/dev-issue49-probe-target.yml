@@ -57,6 +57,111 @@ jobs:
             $text.Replace($oldUsing, $newUsing),
             [Text.UTF8Encoding]::new($false))
 
+          $appOptions = 'src/ProxyToAnyConnect/Configuration/AppOptions.cs'
+          $appText = [IO.File]::ReadAllText($appOptions).Replace("`r`n", "`n")
+          $asciiOld = @'
+        if (isAscii)
+        {
+            if (Uri.CheckHostName(value) != UriHostNameType.Dns)
+            {
+                return false;
+            }
+
+            canonicalHost = value;
+            return true;
+        }
+'@.TrimEnd("`r", "`n")
+          $asciiNew = @'
+        if (isAscii)
+        {
+            if (!IsValidAsciiDnsHost(value))
+            {
+                return false;
+            }
+
+            canonicalHost = value;
+            return true;
+        }
+'@.TrimEnd("`r", "`n")
+          if ([regex]::Matches($appText, [regex]::Escape($asciiOld)).Count -ne 1) {
+            throw 'Unexpected ASCII verification-host validation surface.'
+          }
+          $appText = $appText.Replace($asciiOld, $asciiNew)
+
+          $idnOld = @'
+        if (Uri.CheckHostName(canonicalHost) != UriHostNameType.Dns ||
+            canonicalHost.Any(character => character > 0x7f))
+        {
+            canonicalHost = string.Empty;
+            return false;
+        }
+
+        return true;
+    }
+
+    internal static bool IsValidProbePath(string? value)
+'@.TrimEnd("`r", "`n")
+          $idnNew = @'
+        if (!IsValidAsciiDnsHost(canonicalHost))
+        {
+            canonicalHost = string.Empty;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsValidAsciiDnsHost(string value)
+    {
+        if (value.Length is <= 0 or > 253 || value[^1] == '.')
+        {
+            return false;
+        }
+
+        var labelStart = 0;
+        for (var index = 0; index <= value.Length; index++)
+        {
+            if (index != value.Length && value[index] != '.')
+            {
+                continue;
+            }
+
+            var labelLength = index - labelStart;
+            if (labelLength is <= 0 or > 63 ||
+                value[labelStart] == '-' ||
+                value[index - 1] == '-')
+            {
+                return false;
+            }
+
+            for (var labelIndex = labelStart; labelIndex < index; labelIndex++)
+            {
+                var current = value[labelIndex];
+                if (!((current >= 'A' && current <= 'Z') ||
+                      (current >= 'a' && current <= 'z') ||
+                      (current >= '0' && current <= '9') ||
+                      current == '-'))
+                {
+                    return false;
+                }
+            }
+
+            labelStart = index + 1;
+        }
+
+        return true;
+    }
+
+    internal static bool IsValidProbePath(string? value)
+'@.TrimEnd("`r", "`n")
+          if ([regex]::Matches($appText, [regex]::Escape($idnOld)).Count -ne 1) {
+            throw 'Unexpected IDNA verification-host validation surface.'
+          }
+          [IO.File]::WriteAllText(
+            $appOptions,
+            $appText.Replace($idnOld, $idnNew),
+            [Text.UTF8Encoding]::new($false))
+
           $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
           git add -- $expectedPaths
           git config core.whitespace cr-at-eol
