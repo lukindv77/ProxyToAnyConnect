@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/dev-issue66-dns-response-binding.yml
       - .github/validation/issue66-transform.ps1
+      - .github/validation/issue66-normalize-transform.ps1
 
 permissions:
   contents: write
@@ -32,6 +33,9 @@ jobs:
           if ((git rev-parse HEAD:.github/validation/issue66-transform.ps1).Trim() -ne '9573ecc32833abc78485bcf8ff26fa54616a5136') {
             throw 'Unexpected issue66 transform blob.'
           }
+          if ((git rev-parse HEAD:.github/validation/issue66-normalize-transform.ps1).Trim() -ne 'c13738d00edea33f5feb391287e548223472b318') {
+            throw 'Unexpected issue66 transform-normalizer blob.'
+          }
 
           $expectedBlobs = [ordered]@{
             'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs' = '01e37499c2f3f312b97e1dac924e91d49a3409f3'
@@ -47,6 +51,7 @@ jobs:
             }
           }
 
+          & ./.github/validation/issue66-normalize-transform.ps1
           & ./.github/validation/issue66-transform.ps1
 
           $expectedPaths = @(
