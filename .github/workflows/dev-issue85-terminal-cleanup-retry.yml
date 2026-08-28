@@ -1,0 +1,78 @@
+name: dev-issue85-terminal-cleanup-retry
+
+on:
+  push:
+    branches:
+      - dev/issue85-terminal-cleanup-retry
+    paths:
+      - .github/workflows/dev-issue85-terminal-cleanup-retry.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 85 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = 'e5c817aeebc3b29c8e19fa07423eba8221cd47d7'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          $expected = @{
+            'src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs' = 'c40c84231cfd6421b01ac49f8af175694b761fa5'
+            'src/ProxyToAnyConnect/Runtime/ProxyRuntimeHost.cs' = 'e400eb42324ef6aa49d779a56c8a8d0dd4fdc363'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs' = 'fc7bc9c3e4ec32e16e68a82e983fe3a2c4574e8f'
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            if ((git rev-parse "$expectedBase`:$($entry.Key)").Trim() -ne $entry.Value) { throw "Unexpected #85 base blob: $($entry.Key)" }
+          }
+          if ((git rev-parse 'HEAD:.github/validation/issue85-transform.ps1').Trim() -ne 'e975248276c591bb57ea94f9b3c88908ba9f8c72') { throw 'Unexpected #85 transform blob.' }
+          if ((git rev-parse 'HEAD:tests/ProxyToAnyConnect.SelfTests/TerminalRuntimeCleanupRetrySelfTests.cs').Trim() -ne 'c5830950a24312640e22320b99b3301b1c7ed8e8') { throw 'Unexpected #85 regression-test blob.' }
+
+          $expectedSurface = @(
+            '.github/validation/issue85-transform.ps1'
+            '.github/workflows/dev-issue85-terminal-cleanup-retry.yml'
+            'tests/ProxyToAnyConnect.SelfTests/TerminalRuntimeCleanupRetrySelfTests.cs'
+          ) | Sort-Object
+          $surface = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
+          if (($surface -join "`n") -ne ($expectedSurface -join "`n")) { throw "Unexpected #85 branch surface: $($surface -join ', ')" }
+
+          & ./.github/validation/issue85-transform.ps1
+          git add -- `
+            src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs `
+            src/ProxyToAnyConnect/Runtime/ProxyRuntimeHost.cs `
+            tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $expectedStaged = @(
+            'src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs'
+            'src/ProxyToAnyConnect/Runtime/ProxyRuntimeHost.cs'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          ) | Sort-Object
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedStaged -join "`n")) { throw "Unexpected #85 staged surface: $($staged -join ', ')" }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 85 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'runtime: retain terminal cleanup owners for retry'
+          git push origin HEAD:dev/issue85-terminal-cleanup-retry
