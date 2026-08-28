@@ -14,6 +14,7 @@ internal static class SettingsValidationSelfTests
             VerificationResponseLimitIsBounded();
             VerificationProbePathIsWireExactOriginForm();
             VerificationProbeHostUsesCanonicalIdnAuthority();
+            VerificationEditorPreservesWireIdentity();
             InvalidNumericValuesAreRepairable();
             UnusedProtectedSecretsAreDropped();
 
@@ -185,6 +186,49 @@ internal static class SettingsValidationSelfTests
         value.Replace("\r", "\\r", StringComparison.Ordinal)
             .Replace("\n", "\\n", StringComparison.Ordinal)
             .Replace("\t", "\\t", StringComparison.Ordinal);
+
+    private static void VerificationEditorPreservesWireIdentity()
+    {
+        const string rawHost = " example.com ";
+        const string rawPath = "/path ";
+        var materialized = L2tpSettingsDialog.CreateVerificationOptions(
+            "vpn.example.com",
+            rawHost,
+            443,
+            rawPath,
+            5,
+            VerificationOptions.DefaultResponseLimitBytes);
+
+        if (!materialized.ProbeHost.Equals(rawHost, StringComparison.Ordinal) ||
+            !materialized.ProbePath.Equals(rawPath, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "L2TP editor silently rewrote verification host/path identity before validation.");
+        }
+
+        if (VerificationOptions.TryGetCanonicalProbeHost(materialized.ProbeHost, out _) ||
+            VerificationOptions.IsValidProbePath(materialized.ProbePath))
+        {
+            throw new InvalidOperationException(
+                "Whitespace-bearing editor verification identity escaped the shared fail-closed validator.");
+        }
+
+        var valid = L2tpSettingsDialog.CreateVerificationOptions(
+            "vpn.example.com",
+            "API.IPIFY.ORG",
+            443,
+            "/ip/check?x=1%202",
+            5,
+            VerificationOptions.DefaultResponseLimitBytes);
+        if (!valid.ProbeHost.Equals("API.IPIFY.ORG", StringComparison.Ordinal) ||
+            !valid.ProbePath.Equals("/ip/check?x=1%202", StringComparison.Ordinal) ||
+            !VerificationOptions.TryGetCanonicalProbeHost(valid.ProbeHost, out var canonical) ||
+            !canonical.Equals("api.ipify.org", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "L2TP editor did not preserve valid verification input for the common canonicalization boundary.");
+        }
+    }
 
     private static void InvalidNumericValuesAreRepairable()
     {

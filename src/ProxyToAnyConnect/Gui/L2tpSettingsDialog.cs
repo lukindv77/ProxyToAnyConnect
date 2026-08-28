@@ -212,15 +212,13 @@ internal sealed class L2tpSettingsDialog : Form
             MonitorIntervalMilliseconds = decimal.ToInt32(_monitorInterval.Value),
             RouteMonitorIntervalMilliseconds = decimal.ToInt32(_routeMonitorInterval.Value),
             ReconnectCooldownMilliseconds = decimal.ToInt32(_reconnectCooldown.Value),
-            Verification = new VerificationOptions
-            {
-                PublicAddress = _publicAddress.Text.Trim(),
-                ProbeHost = _probeHost.Text.Trim(),
-                ProbePort = decimal.ToInt32(_probePort.Value),
-                ProbePath = _probePath.Text.Trim(),
-                TimeoutSeconds = decimal.ToInt32(_verificationTimeout.Value),
-                MaxResponseBytes = decimal.ToInt32(_verificationMaxResponse.Value)
-            },
+            Verification = CreateVerificationOptions(
+                _publicAddress.Text.Trim(),
+                _probeHost.Text,
+                decimal.ToInt32(_probePort.Value),
+                _probePath.Text,
+                decimal.ToInt32(_verificationTimeout.Value),
+                decimal.ToInt32(_verificationMaxResponse.Value)),
             Keepalive = new KeepaliveOptions
             {
                 Mode = SelectedEnum<L2tpKeepaliveMode>(_keepaliveMode),
@@ -245,6 +243,23 @@ internal sealed class L2tpSettingsDialog : Form
             }
         };
     }
+
+    internal static VerificationOptions CreateVerificationOptions(
+        string publicAddress,
+        string probeHost,
+        int probePort,
+        string probePath,
+        int timeoutSeconds,
+        int maxResponseBytes) =>
+        new()
+        {
+            PublicAddress = publicAddress,
+            ProbeHost = probeHost,
+            ProbePort = probePort,
+            ProbePath = probePath,
+            TimeoutSeconds = timeoutSeconds,
+            MaxResponseBytes = maxResponseBytes
+        };
 
     internal static string ResolveProtectedSecret(
         bool credentialRequired,
