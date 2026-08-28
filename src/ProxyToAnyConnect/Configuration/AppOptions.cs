@@ -334,7 +334,7 @@ internal sealed class AppOptions
         if (!VerificationOptions.TryGetCanonicalProbeHost(verification.ProbeHost, out _))
         {
             throw new InvalidOperationException(
-                $"L2TP '{name}' verification.probeHost must be a valid DNS host name that can be canonicalized with IDNA.");
+                $"L2TP '{name}' verification.probeHost must be a canonical IPv4 literal or a valid DNS host name that can be canonicalized with IDNA.");
         }
 
         if (verification.ProbePort is < 1 or > 65535)
@@ -606,6 +606,23 @@ internal sealed class VerificationOptions
             return false;
         }
 
+        if (IPAddress.TryParse(value, out var literal))
+        {
+            if (literal.AddressFamily != AddressFamily.InterNetwork)
+            {
+                return false;
+            }
+
+            var canonicalLiteral = literal.ToString();
+            if (!value.Equals(canonicalLiteral, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            canonicalHost = canonicalLiteral;
+            return true;
+        }
+
         var isAscii = true;
         foreach (var current in value)
         {
@@ -623,7 +640,7 @@ internal sealed class VerificationOptions
                 return false;
             }
 
-            canonicalHost = value;
+            canonicalHost = value.ToLowerInvariant();
             return true;
         }
 

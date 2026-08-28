@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Gui;
 
@@ -97,7 +99,9 @@ internal static class SettingsValidationSelfTests
     private static void VerificationProbeHostUsesCanonicalIdnAuthority()
     {
         CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: "api.ipify.org").Validate();
+        CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: "API.IPIFY.ORG").Validate();
         CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: "münich.example").Validate();
+        CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: "127.0.0.1").Validate();
 
         if (!VerificationOptions.TryGetCanonicalProbeHost("münich.example", out var canonical) ||
             !canonical.Equals("xn--mnich-kva.example", StringComparison.Ordinal))
@@ -106,14 +110,31 @@ internal static class SettingsValidationSelfTests
                 $"Unicode verification host did not canonicalize to the expected IDNA A-label: '{canonical}'.");
         }
 
-        foreach (var invalid in new[]
-                 {
-                     string.Empty,
-                     "bad host.example",
-                     "line\r\nhost.example",
-                     "bad_.example",
-                     "[2001:db8::1]"
-                 })
+        if (!VerificationOptions.TryGetCanonicalProbeHost("API.IPIFY.ORG", out var asciiCanonical) ||
+            !asciiCanonical.Equals("api.ipify.org", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"ASCII verification host did not canonicalize case consistently: '{asciiCanonical}'.");
+        }
+
+        if (!VerificationOptions.TryGetCanonicalProbeHost("127.0.0.1", out var ipv4Canonical) ||
+            !ipv4Canonical.Equals("127.0.0.1", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Canonical IPv4 verification host was not preserved exactly: '{ipv4Canonical}'.");
+        }
+
+        var invalidHosts = new List<string>
+        {
+            string.Empty,
+            "bad host.example",
+            "line\r\nhost.example",
+            "bad_.example",
+            "[2001:db8::1]"
+        };
+        invalidHosts.AddRange(DetectRuntimeLegacyIpv4Forms());
+
+        foreach (var invalid in invalidHosts)
         {
             try
             {
@@ -126,8 +147,38 @@ internal static class SettingsValidationSelfTests
             }
 
             throw new InvalidOperationException(
-                $"verification.probeHost '{EscapeForDiagnostic(invalid)}' escaped canonical DNS-host validation.");
+                $"verification.probeHost '{EscapeForDiagnostic(invalid)}' escaped canonical host validation.");
         }
+    }
+
+    private static string[] DetectRuntimeLegacyIpv4Forms()
+    {
+        string[] candidates =
+        [
+            "127.1",
+            "127.0.1",
+            "2130706433",
+            "0x7f000001",
+            "017700000001",
+            "0177.0.0.1",
+            "127.000.000.001"
+        ];
+
+        var detected = candidates
+            .Where(candidate =>
+                IPAddress.TryParse(candidate, out var address) &&
+                address.AddressFamily == AddressFamily.InterNetwork &&
+                !candidate.Equals(address.ToString(), StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (detected.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "The current Windows/.NET runtime did not recognize any legacy IPv4 form from the verification regression matrix.");
+        }
+
+        return detected;
     }
 
     private static string EscapeForDiagnostic(string value) =>
