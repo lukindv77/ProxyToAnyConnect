@@ -1,0 +1,135 @@
+name: audit-ras-native-layout
+
+on:
+  push:
+    branches:
+      - audit/ras-native-layout-20260828
+    paths:
+      - .github/workflows/audit-ras-native-layout.yml
+
+permissions:
+  contents: read
+
+jobs:
+  compare-layout:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Verify audited source generation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse '4437e8df614271d8e2fd666979dab6a3e85c803c:src/ProxyToAnyConnect/Vpn/RasNative.cs').Trim() -ne 'ca367e9f3f3ef615dd4ba4da3bc3c952508166ae') {
+            throw 'Unexpected RasNative.cs baseline.'
+          }
+      - name: Build Windows SDK layout probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $probe = Join-Path $env:RUNNER_TEMP 'ras-layout.cpp'
+          @'
+          #define WINVER 0x0501
+          #define _WIN32_WINNT 0x0501
+          #define UNICODE
+          #define _UNICODE
+          #include <windows.h>
+          #include <ras.h>
+          #include <cstddef>
+          #include <iostream>
+
+          int main() {
+              std::cout << "RasDialParams.Size=" << sizeof(RASDIALPARAMSW) << "\n";
+              std::cout << "RasDialParams.DwCallbackId=" << offsetof(RASDIALPARAMSW, dwCallbackId) << "\n";
+              std::cout << "RasPppIp.Size=" << sizeof(RASPPPIPW) << "\n";
+              std::cout << "RasPppIp.DwOptions=" << offsetof(RASPPPIPW, dwOptions) << "\n";
+              std::cout << "RasEntry.Size=" << sizeof(RASENTRYW) << "\n";
+              std::cout << "RasEntry.DwVpnStrategy=" << offsetof(RASENTRYW, dwVpnStrategy) << "\n";
+              std::cout << "RasEntry.DwfOptions3=" << offsetof(RASENTRYW, dwfOptions3) << "\n";
+              std::cout << "RasEntry.DwRedialPause=" << offsetof(RASENTRYW, dwRedialPause) << "\n";
+              std::cout << "RasDevInfo.Size=" << sizeof(RASDEVINFOW) << "\n";
+              std::cout << "RasDevInfo.SzDeviceName=" << offsetof(RASDEVINFOW, szDeviceName) << "\n";
+              std::cout << "RasCredentials.Size=" << sizeof(RASCREDENTIALSW) << "\n";
+              std::cout << "RasCredentials.SzPassword=" << offsetof(RASCREDENTIALSW, szPassword) << "\n";
+              return 0;
+          }
+          '@ | Set-Content -LiteralPath $probe -Encoding utf8
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $install = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1).Trim()
+          if (-not $install) { throw 'Visual C++ toolchain not found.' }
+          $devCmd = Join-Path $install 'Common7\Tools\VsDevCmd.bat'
+          $exe = Join-Path $env:RUNNER_TEMP 'ras-layout.exe'
+          $command = '"' + $devCmd + '" -no_logo -arch=x64 && cl /nologo /EHsc /std:c++17 /DWIN32_LEAN_AND_MEAN "' + $probe + '" /Fe:"' + $exe + '"'
+          cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE." }
+          & $exe | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'native-layout.txt') -Encoding ascii
+          Get-Content (Join-Path $env:RUNNER_TEMP 'native-layout.txt')
+      - name: Build managed layout probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'managed-ras-layout'
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0-windows</TargetFramework>
+              <PlatformTarget>x64</PlatformTarget>
+              <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+            </PropertyGroup>
+            <ItemGroup>
+              <Compile Include="${GITHUB_WORKSPACE}\src\ProxyToAnyConnect\Vpn\RasNative.cs" Link="RasNative.cs" />
+            </ItemGroup>
+          </Project>
+          '@.Replace('${GITHUB_WORKSPACE}', $env:GITHUB_WORKSPACE) | Set-Content -LiteralPath (Join-Path $dir 'Probe.csproj') -Encoding utf8
+          @'
+          using System.Runtime.InteropServices;
+          using ProxyToAnyConnect.Vpn;
+
+          static long Offset(Type type, string field) => Marshal.OffsetOf(type, field).ToInt64();
+          static void Print(string key, long value) => Console.WriteLine($"{key}={value}");
+
+          Print("RasDialParams.Size", Marshal.SizeOf(typeof(RasNative.RasDialParams)));
+          Print("RasDialParams.DwCallbackId", Offset(typeof(RasNative.RasDialParams), nameof(RasNative.RasDialParams.DwCallbackId)));
+          Print("RasPppIp.Size", Marshal.SizeOf(typeof(RasNative.RasPppIp)));
+          Print("RasPppIp.DwOptions", Offset(typeof(RasNative.RasPppIp), nameof(RasNative.RasPppIp.DwOptions)));
+          Print("RasEntry.Size", Marshal.SizeOf(typeof(RasNative.RasEntry)));
+          Print("RasEntry.DwVpnStrategy", Offset(typeof(RasNative.RasEntry), nameof(RasNative.RasEntry.DwVpnStrategy)));
+          Print("RasEntry.DwfOptions3", Offset(typeof(RasNative.RasEntry), nameof(RasNative.RasEntry.DwfOptions3)));
+          Print("RasEntry.DwRedialPause", Offset(typeof(RasNative.RasEntry), nameof(RasNative.RasEntry.DwRedialPause)));
+          Print("RasDevInfo.Size", Marshal.SizeOf(typeof(RasNative.RasDevInfo)));
+          Print("RasDevInfo.SzDeviceName", Offset(typeof(RasNative.RasDevInfo), nameof(RasNative.RasDevInfo.SzDeviceName)));
+          Print("RasCredentials.Size", Marshal.SizeOf(typeof(RasNative.RasCredentials)));
+          Print("RasCredentials.SzPassword", Offset(typeof(RasNative.RasCredentials), nameof(RasNative.RasCredentials.SzPassword)));
+          '@ | Set-Content -LiteralPath (Join-Path $dir 'Program.cs') -Encoding utf8
+          dotnet run --project (Join-Path $dir 'Probe.csproj') -c Release | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'managed-layout.txt') -Encoding ascii
+          Get-Content (Join-Path $env:RUNNER_TEMP 'managed-layout.txt')
+      - name: Compare native and managed layouts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Read-Layout([string]$Path) {
+            $map = @{}
+            foreach ($line in Get-Content -LiteralPath $Path) {
+              if ($line -notmatch '^([^=]+)=([0-9]+)$') { throw "Unexpected layout line: $line" }
+              $map[$matches[1]] = [long]$matches[2]
+            }
+            return $map
+          }
+          $native = Read-Layout (Join-Path $env:RUNNER_TEMP 'native-layout.txt')
+          $managed = Read-Layout (Join-Path $env:RUNNER_TEMP 'managed-layout.txt')
+          if (($native.Keys | Sort-Object) -join "`n" -ne (($managed.Keys | Sort-Object) -join "`n")) {
+            throw 'Native/managed layout probe key sets differ.'
+          }
+          foreach ($key in ($native.Keys | Sort-Object)) {
+            if ($native[$key] -ne $managed[$key]) {
+              throw "RAS layout mismatch for $key: SDK=$($native[$key]), managed=$($managed[$key])."
+            }
+            Write-Host "MATCH $key=$($native[$key])"
+          }
