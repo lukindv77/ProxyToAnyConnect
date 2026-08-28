@@ -135,7 +135,7 @@ jobs:
           }
           foreach ($key in ($native.Keys | Sort-Object)) {
             if ($native[$key] -ne $managed[$key]) {
-              throw "RAS layout mismatch for $key: SDK=$($native[$key]), managed=$($managed[$key])."
+              throw "RAS layout mismatch for ${key}: SDK=$($native[$key]), managed=$($managed[$key])."
             }
             Write-Host "MATCH $key=$($native[$key])"
           }
