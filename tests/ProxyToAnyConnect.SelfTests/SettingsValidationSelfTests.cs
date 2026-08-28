@@ -15,6 +15,7 @@ internal static class SettingsValidationSelfTests
             VerificationProbePathIsWireExactOriginForm();
             VerificationProbeHostUsesCanonicalIdnAuthority();
             VerificationEditorPreservesWireIdentity();
+            CustomL2tpNativeFieldLimitsFailClosed();
             InvalidNumericValuesAreRepairable();
             UnusedProtectedSecretsAreDropped();
 
@@ -229,6 +230,158 @@ internal static class SettingsValidationSelfTests
                 "L2TP editor did not preserve valid verification input for the common canonicalization boundary.");
         }
     }
+
+    private static void CustomL2tpNativeFieldLimitsFailClosed()
+    {
+        var serverAtLimit =
+            new string('a', 62) + "." + new string('b', 63) + ".c";
+        var serverOverLimit = serverAtLimit + "d";
+        if (serverAtLimit.Length != CustomL2tpOptions.MaximumServerAddressChars ||
+            serverOverLimit.Length != CustomL2tpOptions.MaximumServerAddressChars + 1)
+        {
+            throw new InvalidOperationException("Custom L2TP server-address boundary fixture is invalid.");
+        }
+
+        CreateCustomOptions(
+            serverAtLimit,
+            new string('u', CustomL2tpOptions.MaximumUserNameChars),
+            new string('d', CustomL2tpOptions.MaximumDomainChars)).Validate();
+
+        AssertInvalidCustomField(
+            CreateCustomOptions(serverOverLimit, "user", "domain"),
+            "serverAddress");
+        AssertInvalidCustomField(
+            CreateCustomOptions(
+                "vpn.example.com",
+                new string('u', CustomL2tpOptions.MaximumUserNameChars + 1),
+                "domain"),
+            "userName");
+        AssertInvalidCustomField(
+            CreateCustomOptions(
+                "vpn.example.com",
+                "user",
+                new string('d', CustomL2tpOptions.MaximumDomainChars + 1)),
+            "domain");
+
+        L2tpSettingsDialog.ValidateCustomNativeFieldLengths(
+            L2tpConnectionMode.CustomEphemeral,
+            useWindowsCredentials: false,
+            L2tpIpsecAuthentication.PreSharedKey,
+            "vpn.example.com",
+            new string('u', CustomL2tpOptions.MaximumUserNameChars),
+            new string('d', CustomL2tpOptions.MaximumDomainChars),
+            new string('p', CustomL2tpOptions.MaximumPasswordChars),
+            new string('k', CustomL2tpOptions.MaximumPreSharedKeyChars));
+
+        AssertEditorNativeFieldRejected(
+            password: new string('p', CustomL2tpOptions.MaximumPasswordChars + 1),
+            preSharedKey: "psk");
+        AssertEditorNativeFieldRejected(
+            password: "password",
+            preSharedKey: new string('k', CustomL2tpOptions.MaximumPreSharedKeyChars + 1));
+    }
+
+    private static void AssertInvalidCustomField(AppOptions options, string expectedField)
+    {
+        try
+        {
+            options.Validate();
+        }
+        catch (InvalidOperationException ex) when (
+            ex.Message.Contains(expectedField, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Oversized custom L2TP {expectedField} escaped loaded-configuration validation.");
+    }
+
+    private static void AssertEditorNativeFieldRejected(string password, string preSharedKey)
+    {
+        try
+        {
+            L2tpSettingsDialog.ValidateCustomNativeFieldLengths(
+                L2tpConnectionMode.CustomEphemeral,
+                useWindowsCredentials: false,
+                L2tpIpsecAuthentication.PreSharedKey,
+                "vpn.example.com",
+                "user",
+                "domain",
+                password,
+                preSharedKey);
+        }
+        catch (InvalidOperationException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            "Oversized custom L2TP plaintext secret escaped the pre-DPAPI editor boundary.");
+    }
+
+    private static AppOptions CreateCustomOptions(string serverAddress, string userName, string domain) =>
+        new()
+        {
+            Proxies =
+            [
+                new ProxyOptions
+                {
+                    Id = "proxy-custom-limits",
+                    Name = "Custom limits proxy",
+                    Enabled = false,
+                    ListenAddress = "127.0.0.1",
+                    ListenPort = 18302,
+                    VpnConnectionId = "vpn-custom-limits",
+                    MaxConcurrentConnections = 8,
+                    MaxHeaderBytes = 8192,
+                    ClientHeaderTimeoutSeconds = 5,
+                    OutboundConnectTimeoutSeconds = 5,
+                    DnsTimeoutMilliseconds = 1000
+                }
+            ],
+            VpnConnections =
+            [
+                new L2tpOptions
+                {
+                    Id = "vpn-custom-limits",
+                    Name = "Custom limits VPN",
+                    Shared = false,
+                    Mode = L2tpConnectionMode.CustomEphemeral,
+                    MonitorIntervalMilliseconds = 1000,
+                    RouteMonitorIntervalMilliseconds = 5000,
+                    ReconnectCooldownMilliseconds = 1000,
+                    Custom = new CustomL2tpOptions
+                    {
+                        ServerAddress = serverAddress,
+                        UserName = userName,
+                        Domain = domain,
+                        UseCurrentWindowsCredentials = false,
+                        ProtectedPassword = "protected-password",
+                        IpsecAuthentication = L2tpIpsecAuthentication.PreSharedKey,
+                        ProtectedPreSharedKey = "protected-psk",
+                        Encryption = L2tpEncryptionMode.Required,
+                        AllowMsChapV2 = true
+                    },
+                    Verification = new VerificationOptions
+                    {
+                        PublicAddress = "vpn.example.com",
+                        ProbeHost = "api.ipify.org",
+                        ProbePort = 443,
+                        ProbePath = "/",
+                        TimeoutSeconds = 5,
+                        MaxResponseBytes = VerificationOptions.DefaultResponseLimitBytes
+                    },
+                    Keepalive = new KeepaliveOptions
+                    {
+                        Mode = L2tpKeepaliveMode.Off,
+                        IntervalSeconds = 10,
+                        TimeoutMilliseconds = 1000,
+                        FailureThreshold = 3
+                    }
+                }
+            ]
+        };
 
     private static void InvalidNumericValuesAreRepairable()
     {

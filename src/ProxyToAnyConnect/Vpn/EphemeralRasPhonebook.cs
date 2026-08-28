@@ -44,6 +44,7 @@ internal sealed class EphemeralRasPhonebook : IDisposable
             throw new ArgumentException("CustomEphemeral L2TP options are required.", nameof(options));
         }
 
+        ValidateNativeTextFields(options.Custom);
         CleanupOrphanedSessionDirectories();
 
         var productTempRoot = Path.Combine(Path.GetTempPath(), "ProxyToAnyConnect");
@@ -453,6 +454,7 @@ internal sealed class EphemeralRasPhonebook : IDisposable
     public RasNative.RasDialParams CreateDialParams(CustomL2tpOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ValidateNativeTextFields(options);
 
         var dialParams = new RasNative.RasDialParams
         {
@@ -464,10 +466,42 @@ internal sealed class EphemeralRasPhonebook : IDisposable
         {
             dialParams.SzUserName = options.UserName;
             dialParams.SzDomain = options.Domain;
-            dialParams.SzPassword = WindowsSecretProtector.Unprotect(options.ProtectedPassword);
+            var password = WindowsSecretProtector.Unprotect(options.ProtectedPassword);
+            EnsureNativeFieldCapacity(password, CustomL2tpOptions.MaximumPasswordChars, "password");
+            dialParams.SzPassword = password;
         }
 
         return dialParams;
+    }
+
+    internal static void ValidateNativeTextFields(CustomL2tpOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        EnsureNativeFieldCapacity(
+            options.ServerAddress,
+            CustomL2tpOptions.MaximumServerAddressChars,
+            "server address");
+        if (!options.UseCurrentWindowsCredentials)
+        {
+            EnsureNativeFieldCapacity(
+                options.UserName,
+                CustomL2tpOptions.MaximumUserNameChars,
+                "user name");
+            EnsureNativeFieldCapacity(
+                options.Domain,
+                CustomL2tpOptions.MaximumDomainChars,
+                "domain");
+        }
+    }
+
+    internal static void EnsureNativeFieldCapacity(string value, int maximumChars, string fieldName)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (value.Length > maximumChars)
+        {
+            throw new InvalidOperationException(
+                $"Custom L2TP {fieldName} exceeds the Windows RAS limit of {maximumChars} characters.");
+        }
     }
 
     private static RasNative.RasEntry BuildEntry(L2tpOptions options, RasNative.RasDevInfo device)
@@ -583,6 +617,10 @@ internal sealed class EphemeralRasPhonebook : IDisposable
     private static void SetPreSharedKey(string phoneBookPath, string entryName, string protectedPsk)
     {
         var psk = WindowsSecretProtector.Unprotect(protectedPsk);
+        EnsureNativeFieldCapacity(
+            psk,
+            CustomL2tpOptions.MaximumPreSharedKeyChars,
+            "pre-shared key");
         var credentials = new RasNative.RasCredentials
         {
             DwSize = checked((uint)Marshal.SizeOf<RasNative.RasCredentials>()),
