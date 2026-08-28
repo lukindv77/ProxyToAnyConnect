@@ -13,6 +13,8 @@ internal static class LoggingAndMetricsSelfTests
         failed += Run("Daily log path uses YYYY-MM folders", DailyLogPathUsesMonthlyFolder);
         failed += Run("Daily log appends without replacing file", DailyLogAppends);
         failed += Run("Log retention removes expired daily files", LogRetentionRemovesExpiredFiles);
+        failed += Run("Log retention skips reparse-point month directories", LogRetentionSkipsReparseMonthDirectory);
+        failed += Run("Daily log append rejects reparse-point paths", DailyLogAppendRejectsReparsePaths);
         failed += Run(
             "Log configuration is fail-soft, transactional and explicitly releasable",
             LogConfigurationFailureIsFailSoftAndRecoverable);
@@ -100,6 +102,173 @@ internal static class LoggingAndMetricsSelfTests
         finally
         {
             TryDeleteDirectory(root);
+        }
+    }
+
+    private static void LogRetentionSkipsReparseMonthDirectory()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("SKIP: log reparse ownership test requires Windows.");
+            return;
+        }
+
+        var root = CreateTempDirectory();
+        var external = CreateTempDirectory();
+        var monthLink = Path.Combine(root, "2026-08");
+        try
+        {
+            var externalExpired = Path.Combine(external, "2026-08-10.jsonl");
+            File.WriteAllText(externalExpired, "external-old");
+            if (!TryCreateDirectorySymbolicLink(monthLink, external))
+            {
+                Console.WriteLine("SKIP: Windows runner cannot create directory symbolic links for log ownership regression.");
+                return;
+            }
+
+            using var store = new DailyJsonlLogStore(root, retentionDays: 7);
+            store.CleanupRetention(today: new DateOnly(2026, 8, 26));
+
+            Assert(File.Exists(externalExpired),
+                "Log retention traversed a reparse-point month directory and deleted an external file.");
+            Assert(File.ReadAllText(externalExpired) == "external-old",
+                "Log retention modified an external file through a reparse-point month directory.");
+        }
+        finally
+        {
+            TryDeleteLink(monthLink, directory: true);
+            TryDeleteDirectory(root);
+            TryDeleteDirectory(external);
+        }
+    }
+
+    private static void DailyLogAppendRejectsReparsePaths()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("SKIP: log reparse ownership test requires Windows.");
+            return;
+        }
+
+        var timestamp = new DateTimeOffset(2026, 8, 26, 12, 0, 0, TimeSpan.Zero).ToLocalTime();
+        var localDate = DateOnly.FromDateTime(timestamp.DateTime);
+        var relative = DailyJsonlLogStore.BuildRelativeDailyPath(localDate);
+
+        var fileRoot = CreateTempDirectory();
+        var externalFileRoot = CreateTempDirectory();
+        var fileMonth = Path.Combine(fileRoot, localDate.ToString("yyyy-MM"));
+        Directory.CreateDirectory(fileMonth);
+        var linkedDailyFile = Path.Combine(fileRoot, relative);
+        var externalTarget = Path.Combine(externalFileRoot, "external-target.txt");
+        File.WriteAllText(externalTarget, "sentinel");
+
+        try
+        {
+            if (TryCreateFileSymbolicLink(linkedDailyFile, externalTarget))
+            {
+                AssertAppendOwnershipRejected(fileRoot, timestamp);
+                Assert(File.ReadAllText(externalTarget) == "sentinel",
+                    "Structured logging appended through a daily-file symbolic link.");
+            }
+            else
+            {
+                Console.WriteLine("SKIP: Windows runner cannot create file symbolic links for log ownership regression.");
+            }
+        }
+        finally
+        {
+            TryDeleteLink(linkedDailyFile, directory: false);
+            TryDeleteDirectory(fileRoot);
+            TryDeleteDirectory(externalFileRoot);
+        }
+
+        var directoryRoot = CreateTempDirectory();
+        var externalDirectory = CreateTempDirectory();
+        var monthLink = Path.Combine(directoryRoot, localDate.ToString("yyyy-MM"));
+        try
+        {
+            if (TryCreateDirectorySymbolicLink(monthLink, externalDirectory))
+            {
+                AssertAppendOwnershipRejected(directoryRoot, timestamp);
+                var externalDaily = Path.Combine(externalDirectory, Path.GetFileName(relative));
+                Assert(!File.Exists(externalDaily),
+                    "Structured logging followed a reparse-point month directory outside the configured root.");
+            }
+            else
+            {
+                Console.WriteLine("SKIP: Windows runner cannot create directory symbolic links for append regression.");
+            }
+        }
+        finally
+        {
+            TryDeleteLink(monthLink, directory: true);
+            TryDeleteDirectory(directoryRoot);
+            TryDeleteDirectory(externalDirectory);
+        }
+    }
+
+    private static void AssertAppendOwnershipRejected(string root, DateTimeOffset timestamp)
+    {
+        using var store = new DailyJsonlLogStore(root, retentionDays: 30);
+        try
+        {
+            store.AppendLine("must-not-escape", timestamp);
+        }
+        catch (IOException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            "Structured log append accepted a reparse-point month/file path.");
+    }
+
+    private static bool TryCreateDirectorySymbolicLink(string linkPath, string targetPath)
+    {
+        try
+        {
+            Directory.CreateSymbolicLink(linkPath, targetPath);
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryCreateFileSymbolicLink(string linkPath, string targetPath)
+    {
+        try
+        {
+            File.CreateSymbolicLink(linkPath, targetPath);
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static void TryDeleteLink(string path, bool directory)
+    {
+        try
+        {
+            if (directory)
+            {
+                if (Directory.Exists(path))
+                {
+                    Directory.Delete(path, recursive: false);
+                }
+            }
+            else if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
         }
     }
 
