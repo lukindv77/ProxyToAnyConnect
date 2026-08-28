@@ -118,6 +118,7 @@ internal static class CombinedTestRunner
         Run(nameof(ProxySetupTimingSelfTests), ProxySetupTimingSelfTests.Run);
         Run(nameof(ProxyConnectSetupSelfTests), ProxyConnectSetupSelfTests.Run);
         await RunAsync(nameof(ProxyConnectCommitBoundarySelfTests), ProxyConnectCommitBoundarySelfTests.RunAsync);
+        await RunAsync(nameof(ProxyOutboundTimeoutSelfTests), ProxyOutboundTimeoutSelfTests.RunAsync);
         await RunAsync(nameof(ProxyConnectAuthoritySelfTests), ProxyConnectAuthoritySelfTests.RunAsync);
         await RunAsync(nameof(ProxyConnectPortGrammarSelfTests), ProxyConnectPortGrammarSelfTests.RunAsync);
         await RunAsync(nameof(ProxyHttpResponseCommitBoundarySelfTests), ProxyHttpResponseCommitBoundarySelfTests.RunAsync);
