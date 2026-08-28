@@ -444,7 +444,7 @@ internal sealed class VpnConnectivityVerifier
         statusCode = 0;
         if (!(statusLine.StartsWith("HTTP/1.1 ", StringComparison.Ordinal) ||
               statusLine.StartsWith("HTTP/1.0 ", StringComparison.Ordinal)) ||
-            statusLine.Length < 12)
+            statusLine.Length < 13)
         {
             return false;
         }
@@ -452,23 +452,16 @@ internal sealed class VpnConnectivityVerifier
         var code = statusLine.Slice(9, 3);
         if (code[0] is < '0' or > '9' ||
             code[1] is < '0' or > '9' ||
-            code[2] is < '0' or > '9')
+            code[2] is < '0' or > '9' ||
+            statusLine[12] != ' ' ||
+            !IsValidHttpFieldValue(statusLine[13..]))
         {
             return false;
-        }
-
-        if (statusLine.Length > 12)
-        {
-            if (statusLine[12] != ' ' || !IsValidHttpFieldValue(statusLine[13..]))
-            {
-                return false;
-            }
         }
 
         statusCode = ((code[0] - '0') * 100) + ((code[1] - '0') * 10) + (code[2] - '0');
         return true;
     }
-
     private static ReadOnlySpan<char> TrimHttpOws(ReadOnlySpan<char> value)
     {
         while (!value.IsEmpty && value[0] is ' ' or '\t')
@@ -711,46 +704,35 @@ internal sealed class VpnConnectivityVerifier
     private static bool TryParseChunkSize(ReadOnlySpan<byte> sizeLine, out int chunkSize)
     {
         chunkSize = 0;
-        var extensionSeparator = sizeLine.IndexOf((byte)';');
-        if (extensionSeparator >= 0)
-        {
-            sizeLine = sizeLine[..extensionSeparator];
-        }
-
-        while (!sizeLine.IsEmpty && IsAsciiWhitespace(sizeLine[0]))
-        {
-            sizeLine = sizeLine[1..];
-        }
-
-        while (!sizeLine.IsEmpty && IsAsciiWhitespace(sizeLine[^1]))
-        {
-            sizeLine = sizeLine[..^1];
-        }
-
         if (sizeLine.IsEmpty)
         {
             return false;
         }
 
+        var offset = 0;
         uint value = 0;
-        foreach (var current in sizeLine)
+        while (offset < sizeLine.Length && TryGetHexDigit(sizeLine[offset], out var digit))
         {
-            var digit = current switch
-            {
-                >= (byte)'0' and <= (byte)'9' => current - (byte)'0',
-                >= (byte)'A' and <= (byte)'F' => current - (byte)'A' + 10,
-                >= (byte)'a' and <= (byte)'f' => current - (byte)'a' + 10,
-                _ => -1
-            };
-            if (digit < 0 || value > (uint.MaxValue - (uint)digit) / 16)
+            if (value > (uint.MaxValue - (uint)digit) / 16)
             {
                 return false;
             }
 
             value = (value * 16) + (uint)digit;
+            offset++;
         }
 
-        if (value > int.MaxValue)
+        if (offset == 0 || value > int.MaxValue)
+        {
+            return false;
+        }
+
+        if (offset < sizeLine.Length && !TryParseChunkExtensions(sizeLine, ref offset))
+        {
+            return false;
+        }
+
+        if (offset != sizeLine.Length)
         {
             return false;
         }
@@ -759,11 +741,129 @@ internal sealed class VpnConnectivityVerifier
         return true;
     }
 
-    private static bool IsAsciiWhitespace(byte value)
+    private static bool TryParseChunkExtensions(ReadOnlySpan<byte> line, ref int offset)
     {
-        return value == (byte)' ' || value is >= 0x09 and <= 0x0D;
+        while (offset < line.Length)
+        {
+            SkipChunkBws(line, ref offset);
+            if (offset >= line.Length || line[offset] != (byte)';')
+            {
+                return false;
+            }
+
+            offset++;
+            SkipChunkBws(line, ref offset);
+
+            var nameStart = offset;
+            while (offset < line.Length && IsHttpTokenByte(line[offset]))
+            {
+                offset++;
+            }
+
+            if (offset == nameStart)
+            {
+                return false;
+            }
+
+            var afterName = offset;
+            var equalsOffset = offset;
+            SkipChunkBws(line, ref equalsOffset);
+            if (equalsOffset < line.Length && line[equalsOffset] == (byte)'=')
+            {
+                offset = equalsOffset + 1;
+                SkipChunkBws(line, ref offset);
+                if (!TrySkipChunkExtensionValue(line, ref offset))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                // BWS after a valueless extension name belongs to the next
+                // `BWS ";"` production, not to the name itself. Restoring the
+                // offset makes trailing whitespace without another extension fail.
+                offset = afterName;
+            }
+        }
+
+        return true;
     }
 
+    private static bool TrySkipChunkExtensionValue(ReadOnlySpan<byte> line, ref int offset)
+    {
+        if (offset >= line.Length)
+        {
+            return false;
+        }
+
+        if (line[offset] != (byte)'"')
+        {
+            var tokenStart = offset;
+            while (offset < line.Length && IsHttpTokenByte(line[offset]))
+            {
+                offset++;
+            }
+            return offset != tokenStart;
+        }
+
+        offset++;
+        while (offset < line.Length)
+        {
+            var current = line[offset++];
+            if (current == (byte)'"')
+            {
+                return true;
+            }
+
+            if (current == (byte)'\\')
+            {
+                if (offset >= line.Length || !IsValidQuotedPairByte(line[offset]))
+                {
+                    return false;
+                }
+                offset++;
+                continue;
+            }
+
+            if (!IsValidQdTextByte(current))
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    private static void SkipChunkBws(ReadOnlySpan<byte> line, ref int offset)
+    {
+        while (offset < line.Length && line[offset] is (byte)' ' or (byte)'\t')
+        {
+            offset++;
+        }
+    }
+
+    private static bool IsValidQdTextByte(byte value) =>
+        value is (byte)'\t' or (byte)' ' or 0x21 or
+            >= 0x23 and <= 0x5B or
+            >= 0x5D and <= 0x7E or
+            >= 0x80;
+
+    private static bool IsValidQuotedPairByte(byte value) =>
+        value is (byte)'\t' or (byte)' ' or
+            >= 0x21 and <= 0x7E or
+            >= 0x80;
+
+    private static bool TryGetHexDigit(byte value, out int digit)
+    {
+        digit = value switch
+        {
+            >= (byte)'0' and <= (byte)'9' => value - (byte)'0',
+            >= (byte)'A' and <= (byte)'F' => value - (byte)'A' + 10,
+            >= (byte)'a' and <= (byte)'f' => value - (byte)'a' + 10,
+            _ => -1
+        };
+        return digit >= 0;
+    }
     private readonly record struct HttpBodyMetadata(
         int BodyOffset,
         bool IsChunked,

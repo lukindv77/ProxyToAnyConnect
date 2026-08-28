@@ -49,7 +49,17 @@ internal static class VerificationHttpParserTests
         {
             throw new InvalidOperationException("Successful verification response body was parsed incorrectly.");
         }
-    }
+
+        var emptyReason = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 200 \r\n" +
+            "Content-Length: 11\r\n\r\n" +
+            "203.0.113.7");
+        var emptyReasonBody = VpnConnectivityVerifier.ParseHttpSuccessBody(emptyReason);
+        if (Encoding.ASCII.GetString(emptyReasonBody) != "203.0.113.7")
+        {
+            throw new InvalidOperationException(
+                "Status line with the required separator and an empty reason phrase was rejected.");
+        }    }
 
     private static void RejectsRedirect()
     {
@@ -81,7 +91,9 @@ internal static class VerificationHttpParserTests
         AssertRejected(
             "HTTP/1.1 0200 OK\r\nContent-Length: 11\r\n\r\n203.0.113.7",
             "Non-three-digit status code was accepted.");
-    }
+        AssertRejected(
+            "HTTP/1.1 200\r\nContent-Length: 11\r\n\r\n203.0.113.7",
+            "Status line without the required SP after status-code was accepted.");    }
 
     private static void RejectsContentLengthFramingViolations()
     {
