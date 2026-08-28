@@ -288,9 +288,29 @@ internal sealed class AppOptions
             throw new InvalidOperationException($"L2TP '{name}' custom serverAddress must be an IP address or DNS host name.");
         }
 
+        if (custom.ServerAddress.Length > CustomL2tpOptions.MaximumServerAddressChars)
+        {
+            throw new InvalidOperationException(
+                $"L2TP '{name}' custom serverAddress exceeds the Windows RAS limit of {CustomL2tpOptions.MaximumServerAddressChars} characters.");
+        }
+
         if (!custom.UseCurrentWindowsCredentials && string.IsNullOrWhiteSpace(custom.UserName))
         {
             throw new InvalidOperationException($"L2TP '{name}' custom userName is required.");
+        }
+
+        if (!custom.UseCurrentWindowsCredentials &&
+            custom.UserName.Length > CustomL2tpOptions.MaximumUserNameChars)
+        {
+            throw new InvalidOperationException(
+                $"L2TP '{name}' custom userName exceeds the Windows RAS limit of {CustomL2tpOptions.MaximumUserNameChars} characters.");
+        }
+
+        if (!custom.UseCurrentWindowsCredentials &&
+            custom.Domain.Length > CustomL2tpOptions.MaximumDomainChars)
+        {
+            throw new InvalidOperationException(
+                $"L2TP '{name}' custom domain exceeds the Windows RAS limit of {CustomL2tpOptions.MaximumDomainChars} characters.");
         }
 
         if (!custom.UseCurrentWindowsCredentials && string.IsNullOrWhiteSpace(custom.ProtectedPassword))
@@ -540,6 +560,12 @@ internal sealed class KeepaliveOptions
 
 internal sealed class CustomL2tpOptions
 {
+    internal const int MaximumServerAddressChars = 128;
+    internal const int MaximumUserNameChars = 256;
+    internal const int MaximumPasswordChars = 256;
+    internal const int MaximumDomainChars = 15;
+    internal const int MaximumPreSharedKeyChars = 256;
+
     [JsonPropertyName("serverAddress")]
     public string ServerAddress { get; init; } = string.Empty;
 

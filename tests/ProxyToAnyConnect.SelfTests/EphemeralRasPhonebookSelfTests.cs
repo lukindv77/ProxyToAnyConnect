@@ -18,6 +18,7 @@ internal static class EphemeralRasPhonebookSelfTests
 
         try
         {
+            NativeFieldLimitsStaySynchronizedAndExact();
             OrphanRecoveryRespectsCrossProcessOwnership();
             OrphanRecoveryPreservesAmbiguousFilesystemContent();
             HappyPathCreateAndCleanup();
@@ -30,6 +31,48 @@ internal static class EphemeralRasPhonebookSelfTests
         {
             Console.Error.WriteLine($"FAIL: private ephemeral L2TP RAS phonebook smoke test: {ex}");
             return 1;
+        }
+    }
+
+    private static void NativeFieldLimitsStaySynchronizedAndExact()
+    {
+        if (CustomL2tpOptions.MaximumServerAddressChars != RasNative.RasMaxPhoneNumber ||
+            CustomL2tpOptions.MaximumUserNameChars != RasNative.Unlen ||
+            CustomL2tpOptions.MaximumPasswordChars != RasNative.Pwlen ||
+            CustomL2tpOptions.MaximumDomainChars != RasNative.Dnlen ||
+            CustomL2tpOptions.MaximumPreSharedKeyChars != RasNative.Pwlen)
+        {
+            throw new InvalidOperationException(
+                "Managed custom L2TP limits drifted from fixed-width Windows RAS fields.");
+        }
+
+        foreach (var maximum in new[]
+                 {
+                     CustomL2tpOptions.MaximumServerAddressChars,
+                     CustomL2tpOptions.MaximumUserNameChars,
+                     CustomL2tpOptions.MaximumPasswordChars,
+                     CustomL2tpOptions.MaximumDomainChars,
+                     CustomL2tpOptions.MaximumPreSharedKeyChars
+                 })
+        {
+            EphemeralRasPhonebook.EnsureNativeFieldCapacity(
+                new string('x', maximum),
+                maximum,
+                "self-test");
+            try
+            {
+                EphemeralRasPhonebook.EnsureNativeFieldCapacity(
+                    new string('x', maximum + 1),
+                    maximum,
+                    "self-test");
+            }
+            catch (InvalidOperationException)
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"Windows RAS native-field guard accepted {maximum + 1} characters for a {maximum}-character field.");
         }
     }
 

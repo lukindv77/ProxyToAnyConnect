@@ -186,6 +186,19 @@ internal sealed class L2tpSettingsDialog : Form
         var mode = SelectedEnum<L2tpConnectionMode>(_mode);
         var ipsecAuth = SelectedEnum<L2tpIpsecAuthentication>(_ipsecAuth);
         var useWindowsCredentials = _useWindowsCredentials.Checked;
+        var serverAddress = _serverAddress.Text.Trim();
+        var userName = _userName.Text.Trim();
+        var domain = _domain.Text.Trim();
+        ValidateCustomNativeFieldLengths(
+            mode,
+            useWindowsCredentials,
+            ipsecAuth,
+            serverAddress,
+            userName,
+            domain,
+            _password.Text,
+            _preSharedKey.Text);
+
         var existingProtectedPassword = _existing?.Custom.ProtectedPassword ?? string.Empty;
         var existingProtectedPsk = _existing?.Custom.ProtectedPreSharedKey ?? string.Empty;
         var protectedPassword = ResolveProtectedSecret(
@@ -229,9 +242,9 @@ internal sealed class L2tpSettingsDialog : Form
             },
             Custom = new CustomL2tpOptions
             {
-                ServerAddress = _serverAddress.Text.Trim(),
-                UserName = _userName.Text.Trim(),
-                Domain = _domain.Text.Trim(),
+                ServerAddress = serverAddress,
+                UserName = userName,
+                Domain = domain,
                 UseCurrentWindowsCredentials = useWindowsCredentials,
                 ProtectedPassword = protectedPassword,
                 IpsecAuthentication = ipsecAuth,
@@ -260,6 +273,51 @@ internal sealed class L2tpSettingsDialog : Form
             TimeoutSeconds = timeoutSeconds,
             MaxResponseBytes = maxResponseBytes
         };
+
+    internal static void ValidateCustomNativeFieldLengths(
+        L2tpConnectionMode mode,
+        bool useWindowsCredentials,
+        L2tpIpsecAuthentication ipsecAuthentication,
+        string serverAddress,
+        string userName,
+        string domain,
+        string enteredPassword,
+        string enteredPreSharedKey)
+    {
+        if (mode != L2tpConnectionMode.CustomEphemeral)
+        {
+            return;
+        }
+
+        EnsureNativeFieldLength(serverAddress, CustomL2tpOptions.MaximumServerAddressChars, "server address");
+        if (!useWindowsCredentials)
+        {
+            EnsureNativeFieldLength(userName, CustomL2tpOptions.MaximumUserNameChars, "user name");
+            EnsureNativeFieldLength(domain, CustomL2tpOptions.MaximumDomainChars, "domain");
+            if (!string.IsNullOrEmpty(enteredPassword))
+            {
+                EnsureNativeFieldLength(enteredPassword, CustomL2tpOptions.MaximumPasswordChars, "password");
+            }
+        }
+
+        if (ipsecAuthentication == L2tpIpsecAuthentication.PreSharedKey &&
+            !string.IsNullOrEmpty(enteredPreSharedKey))
+        {
+            EnsureNativeFieldLength(
+                enteredPreSharedKey,
+                CustomL2tpOptions.MaximumPreSharedKeyChars,
+                "pre-shared key");
+        }
+    }
+
+    private static void EnsureNativeFieldLength(string value, int maximumChars, string fieldName)
+    {
+        if (value.Length > maximumChars)
+        {
+            throw new InvalidOperationException(
+                $"Custom L2TP {fieldName} exceeds the Windows RAS limit of {maximumChars} characters.");
+        }
+    }
 
     internal static string ResolveProtectedSecret(
         bool credentialRequired,
