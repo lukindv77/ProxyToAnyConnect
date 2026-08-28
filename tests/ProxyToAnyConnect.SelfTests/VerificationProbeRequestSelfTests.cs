@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Vpn;
 
 namespace ProxyToAnyConnect.SelfTests;
@@ -19,6 +20,9 @@ internal static class VerificationProbeRequestSelfTests
         try
         {
             RequestWireBytesRemainEquivalent();
+            IdnHostIsCanonicalizedOnWire();
+            InvalidRequestTargetsAreRejectedByBuilder();
+            InvalidHostsAreRejectedByBuilder();
 
             for (var i = 0; i < WarmupIterations; i++)
             {
@@ -83,9 +87,8 @@ internal static class VerificationProbeRequestSelfTests
         [
             (RepresentativeHost, RepresentativePath),
             ("example.com", "/"),
-            (string.Empty, string.Empty),
-            (null, null),
-            ("münich.example", "/café/😀")
+            ("example.com", "/ip/check?x=1%202"),
+            ("example.com", "/caf%C3%A9?next=%2Fok&flag=true")
         ];
 
         foreach (var (host, path) in cases)
@@ -100,11 +103,95 @@ internal static class VerificationProbeRequestSelfTests
         }
     }
 
+    private static void IdnHostIsCanonicalizedOnWire()
+    {
+        var request = Encoding.ASCII.GetString(
+            VpnConnectivityVerifier.BuildProbeRequest("münich.example", "/?format=text"));
+        if (!request.Contains("\r\nHost: xn--mnich-kva.example\r\n", StringComparison.Ordinal) ||
+            request.Contains("m?nich", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Verification request did not emit the canonical IDNA Host authority: {request}");
+        }
+    }
+
+    private static void InvalidRequestTargetsAreRejectedByBuilder()
+    {
+        foreach (var invalid in new string?[]
+                 {
+                     null,
+                     string.Empty,
+                     "relative",
+                     "/contains space",
+                     "/line\r\nHost: injected.example",
+                     "/café",
+                     "/fragment#value",
+                     "/bad%2",
+                     "/bad%GG"
+                 })
+        {
+            try
+            {
+                _ = VpnConnectivityVerifier.BuildProbeRequest("example.com", invalid);
+            }
+            catch (ArgumentException ex) when (ex.ParamName == "path")
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"Verification request builder accepted unsafe/lossy target '{EscapeForDiagnostic(invalid)}'.");
+        }
+    }
+
+    private static void InvalidHostsAreRejectedByBuilder()
+    {
+        foreach (var invalid in new string?[]
+                 {
+                     null,
+                     string.Empty,
+                     "bad host.example",
+                     "line\r\nhost.example",
+                     "bad_.example"
+                 })
+        {
+            try
+            {
+                _ = VpnConnectivityVerifier.BuildProbeRequest(invalid, "/");
+            }
+            catch (ArgumentException ex) when (ex.ParamName == "host")
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"Verification request builder accepted invalid host '{EscapeForDiagnostic(invalid)}'.");
+        }
+    }
+
+    private static string EscapeForDiagnostic(string? value) =>
+        value is null
+            ? "<null>"
+            : value.Replace("\r", "\\r", StringComparison.Ordinal)
+                .Replace("\n", "\\n", StringComparison.Ordinal)
+                .Replace("\t", "\\t", StringComparison.Ordinal);
+
     private static byte[] LegacyBuildProbeRequest(string? host, string? path)
     {
+        host ??= string.Empty;
+        path ??= string.Empty;
+        if (!VerificationOptions.TryGetCanonicalProbeHost(host, out var canonicalHost))
+        {
+            throw new ArgumentException("Invalid verification host.", nameof(host));
+        }
+        if (!VerificationOptions.IsValidProbePath(path))
+        {
+            throw new ArgumentException("Invalid verification target.", nameof(path));
+        }
+
         return Encoding.ASCII.GetBytes(
             $"GET {path} HTTP/1.1\r\n" +
-            $"Host: {host}\r\n" +
+            $"Host: {canonicalHost}\r\n" +
             "User-Agent: ProxyToAnyConnect/1.0\r\n" +
             "Accept: text/plain\r\n" +
             "Accept-Encoding: identity\r\n" +

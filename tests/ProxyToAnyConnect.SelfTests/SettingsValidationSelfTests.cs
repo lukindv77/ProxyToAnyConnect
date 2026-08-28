@@ -10,11 +10,13 @@ internal static class SettingsValidationSelfTests
         try
         {
             VerificationResponseLimitIsBounded();
+            VerificationProbePathIsWireExactOriginForm();
+            VerificationProbeHostUsesCanonicalIdnAuthority();
             InvalidNumericValuesAreRepairable();
             UnusedProtectedSecretsAreDropped();
 
             Console.WriteLine(
-                "PASS: settings enforce bounded verification responses, repair numeric values and drop unused secrets");
+                "PASS: settings enforce bounded verification responses, byte-exact probe targets, canonical IDN hosts, repair numeric values and drop unused secrets");
             return 0;
         }
         catch (Exception ex)
@@ -48,6 +50,90 @@ internal static class SettingsValidationSelfTests
         throw new InvalidOperationException(
             $"verification.maxResponseBytes={maxResponseBytes} escaped the bounded configuration contract.");
     }
+
+    private static void VerificationProbePathIsWireExactOriginForm()
+    {
+        foreach (var valid in new[]
+                 {
+                     "/",
+                     "/?format=text",
+                     "/ip/check?x=1%202",
+                     "/caf%C3%A9?next=%2Fok&flag=true"
+                 })
+        {
+            CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probePath: valid).Validate();
+        }
+
+        foreach (var invalid in new[]
+                 {
+                     string.Empty,
+                     "relative",
+                     "/contains space",
+                     "/tab\tvalue",
+                     "/line\r\nHost: injected.example",
+                     "/café",
+                     "/fragment#value",
+                     "/bad%2",
+                     "/bad%ZZ",
+                     "/back\\slash",
+                     "/raw[bracket]"
+                 })
+        {
+            try
+            {
+                CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probePath: invalid).Validate();
+            }
+            catch (InvalidOperationException ex) when (
+                ex.Message.Contains("verification.probePath", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"verification.probePath '{EscapeForDiagnostic(invalid)}' escaped the byte-exact origin-form contract.");
+        }
+    }
+
+    private static void VerificationProbeHostUsesCanonicalIdnAuthority()
+    {
+        CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: "api.ipify.org").Validate();
+        CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: "münich.example").Validate();
+
+        if (!VerificationOptions.TryGetCanonicalProbeHost("münich.example", out var canonical) ||
+            !canonical.Equals("xn--mnich-kva.example", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Unicode verification host did not canonicalize to the expected IDNA A-label: '{canonical}'.");
+        }
+
+        foreach (var invalid in new[]
+                 {
+                     string.Empty,
+                     "bad host.example",
+                     "line\r\nhost.example",
+                     "bad_.example",
+                     "[2001:db8::1]"
+                 })
+        {
+            try
+            {
+                CreateOptions(VerificationOptions.DefaultResponseLimitBytes, probeHost: invalid).Validate();
+            }
+            catch (InvalidOperationException ex) when (
+                ex.Message.Contains("verification.probeHost", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"verification.probeHost '{EscapeForDiagnostic(invalid)}' escaped canonical DNS-host validation.");
+        }
+    }
+
+    private static string EscapeForDiagnostic(string value) =>
+        value.Replace("\r", "\\r", StringComparison.Ordinal)
+            .Replace("\n", "\\n", StringComparison.Ordinal)
+            .Replace("\t", "\\t", StringComparison.Ordinal);
 
     private static void InvalidNumericValuesAreRepairable()
     {
@@ -96,7 +182,10 @@ internal static class SettingsValidationSelfTests
         }
     }
 
-    private static AppOptions CreateOptions(int maxResponseBytes) =>
+    private static AppOptions CreateOptions(
+        int maxResponseBytes,
+        string probePath = "/",
+        string probeHost = "api.ipify.org") =>
         new()
         {
             Proxies =
@@ -131,9 +220,9 @@ internal static class SettingsValidationSelfTests
                     Verification = new VerificationOptions
                     {
                         PublicAddress = "vpn.example.com",
-                        ProbeHost = "api.ipify.org",
+                        ProbeHost = probeHost,
                         ProbePort = 443,
-                        ProbePath = "/",
+                        ProbePath = probePath,
                         TimeoutSeconds = 5,
                         MaxResponseBytes = maxResponseBytes
                     },
