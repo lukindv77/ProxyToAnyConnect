@@ -18,11 +18,18 @@ internal sealed partial class RasConnectionManager
         var projectionTask = MonitorProjectionAsync(handle, context, monitorCancellation.Token);
         var routeTask = MonitorDefaultRoutesAsync(routeBaseline, monitorCancellation.Token);
         var keepaliveTask = MonitorKeepaliveAsync(context, monitorCancellation.Token);
+        var failClosed = false;
+        var monitorOwnsFailClosed = false;
 
         try
         {
             var completedTask = await Task.WhenAny(projectionTask, routeTask, keepaliveTask);
             await completedTask;
+
+            // A continuous guard is expected to run until owner cancellation. A guard
+            // that terminates normally while this generation is still owned is itself
+            // a fail-closed event, just like a faulted projection/route/keepalive task.
+            failClosed = !cancellationToken.IsCancellationRequested;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -30,6 +37,7 @@ internal sealed partial class RasConnectionManager
         }
         catch (Exception ex)
         {
+            failClosed = true;
             AppLog.Error(
                 "vpn.monitor.fail_closed",
                 "Continuous L2TP guard rejected the active connection.",
@@ -45,47 +53,87 @@ internal sealed partial class RasConnectionManager
         }
         finally
         {
-            monitorCancellation.Cancel();
+            Action? invalidateBeforeDrain = null;
+            if (failClosed && !cancellationToken.IsCancellationRequested)
+            {
+                invalidateBeforeDrain = () =>
+                {
+                    // Publish the fail-closed boundary before waiting for any native or
+                    // background sibling cleanup. MarkDisconnected cancels this exact
+                    // VpnContext lifetime immediately, aborting existing proxy pumps and
+                    // preventing L2tpSocketFactory from acquiring new references while
+                    // a slow ICMP/route/projection sibling is still draining.
+                    if (MarkCurrentDisconnected(context))
+                    {
+                        monitorOwnsFailClosed = true;
+                        ArmReconnectCooldown(
+                            "Continuous fail-closed monitor rejected the active VPN.");
+                    }
+                };
+            }
 
-            try
-            {
-                await Task.WhenAll(projectionTask, routeTask, keepaliveTask);
-            }
-            catch (OperationCanceledException) when (monitorCancellation.IsCancellationRequested)
-            {
-            }
-            catch
-            {
-            }
+            await InvalidateThenDrainMonitorTasksAsync(
+                invalidateBeforeDrain,
+                monitorCancellation,
+                projectionTask,
+                routeTask,
+                keepaliveTask);
         }
 
-        // Explicit DisconnectAsync removes Current before cancelling this session
-        // monitor. That makes this check robust even if cancellation races the
-        // fail-closed branch between two instructions.
-        if (cancellationToken.IsCancellationRequested || !ReferenceEquals(Current, context))
+        // Owner cancellation after this monitor published fail-closed means an
+        // explicit Disconnect/Connect cleanup path is now waiting for this exact
+        // monitor task. Let that owner claim the HRASCONN/PBK rather than racing it.
+        if (!monitorOwnsFailClosed || cancellationToken.IsCancellationRequested)
         {
             return;
         }
 
-        ArmReconnectCooldown("Continuous fail-closed monitor rejected the active VPN.");
-        MarkCurrentDisconnected(context);
-
-        if (Interlocked.CompareExchange(ref _rasConnection, 0, handle) == handle)
+        if (Interlocked.CompareExchange(ref _rasConnection, 0, handle) != handle)
         {
-            // Claim this exact generation before native teardown. If RasHangUp or
-            // invalid-handle drain fails, the shared helper restores this same
-            // HRASCONN only when no newer generation occupies the slot. The monitor
-            // then faults before PBK release, leaving both resources owned for the
-            // next Disconnect/Connect cleanup attempt rather than permitting an
-            // overlapping replacement dial.
-            await HangUpClaimedRasHandleAsync(handle);
+            // Another lifecycle owner already claimed this exact HRASCONN. Its local
+            // handle remains live until terminal hangup, so the dependent private PBK
+            // must remain owned by that path too.
+            return;
         }
+
+        // This monitor atomically claimed the exact generation. If native teardown
+        // fails, HangUpClaimedRasHandleAsync restores the same handle to the shared
+        // slot and throws before PBK release, preserving retry ownership.
+        await HangUpClaimedRasHandleAsync(handle);
 
         ReleaseEphemeralPhonebook(ephemeralPhonebook);
         AppLog.Warning(
             "vpn.ras.hangup",
             "RAS connection was hung up after a continuous fail-closed guard failure.",
             new { VpnId = _options.Id, VpnName = _options.Name, context.EntryName });
+    }
+
+    internal static async Task InvalidateThenDrainMonitorTasksAsync(
+        Action? invalidateBeforeDrain,
+        CancellationTokenSource monitorCancellation,
+        params Task[] monitorTasks)
+    {
+        ArgumentNullException.ThrowIfNull(monitorCancellation);
+        ArgumentNullException.ThrowIfNull(monitorTasks);
+
+        // This ordering is security-significant: dependent traffic must lose the
+        // verified context before potentially slow sibling cleanup is joined.
+        invalidateBeforeDrain?.Invoke();
+        monitorCancellation.Cancel();
+
+        try
+        {
+            await Task.WhenAll(monitorTasks);
+        }
+        catch (OperationCanceledException) when (monitorCancellation.IsCancellationRequested)
+        {
+        }
+        catch
+        {
+            // The first completed guard already determined the fail-closed outcome.
+            // Sibling failures are secondary cleanup diagnostics and must not prevent
+            // exact-generation native teardown below.
+        }
     }
 
     private async Task MonitorProjectionAsync(
@@ -226,13 +274,16 @@ internal sealed partial class RasConnectionManager
     internal static long GetReconnectCooldownRemainingMilliseconds(long now, long retryNotBefore) =>
         retryNotBefore <= now ? 0 : retryNotBefore - now;
 
-    private void MarkCurrentDisconnected(VpnContext context)
+    private bool MarkCurrentDisconnected(VpnContext context)
     {
         context.MarkDisconnected();
-        if (ReferenceEquals(Interlocked.CompareExchange(ref _current, null, context), context))
+        if (!ReferenceEquals(Interlocked.CompareExchange(ref _current, null, context), context))
         {
-            Volatile.Write(ref _lastVerification, null);
-            SetState(VpnConnectionState.Disconnected);
+            return false;
         }
+
+        Volatile.Write(ref _lastVerification, null);
+        SetState(VpnConnectionState.Disconnected);
+        return true;
     }
 }
