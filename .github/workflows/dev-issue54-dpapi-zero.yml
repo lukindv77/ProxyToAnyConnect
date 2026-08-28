@@ -1,0 +1,73 @@
+name: dev-issue54-dpapi-zero
+
+on:
+  push:
+    branches:
+      - dev/issue54-dpapi-zero
+    paths:
+      - .github/workflows/dev-issue54-dpapi-zero.yml
+      - .github/validation/issue54-transform.ps1
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 54 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '9c0cb3a32d7bb33cb83c6c20b2e8b4994c8b594e'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          if ((git rev-parse HEAD:.github/validation/issue54-transform.ps1).Trim() -ne '878e760c30a1c5a77b5348121614bae97bdf42a8') {
+            throw 'Unexpected issue54 transform blob.'
+          }
+          if ((git rev-parse HEAD:src/ProxyToAnyConnect/Security/UnmanagedSecretMemory.cs).Trim() -ne 'cc9561424c0a114f0b70cd880c8349678dd89a2b') {
+            throw 'Unexpected unmanaged secret-memory helper blob.'
+          }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Security/WindowsSecretProtector.cs' = '35aae091bd0999be909041bc53bf2a6a276b35da'
+            'src/ProxyToAnyConnect/Configuration/DpapiSecretProtector.cs' = '9089f923c5cfb7af971134b884dca2b243d8cde4'
+            'tests/ProxyToAnyConnect.SelfTests/SecuritySelfTests.cs' = 'c8ffc26610d0c131d6977ca577dbf2c893771bca'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) { throw "Unexpected base blob for $($entry.Key): $actual" }
+          }
+
+          & ./.github/validation/issue54-transform.ps1
+
+          $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #54 staged transform surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 54 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'security: zero unmanaged DPAPI buffers before release'
+          git push origin HEAD:dev/issue54-dpapi-zero
