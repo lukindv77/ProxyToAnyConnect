@@ -18,6 +18,9 @@ internal static class DnsResponseBindingSelfTests
             WrongQuestionNameIsRejected();
             WrongQuestionTypeOrClassIsRejected();
             NonSingleQuestionIsRejected();
+            NonQueryOpcodeIsRejected();
+            OrdinaryResponseFlagsRemainAccepted();
+            MalformedOwnedAddressRdataIsRejected();
             UnrelatedAnswerOwnersAreIgnored();
             WrongAnswerClassIsIgnored();
             MalformedCnameRdataLengthIsRejected();
@@ -183,6 +186,41 @@ internal static class DnsResponseBindingSelfTests
 
         packet[5] = 2;
         AssertIOException(() => L2tpDnsResolver.ParseResponse(packet, TransactionId, ExpectedHost));
+    }
+
+    private static void NonQueryOpcodeIsRejected()
+    {
+        var packet = BuildResponse(ExpectedHost, 1, 1, null, 1, 1, [203, 0, 113, 7]);
+        packet[2] |= 0x08; // OPCODE=1 rather than the QUERY opcode used by BuildQuery.
+        AssertIOException(() => L2tpDnsResolver.ParseResponse(packet, TransactionId, ExpectedHost));
+    }
+
+    private static void OrdinaryResponseFlagsRemainAccepted()
+    {
+        var packet = BuildResponse(ExpectedHost, 1, 1, null, 1, 1, [203, 0, 113, 7]);
+        packet[2] |= 0x04; // AA
+        packet[3] |= 0x30; // AD + CD; RA from the base packet remains set.
+        var parsed = L2tpDnsResolver.ParseResponse(packet, TransactionId, ExpectedHost);
+        if (parsed.Addresses.Count != 1 ||
+            !parsed.Addresses[0].Equals(IPAddress.Parse("203.0.113.7")))
+        {
+            throw new InvalidOperationException("Ordinary DNS response flags changed valid A semantics.");
+        }
+    }
+
+    private static void MalformedOwnedAddressRdataIsRejected()
+    {
+        var malformedThenValid = BuildResponse(
+            ExpectedHost, 1, 1, null, 1, 1, [203, 0, 113]);
+        AppendAnswer(ref malformedThenValid, null, 1, 1, [203, 0, 113, 7]);
+        AssertIOException(() =>
+            L2tpDnsResolver.ParseResponse(malformedThenValid, TransactionId, ExpectedHost));
+
+        var validThenMalformed = BuildResponse(
+            ExpectedHost, 1, 1, null, 1, 1, [203, 0, 113, 7]);
+        AppendAnswer(ref validThenMalformed, null, 1, 1, [203, 0, 113]);
+        AssertIOException(() =>
+            L2tpDnsResolver.ParseResponse(validThenMalformed, TransactionId, ExpectedHost));
     }
 
     private static void UnrelatedAnswerOwnersAreIgnored()
