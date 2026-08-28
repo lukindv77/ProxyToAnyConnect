@@ -151,6 +151,10 @@ internal sealed class ProxyServer
             {
                 await TryWriteErrorAsync(client, 503, "L2TP VPN unavailable", ex.Message, cancellationToken);
             }
+            catch (OutboundConnectTimeoutException ex)
+            {
+                await TryWriteErrorAsync(client, 504, "Gateway Timeout", ex.Message, cancellationToken);
+            }
             catch (InvalidDataException ex)
             {
                 await TryWriteErrorAsync(client, 400, "Bad Request", ex.Message, cancellationToken);
@@ -207,7 +211,11 @@ internal sealed class ProxyServer
         ReadOnlyMemory<byte> remainder,
         CancellationToken cancellationToken)
     {
-        await using var upstream = await _socketFactory.ConnectAsync(host, port, cancellationToken);
+        await using var upstream = await _socketFactory.ConnectAsync(
+            host,
+            port,
+            TimeSpan.FromSeconds(_options.OutboundConnectTimeoutSeconds),
+            cancellationToken);
         await using var upstreamStream = new NetworkStream(upstream.Socket, ownsSocket: false);
 
         try
@@ -278,7 +286,11 @@ internal sealed class ProxyServer
 
         var (host, port, authority, pathAndQuery) = ParseHttpTarget(request.Target);
 
-        await using var upstream = await _socketFactory.ConnectAsync(host, port, cancellationToken);
+        await using var upstream = await _socketFactory.ConnectAsync(
+            host,
+            port,
+            TimeSpan.FromSeconds(_options.OutboundConnectTimeoutSeconds),
+            cancellationToken);
         await using var upstreamStream = new NetworkStream(upstream.Socket, ownsSocket: false);
 
         var originHeader = request.BuildOriginHeader(pathAndQuery, authority);
