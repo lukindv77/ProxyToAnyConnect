@@ -84,14 +84,7 @@ internal static class DnsResponseAddressListSelfTests
             throw new InvalidOperationException("DNS A response semantics changed.");
         }
 
-        var mixed = L2tpDnsResolver.ParseResponse(BuildMixedResponse(), TransactionId, "example.com");
-        if (mixed.Addresses.Count != 1 ||
-            !mixed.Addresses[0].Equals(IPAddress.Parse("198.51.100.9")) ||
-            mixed.CanonicalName != "edge.example.com" ||
-            mixed.MinimumTtlSeconds != 30)
-        {
-            throw new InvalidOperationException("DNS mixed A/CNAME response semantics changed.");
-        }
+        AssertAmbiguousResponseRejected(BuildMixedResponse());
     }
 
     private static ParsedDnsResponse EagerAddressListPredecessor(byte[] response)
@@ -113,6 +106,20 @@ internal static class DnsResponseAddressListSelfTests
             (Type: (ushort)5, Ttl: 30u, Data: EncodeName("edge.example.com")),
             (Type: (ushort)1, Ttl: 50u, Data: new byte[] { 198, 51, 100, 9 })
         ]);
+
+    private static void AssertAmbiguousResponseRejected(byte[] response)
+    {
+        try
+        {
+            L2tpDnsResolver.ParseResponse(response, TransactionId, "example.com");
+        }
+        catch (IOException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException("Ambiguous CNAME/A response was accepted by the lazy-address suite.");
+    }
 
     private static byte[] BuildResponse((ushort Type, uint Ttl, byte[] Data)[] answers)
     {

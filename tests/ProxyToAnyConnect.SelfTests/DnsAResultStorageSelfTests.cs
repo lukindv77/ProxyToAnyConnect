@@ -96,18 +96,7 @@ internal static class DnsAResultStorageSelfTests
             throw new InvalidOperationException("Multi-A response did not finish in cache-reusable array storage.");
         }
 
-        var mixed = L2tpDnsResolver.ParseResponse(
-            BuildResponse(
-            [
-                (Type: (ushort)5, Ttl: 20u, Data: EncodeName("edge.example.com")),
-                (Type: (ushort)1, Ttl: 50u, Data: new byte[] { 198, 51, 100, 9 })
-            ]),
-            TransactionId, "example.com");
-        AssertAddresses(mixed, ["198.51.100.9"], expectedTtl: 20);
-        if (mixed.CanonicalName != "edge.example.com")
-        {
-            throw new InvalidOperationException("Mixed CNAME/A canonical-name semantics changed.");
-        }
+
     }
 
     private static void AssertAddresses(

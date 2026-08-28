@@ -21,6 +21,10 @@ internal static class DnsResponseBindingSelfTests
             UnrelatedAnswerOwnersAreIgnored();
             WrongAnswerClassIsIgnored();
             MalformedCnameRdataLengthIsRejected();
+            CnameOnlyIsAccepted();
+            MultipleOwnedAddressesRemainAccepted();
+            AmbiguousCnameAndAddressAreRejected();
+            MultipleOwnedCnamesAreRejected();
 
             Console.WriteLine("PASS: DNS responses are bound to the exact A/IN question and answer owner without owner-name materialization");
             return 0;
@@ -64,6 +68,94 @@ internal static class DnsResponseBindingSelfTests
         {
             throw new InvalidOperationException("DNS owner comparison was not ASCII case-insensitive.");
         }
+    }
+
+    private static void CnameOnlyIsAccepted()
+    {
+        var packet = BuildResponse(
+            ExpectedHost,
+            1,
+            1,
+            null,
+            5,
+            1,
+            EncodeName("target.example.com"));
+        var parsed = L2tpDnsResolver.ParseResponse(packet, TransactionId, ExpectedHost);
+        if (parsed.Addresses.Count != 0 || parsed.CanonicalName != "target.example.com")
+        {
+            throw new InvalidOperationException("A single owned CNAME did not remain a valid canonical redirect.");
+        }
+    }
+
+    private static void MultipleOwnedAddressesRemainAccepted()
+    {
+        var packet = BuildResponse(ExpectedHost, 1, 1, null, 1, 1, [203, 0, 113, 7]);
+        AppendAnswer(ref packet, null, 1, 1, [203, 0, 113, 8]);
+        var parsed = L2tpDnsResolver.ParseResponse(packet, TransactionId, ExpectedHost);
+        if (parsed.Addresses.Count != 2 ||
+            !parsed.Addresses[0].Equals(IPAddress.Parse("203.0.113.7")) ||
+            !parsed.Addresses[1].Equals(IPAddress.Parse("203.0.113.8")))
+        {
+            throw new InvalidOperationException("Valid multi-A RRset semantics changed.");
+        }
+    }
+
+    private static void AmbiguousCnameAndAddressAreRejected()
+    {
+        var cnameThenA = BuildResponse(
+            ExpectedHost,
+            1,
+            1,
+            null,
+            5,
+            1,
+            EncodeName("target.example.com"));
+        AppendAnswer(ref cnameThenA, null, 1, 1, [203, 0, 113, 7]);
+        AssertIOException(() => L2tpDnsResolver.ParseResponse(cnameThenA, TransactionId, ExpectedHost));
+
+        var aThenCname = BuildResponse(ExpectedHost, 1, 1, null, 1, 1, [203, 0, 113, 7]);
+        AppendAnswer(
+            ref aThenCname,
+            null,
+            5,
+            1,
+            EncodeName("target.example.com"));
+        AssertIOException(() => L2tpDnsResolver.ParseResponse(aThenCname, TransactionId, ExpectedHost));
+    }
+
+    private static void MultipleOwnedCnamesAreRejected()
+    {
+        var conflicting = BuildResponse(
+            ExpectedHost,
+            1,
+            1,
+            null,
+            5,
+            1,
+            EncodeName("first.example.com"));
+        AppendAnswer(
+            ref conflicting,
+            null,
+            5,
+            1,
+            EncodeName("second.example.com"));
+        AssertIOException(() => L2tpDnsResolver.ParseResponse(conflicting, TransactionId, ExpectedHost));
+
+        var duplicate = BuildResponse(
+            ExpectedHost,
+            1,
+            1,
+            null,
+            5,
+            1,
+            EncodeName("same.example.com"));
+        AppendAnswer(
+            ref duplicate,
+            null,
+            5,
+            1,
+            EncodeName("same.example.com"));
+        AssertIOException(() => L2tpDnsResolver.ParseResponse(duplicate, TransactionId, ExpectedHost));
     }
 
     private static void WrongQuestionNameIsRejected()
@@ -182,6 +274,42 @@ internal static class DnsResponseBindingSelfTests
         AddUInt16(packet, checked((ushort)answerData.Length));
         packet.AddRange(answerData);
         return packet.ToArray();
+    }
+
+    private static void AppendAnswer(
+        ref byte[] packet,
+        string? answerOwner,
+        ushort answerType,
+        ushort answerClass,
+        byte[] answerData)
+    {
+        var answerCount = (packet[6] << 8) | packet[7];
+        if (answerCount >= ushort.MaxValue)
+        {
+            throw new InvalidOperationException("Test DNS response answer count overflowed.");
+        }
+
+        var bytes = packet.ToList();
+        if (answerOwner is null)
+        {
+            bytes.Add(0xC0);
+            bytes.Add(0x0C);
+        }
+        else
+        {
+            bytes.AddRange(EncodeName(answerOwner));
+        }
+
+        AddUInt16(bytes, answerType);
+        AddUInt16(bytes, answerClass);
+        AddUInt32(bytes, 60);
+        AddUInt16(bytes, checked((ushort)answerData.Length));
+        bytes.AddRange(answerData);
+        packet = bytes.ToArray();
+
+        answerCount++;
+        packet[6] = checked((byte)(answerCount >> 8));
+        packet[7] = checked((byte)answerCount);
     }
 
     private static int FindAnswerRdLengthOffset(byte[] packet)
