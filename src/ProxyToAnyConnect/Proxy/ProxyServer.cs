@@ -151,6 +151,10 @@ internal sealed class ProxyServer
             {
                 await TryWriteErrorAsync(client, 503, "L2TP VPN unavailable", ex.Message, cancellationToken);
             }
+            catch (OutboundConnectTimeoutException ex)
+            {
+                await TryWriteErrorAsync(client, 504, "Gateway Timeout", ex.Message, cancellationToken);
+            }
             catch (InvalidDataException ex)
             {
                 await TryWriteErrorAsync(client, 400, "Bad Request", ex.Message, cancellationToken);
@@ -207,7 +211,7 @@ internal sealed class ProxyServer
         ReadOnlyMemory<byte> remainder,
         CancellationToken cancellationToken)
     {
-        await using var upstream = await _socketFactory.ConnectAsync(host, port, cancellationToken);
+        await using var upstream = await ConnectOutboundAsync(host, port, cancellationToken);
         await using var upstreamStream = new NetworkStream(upstream.Socket, ownsSocket: false);
 
         try
@@ -278,7 +282,7 @@ internal sealed class ProxyServer
 
         var (host, port, authority, pathAndQuery) = ParseHttpTarget(request.Target);
 
-        await using var upstream = await _socketFactory.ConnectAsync(host, port, cancellationToken);
+        await using var upstream = await ConnectOutboundAsync(host, port, cancellationToken);
         await using var upstreamStream = new NetworkStream(upstream.Socket, ownsSocket: false);
 
         var originHeader = request.BuildOriginHeader(pathAndQuery, authority);
@@ -353,6 +357,55 @@ internal sealed class ProxyServer
             responseDownload,
             responseCommit,
             cancellationToken);
+    }
+
+    private Task<IProxyOutboundConnection> ConnectOutboundAsync(
+        string host,
+        int port,
+        CancellationToken cancellationToken) =>
+        ConnectOutboundWithTimeoutAsync(
+            _socketFactory,
+            host,
+            port,
+            TimeSpan.FromSeconds(_options.OutboundConnectTimeoutSeconds),
+            cancellationToken);
+
+    internal static async Task<IProxyOutboundConnection> ConnectOutboundWithTimeoutAsync(
+        IProxyOutboundConnectionFactory socketFactory,
+        string host,
+        int port,
+        TimeSpan timeout,
+        CancellationToken ownerCancellation)
+    {
+        ArgumentNullException.ThrowIfNull(socketFactory);
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        ownerCancellation.ThrowIfCancellationRequested();
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ownerCancellation);
+        deadline.CancelAfter(timeout);
+
+        try
+        {
+            return await socketFactory.ConnectAsync(host, port, deadline.Token);
+        }
+        catch (OperationCanceledException ex)
+        {
+            // Proxy Pause/Shutdown owns the session even if its cancellation races
+            // the configured outbound deadline. Preserve that lifecycle control flow.
+            ownerCancellation.ThrowIfCancellationRequested();
+
+            if (deadline.IsCancellationRequested)
+            {
+                throw new OutboundConnectTimeoutException(
+                    $"Outbound connection to {host}:{port} timed out after {timeout.TotalSeconds:F0} second(s).",
+                    ex);
+            }
+
+            throw;
+        }
     }
 
     internal static void EnsureInitialBodyRemainderFits(long contentLength, int remainderLength)
@@ -938,6 +991,14 @@ internal sealed class ProxyServer
             throw new ProxyResponseCommittedException(
                 "CONNECT response was already committed before remainder forwarding failed.",
                 ex);
+        }
+    }
+
+    internal sealed class OutboundConnectTimeoutException : TimeoutException
+    {
+        public OutboundConnectTimeoutException(string message, Exception innerException)
+            : base(message, innerException)
+        {
         }
     }
 
