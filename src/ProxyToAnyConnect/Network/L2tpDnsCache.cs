@@ -9,11 +9,14 @@ internal sealed class L2tpDnsCache
     private readonly object _gate = new();
     private readonly Dictionary<string, CacheEntry> _entries = new(StringComparer.OrdinalIgnoreCase);
     private readonly int _maxEntries;
+    private readonly TimeProvider _timeProvider;
 
     private VpnContext? _context;
     private long _accessSequence;
 
-    public L2tpDnsCache(int maxEntries = DefaultMaxEntries)
+    public L2tpDnsCache(
+        int maxEntries = DefaultMaxEntries,
+        TimeProvider? timeProvider = null)
     {
         if (maxEntries is < 1 or > 10000)
         {
@@ -21,13 +24,13 @@ internal sealed class L2tpDnsCache
         }
 
         _maxEntries = maxEntries;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public bool TryGet(
         string normalizedHost,
         VpnContext context,
-        out IReadOnlyList<IPAddress> addresses,
-        DateTimeOffset? now = null)
+        out IReadOnlyList<IPAddress> addresses)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(normalizedHost);
         ArgumentNullException.ThrowIfNull(context);
@@ -35,14 +38,14 @@ internal sealed class L2tpDnsCache
         lock (_gate)
         {
             EnsureContextLocked(context);
-            var current = now ?? DateTimeOffset.UtcNow;
+            var currentTimestamp = _timeProvider.GetTimestamp();
             if (!_entries.TryGetValue(normalizedHost, out var entry))
             {
                 addresses = [];
                 return false;
             }
 
-            if (entry.ExpiresAt <= current)
+            if (IsExpired(entry, currentTimestamp))
             {
                 _entries.Remove(normalizedHost);
                 addresses = [];
@@ -59,8 +62,7 @@ internal sealed class L2tpDnsCache
         string normalizedHost,
         VpnContext context,
         IReadOnlyList<IPAddress> addresses,
-        TimeSpan ttl,
-        DateTimeOffset? now = null)
+        TimeSpan ttl)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(normalizedHost);
         ArgumentNullException.ThrowIfNull(context);
@@ -72,12 +74,12 @@ internal sealed class L2tpDnsCache
         }
 
         var copy = addresses as IPAddress[] ?? addresses.ToArray();
-        var current = now ?? DateTimeOffset.UtcNow;
+        var currentTimestamp = _timeProvider.GetTimestamp();
 
         lock (_gate)
         {
             EnsureContextLocked(context);
-            RemoveExpiredLocked(current);
+            RemoveExpiredLocked(currentTimestamp);
 
             if (!_entries.ContainsKey(normalizedHost) && _entries.Count >= _maxEntries)
             {
@@ -86,7 +88,8 @@ internal sealed class L2tpDnsCache
 
             _entries[normalizedHost] = new CacheEntry(
                 copy,
-                current + ttl,
+                currentTimestamp,
+                ttl,
                 ++_accessSequence);
         }
     }
@@ -124,7 +127,10 @@ internal sealed class L2tpDnsCache
         _accessSequence = 0;
     }
 
-    private void RemoveExpiredLocked(DateTimeOffset now)
+    private bool IsExpired(CacheEntry entry, long currentTimestamp) =>
+        _timeProvider.GetElapsedTime(entry.StoredTimestamp, currentTimestamp) >= entry.Ttl;
+
+    private void RemoveExpiredLocked(long currentTimestamp)
     {
         if (_entries.Count == 0)
         {
@@ -134,7 +140,7 @@ internal sealed class L2tpDnsCache
         List<string>? expired = null;
         foreach (var pair in _entries)
         {
-            if (pair.Value.ExpiresAt <= now)
+            if (IsExpired(pair.Value, currentTimestamp))
             {
                 (expired ??= []).Add(pair.Key);
             }
@@ -173,15 +179,21 @@ internal sealed class L2tpDnsCache
 
     private sealed class CacheEntry
     {
-        public CacheEntry(IPAddress[] addresses, DateTimeOffset expiresAt, long lastAccessSequence)
+        public CacheEntry(
+            IPAddress[] addresses,
+            long storedTimestamp,
+            TimeSpan ttl,
+            long lastAccessSequence)
         {
             Addresses = addresses;
-            ExpiresAt = expiresAt;
+            StoredTimestamp = storedTimestamp;
+            Ttl = ttl;
             LastAccessSequence = lastAccessSequence;
         }
 
         public IPAddress[] Addresses { get; }
-        public DateTimeOffset ExpiresAt { get; }
+        public long StoredTimestamp { get; }
+        public TimeSpan Ttl { get; }
         public long LastAccessSequence { get; set; }
     }
 }
