@@ -1,0 +1,72 @@
+name: dev-issue63-verification-http-framing
+
+on:
+  push:
+    branches:
+      - dev/issue63-verification-http-framing
+    paths:
+      - .github/workflows/dev-issue63-verification-http-framing.yml
+      - .github/validation/issue63-transform.ps1
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 63 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = '339c5955e78b7b7b6dae6f4a2d46bd6de360269d'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          if ((git rev-parse HEAD:.github/validation/issue63-transform.ps1).Trim() -ne 'b4154d1383b20ce0db6816190ba2db07542bde89') {
+            throw 'Unexpected issue63 transform blob.'
+          }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs' = 'e2edd830b559b5d8061a09d5d437d02d855b3350'
+            'tests/ProxyToAnyConnect.SelfTests/VerificationHttpParserTests.cs' = 'e36a250aefba8bcfbc01db98b90a542adca5246c'
+            'tests/ProxyToAnyConnect.SelfTests/VerificationChunkedDecodeSelfTests.cs' = '32989d4642f78b13b9dc40fd816eb857e73c06ee'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) {
+              throw "Unexpected base blob for $($entry.Key): $actual"
+            }
+          }
+
+          & ./.github/validation/issue63-transform.ps1
+
+          $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #63 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 63 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'verification: fail closed on HTTP message framing'
+          git push origin HEAD:dev/issue63-verification-http-framing
