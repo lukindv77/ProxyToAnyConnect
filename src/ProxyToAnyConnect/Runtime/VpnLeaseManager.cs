@@ -17,11 +17,13 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
     private readonly HashSet<string> _consumers = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _lifetime = new();
     private readonly CancellationToken _lifetimeToken;
+    private readonly SemaphoreSlim _disposeGate = new(1, 1);
 
     private CancellationTokenSource? _maintenanceCancellation;
     private Task? _maintenanceTask;
     private int _activeProxyCount;
     private int _disposed;
+    private int _connectionDisposeCompleted;
 
     public VpnLeaseManager(L2tpOptions options)
         : this(options, null, null)
@@ -378,12 +380,16 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        await _disposeGate.WaitAsync();
+        try
         {
-            return;
-        }
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                await RetryConnectionDisposeAsync();
+                return;
+            }
 
-        Exception? cleanupFailure = null;
+            Exception? cleanupFailure = null;
         try
         {
             try
@@ -416,6 +422,7 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
                 try
                 {
                     await _connectionManager.DisposeAsync();
+                    Volatile.Write(ref _connectionDisposeCompleted, 1);
                 }
                 catch (Exception ex)
                 {
@@ -444,12 +451,32 @@ internal sealed class VpnLeaseManager : IAsyncDisposable
             }
         }
 
-        RethrowCleanupFailure(cleanupFailure);
+            RethrowCleanupFailure(cleanupFailure);
 
-        // Do not race SemaphoreSlim.Dispose() against a VpnLease.DisposeAsync()
-        // caller that passed the pre-wait disposed check just before shutdown.
-        // AvailableWaitHandle is never used, so there is no OS wait handle to
-        // release; the managed gate becomes collectible with this manager.
+            // Do not race SemaphoreSlim.Dispose() against a VpnLease.DisposeAsync()
+            // caller that passed the pre-wait disposed check just before shutdown.
+            // AvailableWaitHandle is never used, so there is no OS wait handle to
+            // release; both managed gates become collectible with this manager.
+        }
+        finally
+        {
+            _disposeGate.Release();
+        }
+    }
+
+    private async ValueTask RetryConnectionDisposeAsync()
+    {
+        if (Volatile.Read(ref _connectionDisposeCompleted) != 0)
+        {
+            return;
+        }
+
+        // First-pass manager cleanup already unpublished consumers/maintenance/cache
+        // and ended its lifetime. The only retryable residual owner is the nested VPN
+        // controller, whose RasConnectionManager may intentionally retain an exact
+        // HRASCONN/PBK after a failed terminal hangup.
+        await _connectionManager.DisposeAsync();
+        Volatile.Write(ref _connectionDisposeCompleted, 1);
     }
 
     private static void CaptureCleanupFailure(
