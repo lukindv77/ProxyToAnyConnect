@@ -1,0 +1,64 @@
+name: dev-issue80-after79
+
+on:
+  push:
+    branches:
+      - dev/issue80-after79
+    paths:
+      - .github/workflows/dev-issue80-after79.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify cumulative issue 80 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = 'ab8740f2781cdcddf27a395917d81610d2938a88'
+          git merge-base --is-ancestor $expectedBase HEAD
+          if ((git rev-parse "$expectedBase`:src/ProxyToAnyConnect/Proxy/ProxyServer.cs").Trim() -ne '834c9fd6baab59ac3fbdd17ee1f8abf0cf48f77d') { throw 'Unexpected cumulative #80 ProxyServer base.' }
+          if ((git rev-parse "$expectedBase`:tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs").Trim() -ne 'e6baf180e9363a91bee041173bacedf951135cdd') { throw 'Unexpected cumulative #80 runner base.' }
+          if ((git rev-parse 'HEAD:.github/validation/issue80-after79-transform.ps1').Trim() -ne '7da5c9e641008919ca16482ce0368e91e99add25') { throw 'Unexpected cumulative #80 transform.' }
+          if ((git rev-parse 'HEAD:tests/ProxyToAnyConnect.SelfTests/ProxyClientHeaderTimeoutSelfTests.cs').Trim() -ne '7af8ea09d905e0f49717e06dc5103b661fa0a3a1') { throw 'Unexpected cumulative #80 test blob.' }
+
+          $expectedBranchSurface = @(
+            '.github/validation/issue80-after79-transform.ps1'
+            '.github/workflows/dev-issue80-after79.yml'
+            'tests/ProxyToAnyConnect.SelfTests/ProxyClientHeaderTimeoutSelfTests.cs'
+          ) | Sort-Object
+          $surface = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
+          if (($surface -join "`n") -ne ($expectedBranchSurface -join "`n")) { throw "Unexpected cumulative #80 surface: $($surface -join ', ')" }
+
+          & ./.github/validation/issue80-after79-transform.ps1
+          git add -- src/ProxyToAnyConnect/Proxy/ProxyServer.cs tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $expectedStaged = @('src/ProxyToAnyConnect/Proxy/ProxyServer.cs','tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs') | Sort-Object
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedStaged -join "`n")) { throw "Unexpected cumulative #80 staged surface: $($staged -join ', ')" }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish cumulative validated source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'proxy: compose client header and outbound deadlines'
+          git push origin HEAD:dev/issue80-after79
