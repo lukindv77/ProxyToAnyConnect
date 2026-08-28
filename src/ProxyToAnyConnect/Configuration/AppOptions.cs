@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -330,10 +331,10 @@ internal sealed class AppOptions
                 $"L2TP '{name}' verification.publicAddress must be an IPv4 address or DNS host name.");
         }
 
-        if (string.IsNullOrWhiteSpace(verification.ProbeHost) ||
-            Uri.CheckHostName(verification.ProbeHost) != UriHostNameType.Dns)
+        if (!VerificationOptions.TryGetCanonicalProbeHost(verification.ProbeHost, out _))
         {
-            throw new InvalidOperationException($"L2TP '{name}' verification.probeHost must be a DNS host name.");
+            throw new InvalidOperationException(
+                $"L2TP '{name}' verification.probeHost must be a valid DNS host name that can be canonicalized with IDNA.");
         }
 
         if (verification.ProbePort is < 1 or > 65535)
@@ -341,10 +342,10 @@ internal sealed class AppOptions
             throw new InvalidOperationException($"L2TP '{name}' verification.probePort must be between 1 and 65535.");
         }
 
-        if (string.IsNullOrWhiteSpace(verification.ProbePath) ||
-            !verification.ProbePath.StartsWith("/", StringComparison.Ordinal))
+        if (!VerificationOptions.IsValidProbePath(verification.ProbePath))
         {
-            throw new InvalidOperationException($"L2TP '{name}' verification.probePath must start with '/'.");
+            throw new InvalidOperationException(
+                $"L2TP '{name}' verification.probePath must be an ASCII HTTP origin-form request-target without a fragment.");
         }
 
         if (verification.TimeoutSeconds is < 1 or > 60)
@@ -596,6 +597,147 @@ internal sealed class VerificationOptions
 
     [JsonPropertyName("maxResponseBytes")]
     public int MaxResponseBytes { get; init; } = DefaultResponseLimitBytes;
+
+    internal static bool TryGetCanonicalProbeHost(string? value, out string canonicalHost)
+    {
+        canonicalHost = string.Empty;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var isAscii = true;
+        foreach (var current in value)
+        {
+            if (current > 0x7f)
+            {
+                isAscii = false;
+                break;
+            }
+        }
+
+        if (isAscii)
+        {
+            if (!IsValidAsciiDnsHost(value))
+            {
+                return false;
+            }
+
+            canonicalHost = value;
+            return true;
+        }
+
+        try
+        {
+            canonicalHost = new IdnMapping
+            {
+                UseStd3AsciiRules = true
+            }.GetAscii(value).ToLowerInvariant();
+        }
+        catch (ArgumentException)
+        {
+            canonicalHost = string.Empty;
+            return false;
+        }
+
+        if (!IsValidAsciiDnsHost(canonicalHost))
+        {
+            canonicalHost = string.Empty;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsValidAsciiDnsHost(string value)
+    {
+        if (value.Length is <= 0 or > 253 || value[^1] == '.')
+        {
+            return false;
+        }
+
+        var labelStart = 0;
+        for (var index = 0; index <= value.Length; index++)
+        {
+            if (index != value.Length && value[index] != '.')
+            {
+                continue;
+            }
+
+            var labelLength = index - labelStart;
+            if (labelLength is <= 0 or > 63 ||
+                value[labelStart] == '-' ||
+                value[index - 1] == '-')
+            {
+                return false;
+            }
+
+            for (var labelIndex = labelStart; labelIndex < index; labelIndex++)
+            {
+                var current = value[labelIndex];
+                if (!((current >= 'A' && current <= 'Z') ||
+                      (current >= 'a' && current <= 'z') ||
+                      (current >= '0' && current <= '9') ||
+                      current == '-'))
+                {
+                    return false;
+                }
+            }
+
+            labelStart = index + 1;
+        }
+
+        return true;
+    }
+
+    internal static bool IsValidProbePath(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value[0] != '/')
+        {
+            return false;
+        }
+
+        for (var index = 0; index < value.Length; index++)
+        {
+            var current = value[index];
+            if (current is '/' or '?')
+            {
+                continue;
+            }
+
+            if (current == '%')
+            {
+                if (index > value.Length - 3 ||
+                    !IsAsciiHexDigit(value[index + 1]) ||
+                    !IsAsciiHexDigit(value[index + 2]))
+                {
+                    return false;
+                }
+
+                index += 2;
+                continue;
+            }
+
+            if (!IsAsciiPchar(current))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsAsciiPchar(char value) =>
+        (value >= 'A' && value <= 'Z') ||
+        (value >= 'a' && value <= 'z') ||
+        (value >= '0' && value <= '9') ||
+        value is '-' or '.' or '_' or '~' or
+            '!' or '$' or '&' or '\'' or '(' or ')' or '*' or '+' or ',' or ';' or '=' or ':' or '@';
+
+    private static bool IsAsciiHexDigit(char value) =>
+        (value >= '0' && value <= '9') ||
+        (value >= 'A' && value <= 'F') ||
+        (value >= 'a' && value <= 'f');
 }
 
 internal sealed class LoggingOptions

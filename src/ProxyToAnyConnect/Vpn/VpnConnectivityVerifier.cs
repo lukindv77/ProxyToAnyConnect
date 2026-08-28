@@ -15,9 +15,18 @@ internal sealed class VpnConnectivityVerifier
 
     private readonly VerificationOptions _options;
     private readonly L2tpDnsResolver _dnsResolver;
+    private readonly string _probeHost;
 
     public VpnConnectivityVerifier(VerificationOptions options)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        if (!VerificationOptions.TryGetCanonicalProbeHost(options.ProbeHost, out _probeHost))
+        {
+            throw new ArgumentException(
+                "Verification probe host is not a valid IDNA-canonicalizable DNS host name.",
+                nameof(options));
+        }
+
         _options = options;
         _dnsResolver = new L2tpDnsResolver();
     }
@@ -34,7 +43,7 @@ internal sealed class VpnConnectivityVerifier
         try
         {
             var targetAddresses = await _dnsResolver.ResolveIPv4Async(
-                _options.ProbeHost,
+                _probeHost,
                 context,
                 timeout.Token);
 
@@ -52,7 +61,7 @@ internal sealed class VpnConnectivityVerifier
             }
 
             throw new IOException(
-                $"L2TP verification probe could not connect to {_options.ProbeHost}:{_options.ProbePort}.",
+                $"L2TP verification probe could not connect to {_probeHost}:{_options.ProbePort}.",
                 lastError);
         }
         catch (OperationCanceledException ex)
@@ -91,11 +100,11 @@ internal sealed class VpnConnectivityVerifier
         await sslStream.AuthenticateAsClientAsync(
             new SslClientAuthenticationOptions
             {
-                TargetHost = _options.ProbeHost
+                TargetHost = _probeHost
             },
             cancellationToken);
 
-        var request = BuildProbeRequest(_options.ProbeHost, _options.ProbePath);
+        var request = BuildProbeRequest(_probeHost, _options.ProbePath);
 
         await sslStream.WriteAsync(request, cancellationToken);
         await sslStream.FlushAsync(cancellationToken);
@@ -154,13 +163,27 @@ internal sealed class VpnConnectivityVerifier
         host ??= string.Empty;
         path ??= string.Empty;
 
+        if (!VerificationOptions.TryGetCanonicalProbeHost(host, out var canonicalHost))
+        {
+            throw new ArgumentException(
+                "Verification probe host must be a valid IDNA-canonicalizable DNS host name.",
+                nameof(host));
+        }
+
+        if (!VerificationOptions.IsValidProbePath(path))
+        {
+            throw new ArgumentException(
+                "Verification probe path must be an ASCII HTTP origin-form request-target without a fragment.",
+                nameof(path));
+        }
+
         ReadOnlySpan<byte> requestPrefix = "GET "u8;
         ReadOnlySpan<byte> hostPrefix = " HTTP/1.1\r\nHost: "u8;
         ReadOnlySpan<byte> fixedSuffix =
             "\r\nUser-Agent: ProxyToAnyConnect/1.0\r\nAccept: text/plain\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"u8;
 
         var pathByteCount = Encoding.ASCII.GetByteCount(path);
-        var hostByteCount = Encoding.ASCII.GetByteCount(host);
+        var hostByteCount = Encoding.ASCII.GetByteCount(canonicalHost);
         var totalLength = checked(
             requestPrefix.Length +
             pathByteCount +
@@ -177,7 +200,7 @@ internal sealed class VpnConnectivityVerifier
         offset += Encoding.ASCII.GetBytes(path.AsSpan(), destination[offset..]);
         hostPrefix.CopyTo(destination[offset..]);
         offset += hostPrefix.Length;
-        offset += Encoding.ASCII.GetBytes(host.AsSpan(), destination[offset..]);
+        offset += Encoding.ASCII.GetBytes(canonicalHost.AsSpan(), destination[offset..]);
         fixedSuffix.CopyTo(destination[offset..]);
 
         return request;
