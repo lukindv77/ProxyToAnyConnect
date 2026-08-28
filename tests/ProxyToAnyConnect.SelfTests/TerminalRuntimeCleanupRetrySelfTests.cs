@@ -1,6 +1,7 @@
 using System.Net;
 using System.Reflection;
 using ProxyToAnyConnect.Configuration;
+using ProxyToAnyConnect.Gui;
 using ProxyToAnyConnect.Runtime;
 using ProxyToAnyConnect.Vpn;
 
@@ -14,9 +15,10 @@ internal static class TerminalRuntimeCleanupRetrySelfTests
         {
             await CoordinatorRetainsExactVpnOwnerUntilRetryAsync();
             await HostRetainsExactCoordinatorUntilRetryAsync();
+            await ShutdownSequenceRetriesRuntimeAfterIndependentOwnersAsync();
 
             Console.WriteLine(
-                "PASS: terminal runtime disposal retains exact failed VPN/coordinator cleanup owners until serialized retry succeeds");
+                "PASS: terminal runtime disposal retains exact failed VPN/coordinator cleanup owners and application shutdown performs one bounded retry");
             return 0;
         }
         catch (Exception ex)
@@ -128,6 +130,48 @@ internal static class TerminalRuntimeCleanupRetrySelfTests
         {
             throw new InvalidOperationException(
                 "Idempotent host disposal retried an already-terminal coordinator.");
+        }
+    }
+
+    private static async Task ShutdownSequenceRetriesRuntimeAfterIndependentOwnersAsync()
+    {
+        var phases = new List<string>();
+        var runtimeAttempts = 0;
+        var firstRuntimeFailure = new SyntheticCleanupException("first runtime cleanup failed");
+
+        var failures = await ApplicationShutdownSequence.DrainAsync(
+            () =>
+            {
+                phases.Add("configuration");
+                return Task.CompletedTask;
+            },
+            () =>
+            {
+                runtimeAttempts++;
+                phases.Add($"runtime-{runtimeAttempts}");
+                return runtimeAttempts == 1
+                    ? ValueTask.FromException(firstRuntimeFailure)
+                    : ValueTask.CompletedTask;
+            },
+            () =>
+            {
+                phases.Add("memory");
+                return ValueTask.CompletedTask;
+            });
+
+        var expected = new[] { "configuration", "runtime-1", "memory", "runtime-2" };
+        if (!phases.SequenceEqual(expected))
+        {
+            throw new InvalidOperationException(
+                $"Application shutdown did not retry runtime only after independent first-pass owners: {string.Join(",", phases)}.");
+        }
+
+        if (failures.Count != 1 ||
+            failures[0].Phase != "runtime-host" ||
+            !ReferenceEquals(failures[0].Exception, firstRuntimeFailure))
+        {
+            throw new InvalidOperationException(
+                "A successful bounded runtime retry did not preserve exactly the original first-pass diagnostic.");
         }
     }
 
