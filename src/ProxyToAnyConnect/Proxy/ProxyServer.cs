@@ -138,6 +138,15 @@ internal sealed class ProxyServer
             {
                 await HandleClientAsync(client, cancellationToken);
             }
+            catch (ProxyResponseCommittedException ex)
+            {
+                // Once a CONNECT success response has begun, this client stream is
+                // no longer an HTTP response channel. Never inject a second proxy
+                // response into the raw tunnel; terminal transport close is the only
+                // fail-closed action after the commitment boundary.
+                System.Diagnostics.Debug.WriteLine(
+                    $"Committed proxy response failed; closing transport without a second HTTP response: {ex.InnerException ?? ex}");
+            }
             catch (VpnUnavailableException ex)
             {
                 await TryWriteErrorAsync(client, 503, "L2TP VPN unavailable", ex.Message, cancellationToken);
@@ -201,37 +210,61 @@ internal sealed class ProxyServer
         await using var upstream = await _socketFactory.ConnectAsync(host, port, cancellationToken);
         await using var upstreamStream = new NetworkStream(upstream.Socket, ownsSocket: false);
 
-        await clientStream.WriteAsync(ConnectionEstablished, cancellationToken);
-        if (!remainder.IsEmpty)
-        {
-            await upstreamStream.WriteAsync(remainder, cancellationToken);
-            RecordSent(remainder.Length);
-        }
-
-        using var tunnelCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken,
-            upstream.LifetimeToken);
-
-        var clientToUpstream = PumpAsync(
-            clientStream,
-            upstreamStream,
-            RecordSent,
-            tunnelCancellation.Token);
-        var upstreamToClient = PumpAsync(
-            upstreamStream,
-            clientStream,
-            RecordReceived,
-            tunnelCancellation.Token);
-
         try
         {
-            await Task.WhenAny(clientToUpstream, upstreamToClient);
+            // Treat the success response as committed before the write begins. A
+            // transport failure can occur after a partial write, so attempting a
+            // fallback 5xx is never safe once these bytes are handed to the stream.
+            await clientStream.WriteAsync(ConnectionEstablished, cancellationToken);
+            if (!remainder.IsEmpty)
+            {
+                await WriteConnectRemainderAfterCommitAsync(
+                    upstreamStream,
+                    remainder,
+                    cancellationToken);
+                RecordSent(remainder.Length);
+            }
+
+            using var tunnelCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                upstream.LifetimeToken);
+
+            var clientToUpstream = PumpAsync(
+                clientStream,
+                upstreamStream,
+                RecordSent,
+                tunnelCancellation.Token);
+            var upstreamToClient = PumpAsync(
+                upstreamStream,
+                clientStream,
+                RecordReceived,
+                tunnelCancellation.Token);
+
+            try
+            {
+                await Task.WhenAny(clientToUpstream, upstreamToClient);
+            }
+            finally
+            {
+                tunnelCancellation.Cancel();
+                await IgnoreCancellationAsync(clientToUpstream);
+                await IgnoreCancellationAsync(upstreamToClient);
+            }
         }
-        finally
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            tunnelCancellation.Cancel();
-            await IgnoreCancellationAsync(clientToUpstream);
-            await IgnoreCancellationAsync(upstreamToClient);
+            // Preserve explicit proxy Pause/Shutdown cancellation semantics.
+            throw;
+        }
+        catch (ProxyResponseCommittedException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new ProxyResponseCommittedException(
+                "CONNECT response was already committed; closing the tunnel transport.",
+                ex);
         }
     }
 
@@ -772,6 +805,41 @@ internal sealed class ProxyServer
         catch
         {
             // Best effort error response only.
+        }
+    }
+
+    internal static async Task WriteConnectRemainderAfterCommitAsync(
+        Stream upstreamStream,
+        ReadOnlyMemory<byte> remainder,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(upstreamStream);
+        if (remainder.IsEmpty)
+        {
+            return;
+        }
+
+        try
+        {
+            await upstreamStream.WriteAsync(remainder, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new ProxyResponseCommittedException(
+                "CONNECT response was already committed before remainder forwarding failed.",
+                ex);
+        }
+    }
+
+    internal sealed class ProxyResponseCommittedException : Exception
+    {
+        public ProxyResponseCommittedException(string message, Exception innerException)
+            : base(message, innerException)
+        {
         }
     }
 
