@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/dev-issue63-verification-http-framing.yml
       - .github/validation/issue63-transform.ps1
+      - .github/validation/issue63-parser-contract.ps1
 
 permissions:
   contents: write
@@ -32,11 +33,15 @@ jobs:
           if ((git rev-parse HEAD:.github/validation/issue63-transform.ps1).Trim() -ne 'b4154d1383b20ce0db6816190ba2db07542bde89') {
             throw 'Unexpected issue63 transform blob.'
           }
+          if ((git rev-parse HEAD:.github/validation/issue63-parser-contract.ps1).Trim() -ne '5a9694b6a962f344bcfefc0984e3b0c4d42766e3') {
+            throw 'Unexpected issue63 parser-contract transform blob.'
+          }
 
           $expectedBlobs = [ordered]@{
             'src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs' = 'e2edd830b559b5d8061a09d5d437d02d855b3350'
             'tests/ProxyToAnyConnect.SelfTests/VerificationHttpParserTests.cs' = 'e36a250aefba8bcfbc01db98b90a542adca5246c'
             'tests/ProxyToAnyConnect.SelfTests/VerificationChunkedDecodeSelfTests.cs' = '32989d4642f78b13b9dc40fd816eb857e73c06ee'
+            'tests/ProxyToAnyConnect.SelfTests/VerificationParserSetupSelfTests.cs' = 'ab1d2803274f4ef7fc6d62bb3308126049c57c98'
           }
           foreach ($entry in $expectedBlobs.GetEnumerator()) {
             $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
@@ -46,6 +51,7 @@ jobs:
           }
 
           & ./.github/validation/issue63-transform.ps1
+          & ./.github/validation/issue63-parser-contract.ps1
 
           $expectedPaths = @($expectedBlobs.Keys | Sort-Object)
           git add -- $expectedPaths
