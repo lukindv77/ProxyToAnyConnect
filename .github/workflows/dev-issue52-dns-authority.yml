@@ -6,6 +6,8 @@ on:
       - dev/issue52-dns-authority
     paths:
       - .github/workflows/dev-issue52-dns-authority.yml
+      - .github/validation/issue52-transform.ps1
+      - .github/validation/issue52-post-transform.ps1
 
 permissions:
   contents: write
@@ -31,7 +33,7 @@ jobs:
           if ((git rev-parse HEAD:.github/validation/issue52-transform.ps1).Trim() -ne '24bf5ff4e99cb70e889015c81df986a6d320ba42') {
             throw 'Unexpected issue52 transform blob.'
           }
-          if ((git rev-parse HEAD:.github/validation/issue52-post-transform.ps1).Trim() -ne '12dc9d29e72e1fc175c057582a059127c772f201') {
+          if ((git rev-parse HEAD:.github/validation/issue52-post-transform.ps1).Trim() -ne '49fc61cee0b3f34b5d12cd661b37f76de2bf87c8') {
             throw 'Unexpected issue52 post-transform blob.'
           }
 
