@@ -15,10 +15,11 @@ internal static class ProxyConnectCommitBoundarySelfTests
     {
         try
         {
-            await CommittedRemainderFailureClosesWithoutSecondHttpResponseAsync();
+            await CommittedRemainderWriteFailureIsClassifiedAsync();
+            await CommittedRemainderCancellationPreservesOwnerCancellationAsync();
             await PreEstablishmentVpnFailureStillReturns503Async();
             Console.WriteLine(
-                "PASS: CONNECT response commit boundary suppresses post-200 HTTP errors and preserves pre-establishment failures");
+                "PASS: CONNECT response commit boundary classifies post-200 remainder failures as close-only and preserves pre-establishment errors");
             return 0;
         }
         catch (Exception ex)
@@ -28,75 +29,49 @@ internal static class ProxyConnectCommitBoundarySelfTests
         }
     }
 
-    private static async Task CommittedRemainderFailureClosesWithoutSecondHttpResponseAsync()
+    private static async Task CommittedRemainderWriteFailureIsClassifiedAsync()
     {
-        using var timeout = new CancellationTokenSource(TestTimeout);
-        using var originListener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        originListener.Start();
-        var originPort = ((IPEndPoint)originListener.LocalEndpoint).Port;
+        var failure = new IOException("Synthetic upstream write failure after CONNECT commitment.");
+        await using var stream = new ThrowingWriteStream(failure);
+        try
+        {
+            await ProxyServer.WriteConnectRemainderAfterCommitAsync(
+                stream,
+                "TLS-CLIENT-HELLO"u8.ToArray(),
+                CancellationToken.None);
+            throw new InvalidOperationException(
+                "Committed CONNECT remainder failure did not surface as a committed-response failure.");
+        }
+        catch (ProxyServer.ProxyResponseCommittedException ex)
+            when (ReferenceEquals(ex.InnerException, failure))
+        {
+        }
 
-        var proxyPort = ReserveLoopbackPort();
-        var factory = new SendShutdownOutboundFactory(originPort);
-        using var proxyCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
-        var proxy = new ProxyServer(CreateProxyOptions(proxyPort), factory);
-        var proxyTask = proxy.RunAsync(proxyCancellation.Token);
+        if (stream.WriteAttempts != 1)
+        {
+            throw new InvalidOperationException(
+                $"Expected exactly one committed remainder write attempt, got {stream.WriteAttempts}.");
+        }
+    }
+
+    private static async Task CommittedRemainderCancellationPreservesOwnerCancellationAsync()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await using var stream = new ThrowingWriteStream(
+            new OperationCanceledException(cancellation.Token));
 
         try
         {
-            using var client = new System.Net.Sockets.TcpClient { NoDelay = true };
-            await client.ConnectAsync(IPAddress.Loopback, proxyPort, timeout.Token);
-            await using var clientStream = client.GetStream();
-
-            var header = Encoding.ASCII.GetBytes(
-                "CONNECT commit-boundary.test:443 HTTP/1.1\r\n" +
-                "Host: commit-boundary.test:443\r\n\r\n");
-            var remainder = GC.AllocateUninitializedArray<byte>(512);
-            remainder.AsSpan().Fill(0xA5);
-            var request = GC.AllocateUninitializedArray<byte>(header.Length + remainder.Length);
-            header.CopyTo(request, 0);
-            remainder.CopyTo(request, header.Length);
-
-            // One loopback send keeps the header terminator and first tunnel bytes
-            // queued together for the proxy's bounded request read. The outbound
-            // factory locally shuts down its send half before publication, so any
-            // captured remainder write fails deterministically after the 200 response.
-            await clientStream.WriteAsync(request, timeout.Token);
-
-            using var origin = await originListener.AcceptTcpClientAsync(timeout.Token);
-            var responseHeader = await ReadHeaderAsync(clientStream, timeout.Token);
-            var responseText = Encoding.ASCII.GetString(responseHeader);
-            if (!responseText.StartsWith(
-                    "HTTP/1.1 200 Connection Established\r\n\r\n",
-                    StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"CONNECT did not commit the expected success response: {responseText}");
-            }
-
-            var tail = await ReadUntilCloseAsync(clientStream, timeout.Token);
-            if (tail.Length != 0)
-            {
-                var tailText = Encoding.ASCII.GetString(tail);
-                if (tailText.Contains("HTTP/1.1 ", StringComparison.Ordinal))
-                {
-                    throw new InvalidOperationException(
-                        $"Proxy injected a second HTTP response after CONNECT establishment: {tailText}");
-                }
-
-                throw new InvalidOperationException(
-                    $"Expected transport-close after committed remainder failure, received {tail.Length} unexpected byte(s).");
-            }
-
-            if (factory.ConnectCount != 1)
-            {
-                throw new InvalidOperationException(
-                    $"Expected one outbound CONNECT attempt, got {factory.ConnectCount}.");
-            }
+            await ProxyServer.WriteConnectRemainderAfterCommitAsync(
+                stream,
+                "cancelled"u8.ToArray(),
+                cancellation.Token);
+            throw new InvalidOperationException(
+                "Committed CONNECT remainder cancellation did not remain cancellation control flow.");
         }
-        finally
+        catch (OperationCanceledException ex) when (ex.CancellationToken == cancellation.Token)
         {
-            proxyCancellation.Cancel();
-            await proxyTask;
         }
     }
 
@@ -172,31 +147,6 @@ internal static class ProxyConnectCommitBoundarySelfTests
         throw new InvalidDataException("Proxy response header exceeded the test limit.");
     }
 
-    private static async Task<byte[]> ReadUntilCloseAsync(Stream stream, CancellationToken cancellationToken)
-    {
-        var result = new List<byte>(512);
-        var buffer = new byte[512];
-        while (result.Count < 8192)
-        {
-            try
-            {
-                var read = await stream.ReadAsync(buffer, cancellationToken);
-                if (read == 0)
-                {
-                    return result.ToArray();
-                }
-
-                result.AddRange(buffer.AsSpan(0, read).ToArray());
-            }
-            catch (IOException ex) when (ex.InnerException is SocketException)
-            {
-                return result.ToArray();
-            }
-        }
-
-        throw new InvalidOperationException("Committed CONNECT failure produced an unexpectedly large response tail.");
-    }
-
     private static int ReserveLoopbackPort()
     {
         var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
@@ -208,44 +158,6 @@ internal static class ProxyConnectCommitBoundarySelfTests
         finally
         {
             listener.Stop();
-        }
-    }
-
-    private sealed class SendShutdownOutboundFactory : IProxyOutboundConnectionFactory
-    {
-        private readonly int _originPort;
-        private int _connectCount;
-
-        public SendShutdownOutboundFactory(int originPort)
-        {
-            _originPort = originPort;
-        }
-
-        public int ConnectCount => Volatile.Read(ref _connectCount);
-
-        public async Task<IProxyOutboundConnection> ConnectAsync(
-            string host,
-            int port,
-            CancellationToken cancellationToken)
-        {
-            Interlocked.Increment(ref _connectCount);
-            var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
-            {
-                NoDelay = true
-            };
-            try
-            {
-                await socket.ConnectAsync(
-                    new IPEndPoint(IPAddress.Loopback, _originPort),
-                    cancellationToken);
-                socket.Shutdown(SocketShutdown.Send);
-                return new TestOutboundConnection(socket);
-            }
-            catch
-            {
-                socket.Dispose();
-                throw;
-            }
         }
     }
 
@@ -262,20 +174,39 @@ internal static class ProxyConnectCommitBoundarySelfTests
         }
     }
 
-    private sealed class TestOutboundConnection : IProxyOutboundConnection
+    private sealed class ThrowingWriteStream : Stream
     {
-        public TestOutboundConnection(Socket socket)
+        private readonly Exception _failure;
+        private int _writeAttempts;
+
+        public ThrowingWriteStream(Exception failure)
         {
-            Socket = socket;
+            _failure = failure;
         }
 
-        public Socket Socket { get; }
-        public CancellationToken LifetimeToken => CancellationToken.None;
-
-        public ValueTask DisposeAsync()
+        public int WriteAttempts => Volatile.Read(ref _writeAttempts);
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
         {
-            Socket.Dispose();
-            return ValueTask.CompletedTask;
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() => throw new NotSupportedException();
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _writeAttempts);
+            return ValueTask.FromException(_failure);
         }
     }
 }
