@@ -313,7 +313,18 @@ internal sealed class VpnConnectivityVerifier
     {
         var metadata = ParseHttpSuccessHeader(response);
         var body = response[metadata.BodyOffset..];
-        return metadata.IsChunked ? DecodeChunkedBody(body) : body.ToArray();
+        if (metadata.IsChunked)
+        {
+            return DecodeChunkedBody(body);
+        }
+
+        if (metadata.ContentLength is int contentLength)
+        {
+            EnsureExactContentLength(body.Length, contentLength);
+            return body[..contentLength].ToArray();
+        }
+
+        return body.ToArray();
     }
 
     internal static ReadOnlyMemory<byte> ParseHttpSuccessBodyView(byte[] response)
@@ -331,6 +342,14 @@ internal sealed class VpnConnectivityVerifier
             return DecodeChunkedBody(body.Span);
         }
 
+        if (metadata.ContentLength is int contentLength)
+        {
+            EnsureExactContentLength(body.Length, contentLength);
+            return body[..contentLength];
+        }
+
+        // HTTP/1.x close-delimited responses remain supported because the verifier
+        // explicitly sends Connection: close and ReadPooledResponseAsync owns EOF.
         return body;
     }
 
@@ -352,21 +371,55 @@ internal sealed class VpnConnectivityVerifier
             statusCode is < 200 or >= 300)
         {
             throw new IOException(
-                $"Verification endpoint returned an unsuccessful HTTP status: '{statusLine.ToString()}'.");
+                $"Verification endpoint returned an invalid or unsuccessful HTTP status: '{statusLine.ToString()}'.");
         }
 
+        var transferEncodingSeen = false;
         var isChunked = false;
+        int? contentLength = null;
         var offset = firstLineEnd < 0 ? headerText.Length : firstLineEnd + 2;
         while (offset < headerText.Length)
         {
             var remaining = headerText.AsSpan(offset);
             var lineEnd = remaining.IndexOf("\r\n".AsSpan());
             var line = lineEnd < 0 ? remaining : remaining[..lineEnd];
-            if (line.StartsWith("Transfer-Encoding:", StringComparison.OrdinalIgnoreCase) &&
-                line.Contains("chunked", StringComparison.OrdinalIgnoreCase))
+            var colon = line.IndexOf(':');
+            if (colon <= 0)
             {
+                throw new IOException("Verification endpoint returned a malformed HTTP header field.");
+            }
+
+            var name = line[..colon];
+            var value = TrimHttpOws(line[(colon + 1)..]);
+            if (!IsValidHttpFieldName(name) || !IsValidHttpFieldValue(value))
+            {
+                throw new IOException("Verification endpoint returned an invalid HTTP header field.");
+            }
+
+            if (name.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
+            {
+                if (transferEncodingSeen)
+                {
+                    throw new IOException("Verification endpoint returned duplicate Transfer-Encoding fields.");
+                }
+
+                transferEncodingSeen = true;
+                if (!value.Equals("chunked", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new IOException(
+                        "Verification endpoint returned an unsupported Transfer-Encoding; only exact 'chunked' is accepted.");
+                }
+
                 isChunked = true;
-                break;
+            }
+            else if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+            {
+                if (contentLength is not null || !TryParseContentLength(value, out var parsedLength))
+                {
+                    throw new IOException("Verification endpoint returned an invalid or duplicate Content-Length field.");
+                }
+
+                contentLength = parsedLength;
             }
 
             if (lineEnd < 0)
@@ -377,15 +430,130 @@ internal sealed class VpnConnectivityVerifier
             offset += lineEnd + 2;
         }
 
-        return new HttpBodyMetadata(headerEnd + 4, isChunked);
+        if (isChunked && contentLength is not null)
+        {
+            throw new IOException(
+                "Verification endpoint returned ambiguous HTTP framing with both Transfer-Encoding and Content-Length.");
+        }
+
+        return new HttpBodyMetadata(headerEnd + 4, isChunked, contentLength);
     }
 
     private static bool TryParseStatusCode(ReadOnlySpan<char> statusLine, out int statusCode)
     {
         statusCode = 0;
-        Span<Range> parts = stackalloc Range[3];
-        var partCount = statusLine.Split(parts, ' ', StringSplitOptions.RemoveEmptyEntries);
-        return partCount >= 2 && int.TryParse(statusLine[parts[1]], out statusCode);
+        if (!(statusLine.StartsWith("HTTP/1.1 ", StringComparison.Ordinal) ||
+              statusLine.StartsWith("HTTP/1.0 ", StringComparison.Ordinal)) ||
+            statusLine.Length < 12)
+        {
+            return false;
+        }
+
+        var code = statusLine.Slice(9, 3);
+        if (code[0] is < '0' or > '9' ||
+            code[1] is < '0' or > '9' ||
+            code[2] is < '0' or > '9')
+        {
+            return false;
+        }
+
+        if (statusLine.Length > 12)
+        {
+            if (statusLine[12] != ' ' || !IsValidHttpFieldValue(statusLine[13..]))
+            {
+                return false;
+            }
+        }
+
+        statusCode = ((code[0] - '0') * 100) + ((code[1] - '0') * 10) + (code[2] - '0');
+        return true;
+    }
+
+    private static ReadOnlySpan<char> TrimHttpOws(ReadOnlySpan<char> value)
+    {
+        while (!value.IsEmpty && value[0] is ' ' or '\t')
+        {
+            value = value[1..];
+        }
+
+        while (!value.IsEmpty && value[^1] is ' ' or '\t')
+        {
+            value = value[..^1];
+        }
+
+        return value;
+    }
+
+    private static bool IsValidHttpFieldName(ReadOnlySpan<char> name)
+    {
+        if (name.IsEmpty)
+        {
+            return false;
+        }
+
+        foreach (var current in name)
+        {
+            if (!(char.IsAsciiLetterOrDigit(current) ||
+                  current is '!' or '#' or '$' or '%' or '&' or '\'' or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsValidHttpFieldValue(ReadOnlySpan<char> value)
+    {
+        foreach (var current in value)
+        {
+            if (current != '\t' && (current < ' ' || current == '\x7f'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryParseContentLength(ReadOnlySpan<char> value, out int contentLength)
+    {
+        contentLength = 0;
+        if (value.IsEmpty)
+        {
+            return false;
+        }
+
+        foreach (var current in value)
+        {
+            if (current is < '0' or > '9')
+            {
+                return false;
+            }
+
+            var digit = current - '0';
+            if (contentLength > (int.MaxValue - digit) / 10)
+            {
+                return false;
+            }
+
+            contentLength = (contentLength * 10) + digit;
+        }
+
+        return true;
+    }
+
+    private static void EnsureExactContentLength(int actualLength, int expectedLength)
+    {
+        if (actualLength == expectedLength)
+        {
+            return;
+        }
+
+        throw new IOException(
+            actualLength < expectedLength
+                ? "Verification endpoint returned a truncated Content-Length body."
+                : "Verification endpoint returned bytes after the declared Content-Length body.");
     }
 
     private static int FindHeaderEnd(ReadOnlySpan<byte> data)
@@ -446,6 +614,7 @@ internal sealed class VpnConnectivityVerifier
             offset = lineEnd + 2;
             if (chunkSize == 0)
             {
+                ValidateChunkedMessageEnd(body, offset);
                 return decodedLength;
             }
 
@@ -471,6 +640,73 @@ internal sealed class VpnConnectivityVerifier
             offset += 2;
         }
     }
+
+    private static void ValidateChunkedMessageEnd(ReadOnlySpan<byte> body, int offset)
+    {
+        while (true)
+        {
+            var lineEnd = FindCrlf(body, offset);
+            if (lineEnd < 0)
+            {
+                throw new IOException(
+                    "Chunked verification response ended before the trailer terminator.");
+            }
+
+            var trailerLine = body[offset..lineEnd];
+            offset = lineEnd + 2;
+            if (trailerLine.IsEmpty)
+            {
+                if (offset != body.Length)
+                {
+                    throw new IOException(
+                        "Verification endpoint returned bytes after the complete chunked message.");
+                }
+
+                return;
+            }
+
+            if (!IsValidTrailerField(trailerLine))
+            {
+                throw new IOException("Verification endpoint returned a malformed HTTP trailer field.");
+            }
+        }
+    }
+
+    private static bool IsValidTrailerField(ReadOnlySpan<byte> line)
+    {
+        var colon = line.IndexOf((byte)':');
+        if (colon <= 0)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < colon; index++)
+        {
+            if (!IsHttpTokenByte(line[index]))
+            {
+                return false;
+            }
+        }
+
+        for (var index = colon + 1; index < line.Length; index++)
+        {
+            var current = line[index];
+            if (current != (byte)'\t' && (current < 0x20 || current == 0x7f))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsHttpTokenByte(byte value) =>
+        value is >= (byte)'0' and <= (byte)'9' or
+            >= (byte)'A' and <= (byte)'Z' or
+            >= (byte)'a' and <= (byte)'z' ||
+        value is (byte)'!' or (byte)'#' or (byte)'$' or (byte)'%' or (byte)'&' or
+            (byte)'\'' or (byte)'*' or (byte)'+' or (byte)'-' or (byte)'.' or
+            (byte)'^' or (byte)'_' or (byte)'`' or (byte)'|' or (byte)'~';
 
     private static bool TryParseChunkSize(ReadOnlySpan<byte> sizeLine, out int chunkSize)
     {
@@ -528,7 +764,10 @@ internal sealed class VpnConnectivityVerifier
         return value == (byte)' ' || value is >= 0x09 and <= 0x0D;
     }
 
-    private readonly record struct HttpBodyMetadata(int BodyOffset, bool IsChunked);
+    private readonly record struct HttpBodyMetadata(
+        int BodyOffset,
+        bool IsChunked,
+        int? ContentLength);
 
     private static int FindCrlf(ReadOnlySpan<byte> data, int start)
     {

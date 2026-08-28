@@ -78,8 +78,8 @@ internal static class VerificationParserSetupSelfTests
         string[] accepted =
         [
             "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n203.0.113.7",
-            "HTTP/1.1   204   No Content\r\nX-Test: yes\r\n\r\n",
-            "HTTP/1.1 200 OK\r\ntRaNsFeR-EnCoDiNg: x-chunked-value\r\n\r\nB\r\n203.0.113.7\r\n0\r\n\r\n"
+            "HTTP/1.1 204 No Content\r\nX-Test: yes\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\ntRaNsFeR-EnCoDiNg: chunked\r\n\r\nB\r\n203.0.113.7\r\n0\r\n\r\n"
         ];
 
         foreach (var raw in accepted)
@@ -99,19 +99,18 @@ internal static class VerificationParserSetupSelfTests
             "HTTP/1.1 302 Found\r\nLocation: https://other.example/\r\n\r\n",
             "HTTP/1.1 nope OK\r\nContent-Length: 0\r\n\r\n",
             "HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n",
-            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n",
+            "HTTP/1.1   204   No Content\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: x-chunked-value\r\n\r\nB\r\n203.0.113.7\r\n0\r\n\r\n"
         ];
 
         foreach (var raw in rejected)
         {
             var response = Encoding.ASCII.GetBytes(raw);
-            var optimizedRejected = ThrowsIOException(
-                () => VpnConnectivityVerifier.ParseHttpSuccessBody(response));
-            var predecessorRejected = ThrowsIOException(() => SplitLinqPredecessor(response));
-            if (optimizedRejected != predecessorRejected || !optimizedRejected)
+            if (!ThrowsIOException(() => VpnConnectivityVerifier.ParseHttpSuccessBody(response)))
             {
                 throw new InvalidOperationException(
-                    "Verification parser changed rejection behavior for malformed/unsuccessful response.");
+                    "Verification parser accepted malformed, ambiguous or unsupported response framing.");
             }
         }
     }

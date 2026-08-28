@@ -79,10 +79,10 @@ internal static class VerificationChunkedDecodeSelfTests
         string[] accepted =
         [
             "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
-            " 4 \t;foo=bar\r\nWiki\r\nA\r\n0123456789\r\n0;ignored=yes\r\ntrailers ignored",
-            "00000004\r\nWiki\r\n0\r\nignored",
-            "\t4\t;ext=value\r\nWiki\r\n0\r\n",
-            "0\r\nanything-after-zero-is-ignored"
+            " 4 \t;foo=bar\r\nWiki\r\nA\r\n0123456789\r\n0;ignored=yes\r\nX-Trailer: complete\r\n\r\n",
+            "00000004\r\nWiki\r\n0\r\n\r\n",
+            "\t4\t;ext=value\r\nWiki\r\n0\r\n\r\n",
+            "0\r\n\r\n"
         ];
 
         foreach (var raw in accepted)
@@ -106,19 +106,21 @@ internal static class VerificationChunkedDecodeSelfTests
             "4 0\r\n",
             "4\r\nWik",
             "4\r\nWikiXX0\r\n",
-            "4\r\nWiki\rX0\r\n"
+            "4\r\nWiki\rX0\r\n",
+            "0\r\n",
+            "0\r\nanything-after-zero-is-ignored",
+            "4\r\nWiki\r\n0\r\nignored",
+            "4\r\nWiki\r\n0\r\n\r\nextra",
+            "0\r\nBadTrailer\r\n\r\n"
         ];
 
         foreach (var raw in rejected)
         {
             var body = Encoding.ASCII.GetBytes(raw);
-            var optimizedRejected = ThrowsIOException(
-                () => VpnConnectivityVerifier.DecodeChunkedBody(body));
-            var predecessorRejected = ThrowsIOException(() => LegacyDecodeChunkedBody(body));
-            if (optimizedRejected != predecessorRejected || !optimizedRejected)
+            if (!ThrowsIOException(() => VpnConnectivityVerifier.DecodeChunkedBody(body)))
             {
                 throw new InvalidOperationException(
-                    $"Chunk decoder changed rejection behavior for '{Escape(raw)}'.");
+                    $"Chunk decoder accepted malformed/incomplete framing for '{Escape(raw)}'.");
             }
         }
     }
