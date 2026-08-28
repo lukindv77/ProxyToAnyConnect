@@ -30,7 +30,7 @@ jobs:
 
           $expectedProxyBlob = '5b691ba85239497ce975753faef72e35fa0ee967'
           $expectedRunnerBlob = '9c4e48cafa22674ee76bf8689c9d2e6a63f74a47'
-          $expectedTransformBlob = 'd4b1332a30722d01d575206e9790cf86f61c29e0'
+          $expectedTransformBlob = 'ff87b3fab37a18c42422a8cec17348cfc031fc89'
           $expectedTestBlob = 'ab8756fde9b350eb06231a8515835e510671bb9b'
 
           if ((git rev-parse "$expectedBase`:src/ProxyToAnyConnect/Proxy/ProxyServer.cs").Trim() -ne $expectedProxyBlob) {
