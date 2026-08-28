@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using ProxyToAnyConnect.Network;
 
@@ -23,6 +25,7 @@ internal static class DnsQuerySetupSelfTests
         try
         {
             QueryWireFormatAndValidationMatchCurrentSemantics();
+            ResolverAuthorityNormalizationIsFailClosed();
 
             for (var i = 0; i < WarmupIterations; i++)
             {
@@ -93,6 +96,99 @@ internal static class DnsQuerySetupSelfTests
         AssertBothReject("example.");
         AssertBothReject(new string('a', 64) + ".example");
     }
+
+    private static void ResolverAuthorityNormalizationIsFailClosed()
+    {
+        if (!L2tpDnsResolver.NormalizeDnsName("EXAMPLE.COM").Equals("example.com", StringComparison.Ordinal) ||
+            !L2tpDnsResolver.NormalizeDnsName("münich.example").Equals("xn--mnich-kva.example", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Resolver DNS-name normalization did not preserve canonical IDNA/lowercase semantics.");
+        }
+
+        foreach (var invalid in new[]
+                 {
+                     " edge.example",
+                     "edge.example ",
+                     "\tedge.example",
+                     "edge.example\t",
+                     "edge.example\r"
+                 })
+        {
+            if (!ThrowsInvalidHost(() => L2tpDnsResolver.NormalizeDnsName(invalid)))
+            {
+                throw new InvalidOperationException(
+                    $"Resolver silently normalized whitespace/control-bearing DNS identity '{EscapeForDiagnostic(invalid)}'.");
+            }
+        }
+
+        var canonicalLiteral = L2tpDnsResolver.ParseCanonicalIPv4Literal("127.0.0.1");
+        if (canonicalLiteral is null || !canonicalLiteral.Equals(IPAddress.Loopback))
+        {
+            throw new InvalidOperationException("Resolver did not preserve the canonical IPv4 literal boundary.");
+        }
+
+        if (L2tpDnsResolver.ParseCanonicalIPv4Literal("example.com") is not null)
+        {
+            throw new InvalidOperationException("Resolver misclassified a DNS name as an IPv4 literal.");
+        }
+
+        foreach (var legacy in DetectRuntimeLegacyIpv4Forms())
+        {
+            if (!ThrowsInvalidHost(() => L2tpDnsResolver.ParseCanonicalIPv4Literal(legacy)))
+            {
+                throw new InvalidOperationException(
+                    $"Resolver accepted runtime-recognized non-canonical IPv4 identity '{legacy}'.");
+            }
+        }
+    }
+
+    private static string[] DetectRuntimeLegacyIpv4Forms()
+    {
+        string[] candidates =
+        [
+            "127.1",
+            "127.0.1",
+            "2130706433",
+            "0x7f000001",
+            "017700000001",
+            "0177.0.0.1",
+            "127.000.000.001"
+        ];
+
+        var detected = candidates
+            .Where(candidate =>
+                IPAddress.TryParse(candidate, out var address) &&
+                address.AddressFamily == AddressFamily.InterNetwork &&
+                !candidate.Equals(address.ToString(), StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (detected.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "The current Windows/.NET runtime did not recognize any legacy IPv4 form from the DNS resolver regression matrix.");
+        }
+
+        return detected;
+    }
+
+    private static bool ThrowsInvalidHost(Action action)
+    {
+        try
+        {
+            action();
+            return false;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+        {
+            return true;
+        }
+    }
+
+    private static string EscapeForDiagnostic(string value) =>
+        value.Replace("\r", "\\r", StringComparison.Ordinal)
+            .Replace("\n", "\\n", StringComparison.Ordinal)
+            .Replace("\t", "\\t", StringComparison.Ordinal);
 
     private static void AssertBothReject(string host)
     {

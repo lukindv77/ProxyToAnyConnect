@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using ProxyToAnyConnect.Configuration;
 using ProxyToAnyConnect.Vpn;
@@ -20,7 +22,7 @@ internal static class VerificationProbeRequestSelfTests
         try
         {
             RequestWireBytesRemainEquivalent();
-            IdnHostIsCanonicalizedOnWire();
+            HostAuthorityIsCanonicalizedOnWire();
             InvalidRequestTargetsAreRejectedByBuilder();
             InvalidHostsAreRejectedByBuilder();
 
@@ -103,15 +105,32 @@ internal static class VerificationProbeRequestSelfTests
         }
     }
 
-    private static void IdnHostIsCanonicalizedOnWire()
+    private static void HostAuthorityIsCanonicalizedOnWire()
     {
-        var request = Encoding.ASCII.GetString(
+        var idnRequest = Encoding.ASCII.GetString(
             VpnConnectivityVerifier.BuildProbeRequest("münich.example", "/?format=text"));
-        if (!request.Contains("\r\nHost: xn--mnich-kva.example\r\n", StringComparison.Ordinal) ||
-            request.Contains("m?nich", StringComparison.Ordinal))
+        if (!idnRequest.Contains("\r\nHost: xn--mnich-kva.example\r\n", StringComparison.Ordinal) ||
+            idnRequest.Contains("m?nich", StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
-                $"Verification request did not emit the canonical IDNA Host authority: {request}");
+                $"Verification request did not emit the canonical IDNA Host authority: {idnRequest}");
+        }
+
+        var asciiRequest = Encoding.ASCII.GetString(
+            VpnConnectivityVerifier.BuildProbeRequest("API.IPIFY.ORG", "/"));
+        if (!asciiRequest.Contains("\r\nHost: api.ipify.org\r\n", StringComparison.Ordinal) ||
+            asciiRequest.Contains("Host: API.IPIFY.ORG", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Verification request did not emit the canonical lowercase ASCII authority: {asciiRequest}");
+        }
+
+        var ipv4Request = Encoding.ASCII.GetString(
+            VpnConnectivityVerifier.BuildProbeRequest("127.0.0.1", "/"));
+        if (!ipv4Request.Contains("\r\nHost: 127.0.0.1\r\n", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Verification request did not preserve the canonical IPv4 authority: {ipv4Request}");
         }
     }
 
@@ -146,14 +165,17 @@ internal static class VerificationProbeRequestSelfTests
 
     private static void InvalidHostsAreRejectedByBuilder()
     {
-        foreach (var invalid in new string?[]
-                 {
-                     null,
-                     string.Empty,
-                     "bad host.example",
-                     "line\r\nhost.example",
-                     "bad_.example"
-                 })
+        var invalidHosts = new List<string?>
+        {
+            null,
+            string.Empty,
+            "bad host.example",
+            "line\r\nhost.example",
+            "bad_.example"
+        };
+        invalidHosts.AddRange(DetectRuntimeLegacyIpv4Forms());
+
+        foreach (var invalid in invalidHosts)
         {
             try
             {
@@ -167,6 +189,36 @@ internal static class VerificationProbeRequestSelfTests
             throw new InvalidOperationException(
                 $"Verification request builder accepted invalid host '{EscapeForDiagnostic(invalid)}'.");
         }
+    }
+
+    private static string[] DetectRuntimeLegacyIpv4Forms()
+    {
+        string[] candidates =
+        [
+            "127.1",
+            "127.0.1",
+            "2130706433",
+            "0x7f000001",
+            "017700000001",
+            "0177.0.0.1",
+            "127.000.000.001"
+        ];
+
+        var detected = candidates
+            .Where(candidate =>
+                IPAddress.TryParse(candidate, out var address) &&
+                address.AddressFamily == AddressFamily.InterNetwork &&
+                !candidate.Equals(address.ToString(), StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (detected.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "The current Windows/.NET runtime did not recognize any legacy IPv4 form from the request-builder regression matrix.");
+        }
+
+        return detected;
     }
 
     private static string EscapeForDiagnostic(string? value) =>

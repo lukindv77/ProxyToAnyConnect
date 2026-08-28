@@ -32,13 +32,9 @@ internal sealed class L2tpDnsResolver
         VpnContext context,
         CancellationToken cancellationToken)
     {
-        if (IPAddress.TryParse(host, out var literal))
+        var literal = ParseCanonicalIPv4Literal(host);
+        if (literal is not null)
         {
-            if (literal.AddressFamily != AddressFamily.InterNetwork)
-            {
-                throw new NotSupportedException("IPv6 targets are not supported yet.");
-            }
-
             return [literal];
         }
 
@@ -83,6 +79,29 @@ internal sealed class L2tpDnsResolver
 
         throw new InvalidOperationException(
             $"Unable to resolve '{host}' through the L2TP DNS servers.", lastError);
+    }
+
+    internal static IPAddress? ParseCanonicalIPv4Literal(string host)
+    {
+        ArgumentNullException.ThrowIfNull(host);
+        if (!IPAddress.TryParse(host, out var literal))
+        {
+            return null;
+        }
+
+        if (literal.AddressFamily != AddressFamily.InterNetwork)
+        {
+            throw new NotSupportedException("IPv6 targets are not supported yet.");
+        }
+
+        var canonicalLiteral = literal.ToString();
+        if (!host.Equals(canonicalLiteral, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"IPv4 literal '{host}' is not in canonical dotted-decimal form.");
+        }
+
+        return literal;
     }
 
     private async Task<DnsResolutionResult> QueryAsync(
@@ -598,8 +617,8 @@ internal sealed class L2tpDnsResolver
         }
     }
 
-    private static string NormalizeDnsName(string host) =>
-        NormalizeDnsHostStrict(host.Trim());
+    internal static string NormalizeDnsName(string host) =>
+        NormalizeDnsHostStrict(host);
 
     internal static string NormalizeDnsHostStrict(string host)
     {
