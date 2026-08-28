@@ -8,6 +8,7 @@ on:
       - .github/workflows/dev-issue66-dns-response-binding.yml
       - .github/validation/issue66-transform.ps1
       - .github/validation/issue66-normalize-transform.ps1
+      - .github/validation/issue66-post-transform.ps1
 
 permissions:
   contents: write
@@ -36,12 +37,16 @@ jobs:
           if ((git rev-parse HEAD:.github/validation/issue66-normalize-transform.ps1).Trim() -ne 'c13738d00edea33f5feb391287e548223472b318') {
             throw 'Unexpected issue66 transform-normalizer blob.'
           }
+          if ((git rev-parse HEAD:.github/validation/issue66-post-transform.ps1).Trim() -ne 'c5903d57f4a4c50afad85959e745f373a41a5355') {
+            throw 'Unexpected issue66 post-transform blob.'
+          }
 
           $expectedBlobs = [ordered]@{
             'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs' = '01e37499c2f3f312b97e1dac924e91d49a3409f3'
             'tests/ProxyToAnyConnect.SelfTests/Program.cs' = '493235315a5d0165f85fa277c933ebeda53d5620'
             'tests/ProxyToAnyConnect.SelfTests/DnsResponseAddressListSelfTests.cs' = '1814583d0edaf715f130b6ddc9b984878852e968'
             'tests/ProxyToAnyConnect.SelfTests/DnsAResultStorageSelfTests.cs' = '9bdf5f71fa4e85328e9e1b4d94fadc8508796734'
+            'tests/ProxyToAnyConnect.SelfTests/DnsNameSkipSelfTests.cs' = '7fd06482d571905fb10dd67e7cd4e71646acee73'
             'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs' = 'e6c37332c7de71618c55bb01a0b28e0f1f1ddb7a'
           }
           foreach ($entry in $expectedBlobs.GetEnumerator()) {
@@ -53,12 +58,14 @@ jobs:
 
           & ./.github/validation/issue66-normalize-transform.ps1
           & ./.github/validation/issue66-transform.ps1
+          & ./.github/validation/issue66-post-transform.ps1
 
           $expectedPaths = @(
             'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs'
             'tests/ProxyToAnyConnect.SelfTests/Program.cs'
             'tests/ProxyToAnyConnect.SelfTests/DnsResponseAddressListSelfTests.cs'
             'tests/ProxyToAnyConnect.SelfTests/DnsAResultStorageSelfTests.cs'
+            'tests/ProxyToAnyConnect.SelfTests/DnsNameSkipSelfTests.cs'
             'tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs'
             'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
           ) | Sort-Object
