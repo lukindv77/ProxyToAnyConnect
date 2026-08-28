@@ -1,0 +1,51 @@
+name: dev-issue70-monitor-invalidation
+
+on:
+  push:
+    branches:
+      - dev/issue70-monitor-invalidation
+    paths:
+      - .github/workflows/dev-issue70-monitor-invalidation.yml
+      - src/ProxyToAnyConnect/Vpn/RasConnectionManager.Monitoring.cs
+      - tests/ProxyToAnyConnect.SelfTests/RasMonitorFailClosedOrderingSelfTests.cs
+      - tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Verify issue 70 source surface
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = 'e43491ae2f12ed430c9b6d13d2787a269cf41a67'
+          git merge-base --is-ancestor $expectedBase HEAD
+          git config core.whitespace cr-at-eol
+          git diff --check "$expectedBase...HEAD"
+
+          $expectedPaths = @(
+            '.github/workflows/dev-issue70-monitor-invalidation.yml'
+            'src/ProxyToAnyConnect/Vpn/RasConnectionManager.Monitoring.cs'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+            'tests/ProxyToAnyConnect.SelfTests/RasMonitorFailClosedOrderingSelfTests.cs'
+          ) | Sort-Object
+          $changed = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
+          if (($changed -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #70 branch surface: $($changed -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
