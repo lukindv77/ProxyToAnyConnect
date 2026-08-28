@@ -62,10 +62,16 @@ internal sealed class DailyJsonlLogStore : IDisposable
                 _rootDirectory,
                 localDate,
                 out var pathChanged);
+            var monthDirectory = Path.GetDirectoryName(fullPath)!;
             if (pathChanged)
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+                Directory.CreateDirectory(monthDirectory);
             }
+
+            // A yyyy-MM name is not filesystem ownership proof. Reject month/file
+            // reparse points before opening the append handle so a junction/symlink
+            // cannot redirect structured logging outside the configured tree.
+            EnsureRegularAppendPath(monthDirectory, fullPath);
 
             // Append exactly one JSONL record. The existing file is never read or
             // rewritten as part of logging. Closing the handle after the append keeps
@@ -77,6 +83,12 @@ internal sealed class DailyJsonlLogStore : IDisposable
                 FileShare.ReadWrite | FileShare.Delete,
                 bufferSize: 4 * 1024,
                 FileOptions.SequentialScan);
+
+            // Re-check after opening but before the first write. This catches a path
+            // substitution that happened between the pre-open ownership check and
+            // FileStream construction; the already-open handle is still untouched.
+            EnsureRegularAppendPath(monthDirectory, fullPath);
+
             using var writer = new StreamWriter(
                 stream,
                 Utf8NoBom,
@@ -123,15 +135,18 @@ internal sealed class DailyJsonlLogStore : IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             var monthName = Path.GetFileName(monthDirectory);
-            if (!IsMonthDirectoryName(monthName))
+            if (!IsMonthDirectoryName(monthName) || !IsRegularDirectory(monthDirectory))
             {
+                // Never enumerate through a junction/symlink merely because its leaf
+                // name looks like an application-owned yyyy-MM log directory.
                 continue;
             }
 
             foreach (var filePath in Directory.EnumerateFiles(monthDirectory, "*.jsonl", SearchOption.TopDirectoryOnly))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!TryParseDailyFileName(Path.GetFileName(filePath), out var fileDate))
+                if (!IsRegularFile(filePath) ||
+                    !TryParseDailyFileName(Path.GetFileName(filePath), out var fileDate))
                 {
                     continue;
                 }
@@ -175,10 +190,64 @@ internal sealed class DailyJsonlLogStore : IDisposable
             DateTimeStyles.None,
             out _);
 
+    private static void EnsureRegularAppendPath(string monthDirectory, string filePath)
+    {
+        if (!IsRegularDirectory(monthDirectory))
+        {
+            throw new IOException(
+                $"Structured log month directory is not an ordinary owned directory: {monthDirectory}");
+        }
+
+        if (File.Exists(filePath) && !IsRegularFile(filePath))
+        {
+            throw new IOException(
+                $"Structured log daily file is not an ordinary owned file: {filePath}");
+        }
+    }
+
+    private static bool IsRegularDirectory(string path)
+    {
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            return (attributes & FileAttributes.Directory) != 0 &&
+                   (attributes & FileAttributes.ReparsePoint) == 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsRegularFile(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            return (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
     private static void TryDelete(string path)
     {
         try
         {
+            // Re-check immediately before deletion so a previously enumerated file
+            // that became a reparse point is preserved rather than treated as owned.
+            if (!IsRegularFile(path))
+            {
+                return;
+            }
+
             File.Delete(path);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -190,7 +259,13 @@ internal sealed class DailyJsonlLogStore : IDisposable
     {
         try
         {
-            if (!Directory.EnumerateFileSystemEntries(path).Any())
+            if (!IsRegularDirectory(path))
+            {
+                return;
+            }
+
+            if (!Directory.EnumerateFileSystemEntries(path).Any() &&
+                IsRegularDirectory(path))
             {
                 Directory.Delete(path);
             }
