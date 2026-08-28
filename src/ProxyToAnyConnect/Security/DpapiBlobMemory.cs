@@ -85,9 +85,9 @@ internal static class DpapiBlobMemory
         }
 
         var bytes = new byte[blob.Size];
-        observer?.Invoke(bytes);
         try
         {
+            observer?.Invoke(bytes);
             copy(blob.Data, bytes);
             return bytes;
         }
