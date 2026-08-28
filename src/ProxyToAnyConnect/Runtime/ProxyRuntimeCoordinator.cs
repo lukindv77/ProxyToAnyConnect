@@ -12,11 +12,14 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
     private readonly Dictionary<string, ProxyInstanceRuntime> _proxyById;
     private readonly HashSet<string> _pendingStartProxyIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _reconfigureGate = new(1, 1);
+    private readonly SemaphoreSlim _disposeGate = new(1, 1);
     private readonly object _collectionGate = new();
     private readonly CancellationTokenSource _lifetime = new();
     private readonly CancellationToken _lifetimeToken;
     private AppOptions _options;
+    private VpnLeaseManager[] _terminalCleanupVpns = [];
     private int _disposed;
+    private int _terminalCleanupCompleted;
 
     public ProxyRuntimeCoordinator(AppOptions options)
     {
@@ -623,83 +626,151 @@ internal sealed class ProxyRuntimeCoordinator : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    private async Task<Exception?> DisposeTerminalVpnOwnersAsync(
+        IReadOnlyList<VpnLeaseManager> vpns,
+        string phase,
+        Exception? primaryFailure)
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        var attempts = new Task<Exception?>[vpns.Count];
+        for (var index = 0; index < vpns.Count; index++)
         {
-            return;
+            attempts[index] = DisposeOneOwnedResourceAsync(vpns[index]);
         }
 
-        Exception? cleanupFailure = null;
-        var gateEntered = false;
+        var residual = new List<VpnLeaseManager>();
+        for (var index = 0; index < attempts.Length; index++)
+        {
+            var failure = await attempts[index];
+            if (failure is null)
+            {
+                continue;
+            }
+
+            residual.Add(vpns[index]);
+            if (primaryFailure is null)
+            {
+                primaryFailure = failure;
+            }
+            else
+            {
+                primaryFailure.Data[$"CoordinatorCleanup:{phase}:{index}"] =
+                    $"{failure.GetType().FullName}: {failure.Message}";
+            }
+        }
+
+        _terminalCleanupVpns = residual.ToArray();
+        return primaryFailure;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _disposeGate.WaitAsync();
         try
         {
-            // Cancel pending foreground lifecycle operations before waiting for their
-            // shared operation gate. A throwing linked-token callback is a cleanup
-            // defect, but it must not skip disposal of every nested proxy/VPN owner.
+            if (Volatile.Read(ref _terminalCleanupCompleted) != 0)
+            {
+                return;
+            }
+
+            var firstDispose = Interlocked.Exchange(ref _disposed, 1) == 0;
+            if (!firstDispose)
+            {
+                var retryFailure = await DisposeTerminalVpnOwnersAsync(
+                    _terminalCleanupVpns,
+                    "dispose-vpn-retry",
+                    primaryFailure: null);
+                if (_terminalCleanupVpns.Length == 0)
+                {
+                    Volatile.Write(ref _terminalCleanupCompleted, 1);
+                }
+
+                RethrowCoordinatorCleanupFailure(retryFailure);
+                return;
+            }
+
+            Exception? cleanupFailure = null;
+            var gateEntered = false;
             try
             {
-                _lifetime.Cancel();
+                // Cancel pending foreground lifecycle operations before waiting for their
+                // shared operation gate. A throwing linked-token callback is a cleanup
+                // defect, but it must not skip disposal of every nested proxy/VPN owner.
+                try
+                {
+                    _lifetime.Cancel();
+                }
+                catch (Exception ex)
+                {
+                    CaptureCoordinatorCleanupFailure(ref cleanupFailure, ex, "lifetime-cancel");
+                }
+
+                await _reconfigureGate.WaitAsync();
+                gateEntered = true;
+
+                ProxyInstanceRuntime[] proxies;
+                VpnLeaseManager[] vpns;
+                lock (_collectionGate)
+                {
+                    proxies = _proxyById.Values.ToArray();
+                    vpns = _vpnById.Values.ToArray();
+                    _proxyById.Clear();
+                    _vpnById.Clear();
+                    _pendingStartProxyIds.Clear();
+                }
+
+                cleanupFailure = await DisposeOwnedResourcesAsync(
+                    proxies.Cast<IAsyncDisposable>(),
+                    "dispose-proxy",
+                    cleanupFailure);
+                cleanupFailure = await DisposeTerminalVpnOwnersAsync(
+                    vpns,
+                    "dispose-vpn",
+                    cleanupFailure);
             }
             catch (Exception ex)
             {
-                CaptureCoordinatorCleanupFailure(ref cleanupFailure, ex, "lifetime-cancel");
+                CaptureCoordinatorCleanupFailure(ref cleanupFailure, ex, "dispose-body");
             }
-
-            await _reconfigureGate.WaitAsync();
-            gateEntered = true;
-
-            ProxyInstanceRuntime[] proxies;
-            VpnLeaseManager[] vpns;
-            lock (_collectionGate)
+            finally
             {
-                proxies = _proxyById.Values.ToArray();
-                vpns = _vpnById.Values.ToArray();
-                _proxyById.Clear();
-                _vpnById.Clear();
-                _pendingStartProxyIds.Clear();
+                if (gateEntered)
+                {
+                    _reconfigureGate.Release();
+                }
+
+                try
+                {
+                    _reconfigureGate.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    CaptureCoordinatorCleanupFailure(ref cleanupFailure, ex, "gate-token");
+                }
+
+                try
+                {
+                    _lifetime.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    CaptureCoordinatorCleanupFailure(ref cleanupFailure, ex, "lifetime-token");
+                }
             }
 
-            cleanupFailure = await DisposeOwnedResourcesAsync(
-                proxies.Cast<IAsyncDisposable>(),
-                "dispose-proxy",
-                cleanupFailure);
-            cleanupFailure = await DisposeOwnedResourcesAsync(
-                vpns.Cast<IAsyncDisposable>(),
-                "dispose-vpn",
-                cleanupFailure);
-        }
-        catch (Exception ex)
-        {
-            CaptureCoordinatorCleanupFailure(ref cleanupFailure, ex, "dispose-body");
+            if (_terminalCleanupVpns.Length == 0)
+            {
+                Volatile.Write(ref _terminalCleanupCompleted, 1);
+            }
+
+            RethrowCoordinatorCleanupFailure(cleanupFailure);
         }
         finally
         {
-            if (gateEntered)
-            {
-                _reconfigureGate.Release();
-            }
-
-            try
-            {
-                _reconfigureGate.Dispose();
-            }
-            catch (Exception ex)
-            {
-                CaptureCoordinatorCleanupFailure(ref cleanupFailure, ex, "gate-token");
-            }
-
-            try
-            {
-                _lifetime.Dispose();
-            }
-            catch (Exception ex)
-            {
-                CaptureCoordinatorCleanupFailure(ref cleanupFailure, ex, "lifetime-token");
-            }
+            // Keep this managed gate alive for a possible later cleanup-only retry.
+            // AvailableWaitHandle is never requested, so collection of the coordinator
+            // after terminal cleanup releases it without an OS-handle leak.
+            _disposeGate.Release();
         }
-
-        RethrowCoordinatorCleanupFailure(cleanupFailure);
     }
 }
 

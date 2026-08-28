@@ -7,11 +7,13 @@ namespace ProxyToAnyConnect.Runtime;
 internal sealed class ProxyRuntimeHost : IAsyncDisposable
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly SemaphoreSlim _disposeGate = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
     private readonly CancellationToken _lifetimeToken;
     private ProxyRuntimeCoordinator? _current;
     private string? _configurationError;
     private int _disposed;
+    private int _terminalCleanupCompleted;
 
     public ProxyRuntimeHost(AppOptions initialOptions)
     {
@@ -20,7 +22,8 @@ internal sealed class ProxyRuntimeHost : IAsyncDisposable
         TryBuildInitial(initialOptions);
     }
 
-    public ProxyRuntimeCoordinator? Current => Volatile.Read(ref _current);
+    public ProxyRuntimeCoordinator? Current =>
+        Volatile.Read(ref _disposed) != 0 ? null : Volatile.Read(ref _current);
     public string? ConfigurationError => Volatile.Read(ref _configurationError);
 
     public async Task StartEnabledAsync(CancellationToken cancellationToken = default)
@@ -171,66 +174,111 @@ internal sealed class ProxyRuntimeHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
-        {
-            return;
-        }
-
-        Exception? cleanupFailure = null;
-
-        // Wake any foreground Start/Pause/Apply operation before waiting for the
-        // host gate it may currently own. A throwing linked-token callback is a
-        // cleanup defect, but it must not prevent disposal of the exact coordinator.
+        await _disposeGate.WaitAsync();
         try
         {
-            _lifetime.Cancel();
-        }
-        catch (Exception ex)
-        {
-            CaptureHostCleanupFailure(ref cleanupFailure, ex, "lifetime-cancel");
-        }
-
-        await _gate.WaitAsync();
-        try
-        {
-            var runtime = Interlocked.Exchange(ref _current, null);
-            if (runtime is not null)
+            if (Volatile.Read(ref _terminalCleanupCompleted) != 0)
             {
+                return;
+            }
+
+            var firstDispose = Interlocked.Exchange(ref _disposed, 1) == 0;
+            if (!firstDispose)
+            {
+                var retained = Volatile.Read(ref _current);
+                if (retained is null)
+                {
+                    Volatile.Write(ref _terminalCleanupCompleted, 1);
+                    return;
+                }
+
+                await retained.DisposeAsync();
+                _ = Interlocked.CompareExchange(ref _current, null, retained);
+                if (Volatile.Read(ref _current) is null)
+                {
+                    Volatile.Write(ref _terminalCleanupCompleted, 1);
+                }
+                return;
+            }
+
+            Exception? cleanupFailure = null;
+            var gateEntered = false;
+
+            // Wake any foreground Start/Pause/Apply operation before waiting for the
+            // host gate it may currently own. A throwing linked-token callback is a
+            // cleanup defect, but it must not prevent disposal of the exact coordinator.
+            try
+            {
+                _lifetime.Cancel();
+            }
+            catch (Exception ex)
+            {
+                CaptureHostCleanupFailure(ref cleanupFailure, ex, "lifetime-cancel");
+            }
+
+            try
+            {
+                await _gate.WaitAsync();
+                gateEntered = true;
+                var runtime = Volatile.Read(ref _current);
+                if (runtime is not null)
+                {
+                    try
+                    {
+                        await runtime.DisposeAsync();
+                        _ = Interlocked.CompareExchange(ref _current, null, runtime);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Keep the exact coordinator private as cleanup-only ownership.
+                        // Public Current is already hidden once _disposed is set, and a
+                        // later DisposeAsync call can retry the coordinator's residual VPNs.
+                        CaptureHostCleanupFailure(ref cleanupFailure, ex, "coordinator-dispose");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                CaptureHostCleanupFailure(ref cleanupFailure, ex, "dispose-body");
+            }
+            finally
+            {
+                if (gateEntered)
+                {
+                    _gate.Release();
+                }
+
                 try
                 {
-                    await runtime.DisposeAsync();
+                    _gate.Dispose();
                 }
                 catch (Exception ex)
                 {
-                    CaptureHostCleanupFailure(ref cleanupFailure, ex, "coordinator-dispose");
+                    CaptureHostCleanupFailure(ref cleanupFailure, ex, "gate-token");
+                }
+
+                try
+                {
+                    _lifetime.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    CaptureHostCleanupFailure(ref cleanupFailure, ex, "lifetime-token");
                 }
             }
+
+            if (Volatile.Read(ref _current) is null)
+            {
+                Volatile.Write(ref _terminalCleanupCompleted, 1);
+            }
+
+            RethrowHostCleanupFailure(cleanupFailure);
         }
         finally
         {
-            _gate.Release();
-            try
-            {
-                _gate.Dispose();
-            }
-            catch (Exception ex)
-            {
-                CaptureHostCleanupFailure(ref cleanupFailure, ex, "gate-token");
-            }
-
-            try
-            {
-                _lifetime.Dispose();
-            }
-            catch (Exception ex)
-            {
-                CaptureHostCleanupFailure(ref cleanupFailure, ex, "lifetime-token");
-            }
+            _disposeGate.Release();
         }
-
-        RethrowHostCleanupFailure(cleanupFailure);
     }
-
     private static void CaptureHostCleanupFailure(
         ref Exception? primaryFailure,
         Exception failure,

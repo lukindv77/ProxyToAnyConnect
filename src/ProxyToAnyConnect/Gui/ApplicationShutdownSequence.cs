@@ -21,14 +21,28 @@ internal static class ApplicationShutdownSequence
             "configuration-command-queue",
             stopConfigurationCommandsAsync,
             failures);
+        var failureCountBeforeRuntime = failures.Count;
         await TryPhaseAsync(
             "runtime-host",
             async () => await disposeRuntimeAsync(),
             failures);
+        var runtimeFailed = failures.Count != failureCountBeforeRuntime;
+
+        // Every independent first-pass owner is still attempted before retrying the
+        // runtime. This keeps shutdown latency bounded by one extra exact-host cleanup
+        // attempt without letting a transient RAS teardown defect skip memory cleanup.
         await TryPhaseAsync(
             "memory-monitor",
             async () => await disposeMemoryMonitorAsync(),
             failures);
+
+        if (runtimeFailed)
+        {
+            await TryPhaseAsync(
+                "runtime-host-retry",
+                async () => await disposeRuntimeAsync(),
+                failures);
+        }
 
         return failures;
     }
