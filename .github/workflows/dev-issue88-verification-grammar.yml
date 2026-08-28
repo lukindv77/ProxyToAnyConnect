@@ -39,11 +39,15 @@ jobs:
             }
           }
           if ((git rev-parse 'HEAD:.github/validation/issue88-transform.ps1').Trim() -ne 'd7679f7098cdbf4d2876cd6071050181ac511d51') {
-            throw 'Unexpected #88 transform blob.'
+            throw 'Unexpected #88 primary transform blob.'
+          }
+          if ((git rev-parse 'HEAD:.github/validation/issue88-finalize-transform.ps1').Trim() -ne '47f0bd84c76839f7b252fe219baa5d0f30d7f6be') {
+            throw 'Unexpected #88 finalizer transform blob.'
           }
 
           $expectedSurface = @(
             '.github/validation/issue88-transform.ps1'
+            '.github/validation/issue88-finalize-transform.ps1'
             '.github/workflows/dev-issue88-verification-grammar.yml'
           ) | Sort-Object
           $surface = @(git diff --name-only "$expectedBase...HEAD" | Sort-Object)
@@ -51,7 +55,17 @@ jobs:
             throw "Unexpected #88 branch surface: $($surface -join ', ')"
           }
 
-          & ./.github/validation/issue88-transform.ps1
+          try {
+            & ./.github/validation/issue88-transform.ps1
+            throw 'Issue 88 primary transform unexpectedly passed its deliberately superseded HTTP-test anchor.'
+          }
+          catch {
+            if ($_.Exception.Message -ne 'Missing missing status separator regression anchor.') {
+              throw
+            }
+          }
+          & ./.github/validation/issue88-finalize-transform.ps1
+
           git add -- `
             src/ProxyToAnyConnect/Vpn/VpnConnectivityVerifier.cs `
             tests/ProxyToAnyConnect.SelfTests/VerificationChunkedDecodeSelfTests.cs `
