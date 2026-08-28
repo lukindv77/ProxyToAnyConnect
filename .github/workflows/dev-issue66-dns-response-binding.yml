@@ -1,0 +1,81 @@
+name: dev-issue66-dns-response-binding
+
+on:
+  push:
+    branches:
+      - dev/issue66-dns-response-binding
+    paths:
+      - .github/workflows/dev-issue66-dns-response-binding.yml
+      - .github/validation/issue66-transform.ps1
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 66 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = 'c0833662d88b3817693d979bf135dbba0093489f'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          if ((git rev-parse HEAD:.github/validation/issue66-transform.ps1).Trim() -ne '9573ecc32833abc78485bcf8ff26fa54616a5136') {
+            throw 'Unexpected issue66 transform blob.'
+          }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs' = '01e37499c2f3f312b97e1dac924e91d49a3409f3'
+            'tests/ProxyToAnyConnect.SelfTests/Program.cs' = '493235315a5d0165f85fa277c933ebeda53d5620'
+            'tests/ProxyToAnyConnect.SelfTests/DnsResponseAddressListSelfTests.cs' = '1814583d0edaf715f130b6ddc9b984878852e968'
+            'tests/ProxyToAnyConnect.SelfTests/DnsAResultStorageSelfTests.cs' = '9bdf5f71fa4e85328e9e1b4d94fadc8508796734'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs' = 'e6c37332c7de71618c55bb01a0b28e0f1f1ddb7a'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) {
+              throw "Unexpected base blob for $($entry.Key): $actual"
+            }
+          }
+
+          & ./.github/validation/issue66-transform.ps1
+
+          $expectedPaths = @(
+            'src/ProxyToAnyConnect/Network/L2tpDnsResolver.cs'
+            'tests/ProxyToAnyConnect.SelfTests/Program.cs'
+            'tests/ProxyToAnyConnect.SelfTests/DnsResponseAddressListSelfTests.cs'
+            'tests/ProxyToAnyConnect.SelfTests/DnsAResultStorageSelfTests.cs'
+            'tests/ProxyToAnyConnect.SelfTests/DnsResponseBindingSelfTests.cs'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+          ) | Sort-Object
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #66 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 66 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'dns: bind responses to exact queried owner'
+          git push origin HEAD:dev/issue66-dns-response-binding
