@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using ProxyToAnyConnect.Security;
 
 namespace ProxyToAnyConnect.Configuration;
 
@@ -46,10 +47,7 @@ internal static class DpapiSecretProtector
             }
             finally
             {
-                if (output.Data != 0)
-                {
-                    _ = LocalFree(output.Data);
-                }
+                FreeBlob(output, localAlloc: true);
             }
         }
         finally
@@ -114,10 +112,7 @@ internal static class DpapiSecretProtector
             }
             finally
             {
-                if (output.Data != 0)
-                {
-                    _ = LocalFree(output.Data);
-                }
+                FreeBlob(output, localAlloc: true);
             }
         }
         finally
@@ -140,11 +135,27 @@ internal static class DpapiSecretProtector
         return new DataBlob { Size = bytes.Length, Data = pointer };
     }
 
-    private static void FreeBlob(DataBlob blob)
+    private static void FreeBlob(DataBlob blob, bool localAlloc = false)
     {
-        if (blob.Data != 0)
+        if (blob.Data == 0)
         {
-            Marshal.FreeHGlobal(blob.Data);
+            return;
+        }
+
+        try
+        {
+            UnmanagedSecretMemory.Zero(blob.Data, blob.Size);
+        }
+        finally
+        {
+            if (localAlloc)
+            {
+                _ = LocalFree(blob.Data);
+            }
+            else
+            {
+                Marshal.FreeHGlobal(blob.Data);
+            }
         }
     }
 
