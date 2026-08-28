@@ -1,0 +1,76 @@
+name: dev-issue71-residual-vpn-owner
+
+on:
+  push:
+    branches:
+      - dev/issue71-residual-vpn-owner
+    paths:
+      - .github/workflows/dev-issue71-residual-vpn-owner.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Apply and verify issue 71 transform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedBase = 'e43491ae2f12ed430c9b6d13d2787a269cf41a67'
+          git merge-base --is-ancestor $expectedBase HEAD
+
+          if ((git rev-parse HEAD:.github/validation/issue71-transform.ps1).Trim() -ne '16d39db3518f92577ed74cd15a7bbb269b9ea33f') {
+            throw 'Unexpected issue71 transform blob.'
+          }
+
+          $expectedBlobs = [ordered]@{
+            'src/ProxyToAnyConnect/Runtime/VpnLeaseManager.cs' = 'e62d2f32ce9bcbae3148f1a823779cba44c8e835'
+            'src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs' = '817440101d65dbd58d3d86a08903b8282bc0bfa5'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs' = '97d709bae32293280ca05c6239347fa8e6be762e'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = (git rev-parse "HEAD:$($entry.Key)").Trim()
+            if ($actual -ne $entry.Value) {
+              throw "Unexpected base blob for $($entry.Key): $actual"
+            }
+          }
+
+          & ./.github/validation/issue71-transform.ps1
+
+          $expectedPaths = @(
+            'src/ProxyToAnyConnect/Runtime/ProxyRuntimeCoordinator.cs'
+            'src/ProxyToAnyConnect/Runtime/VpnLeaseManager.cs'
+            'tests/ProxyToAnyConnect.SelfTests/CombinedTestRunner.cs'
+            'tests/ProxyToAnyConnect.SelfTests/ResidualVpnOwnerSelfTests.cs'
+          ) | Sort-Object
+          git add -- $expectedPaths
+          git config core.whitespace cr-at-eol
+          git diff --cached --check
+          $staged = @(git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -ne ($expectedPaths -join "`n")) {
+            throw "Unexpected #71 staged surface: $($staged -join ', ')"
+          }
+      - name: Full aggregate self-tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet run --project tests/ProxyToAnyConnect.SelfTests/ProxyToAnyConnect.SelfTests.csproj --configuration Release
+      - name: Publish validated issue 71 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'runtime: retain residual VPN cleanup owner'
+          git push origin HEAD:dev/issue71-residual-vpn-owner
