@@ -1,32 +1,42 @@
-# Active development — 2026-08-28
+# Active development — 2026-09-13
 
-## Current production baseline before this docs commit
+## Current accepted production baseline
 
-`main` `5811900dfbf7488bd8ac53af20348c462681eeef`, tree `e44bf16408da3abade0c0f4d04708e6fd5ccd4ac`.
+Last production-changing commit: `f0763ec9337a0758c45a0add65e27d4b8f689482`, tree `e6928be6d0134330cf8b7637e475e69ff159cdd5`.
 
-Exact acceptance:
-- build #616 / `33152272544`: success; artifact `9678213447`, digest `sha256:bd31b7f143d11c56cfc6794e55760e156341ca07bdd8fcbb52691d5010e9c1e7`;
-- handoff #393 / `33152272516`: success; artifact `9678172387`, digest `sha256:bef544b5997914274001b50fce35684dcdd633d44c6230de654c0769db0a77c9`.
+Exact acceptance for that production tree:
+- build #624 / run `33165692687`: success; artifact `9683511938`, digest `sha256:38bde53b760ceeb045d985058d7c5627f7275d189422c70fb277a45b5cab8247`;
+- handoff #397 / run `33165692716`: success; artifact `9683470928`, digest `sha256:2bd3366dd24a68e3dd3911438055ade9e9e51f13d235b0bb7f0b1c832e45368c`.
+
+Transition documentation now moves `main`; always refresh exact live head before code.
 
 ## Last completed engineering sequence
 
-- #79: configured outbound acquisition deadline is now real, with owner/VPN cancellation precedence preserved and genuine pre-commit deadline mapped to HTTP 504.
-- #80: incomplete client header deadline maps to HTTP 408 before outbound ownership; Pause/Shutdown remains lifecycle cancellation.
-- #85: terminal coordinator/host cleanup keeps only failed exact VPN ownership for serialized retry; runtime never becomes usable again; top-level application shutdown retries the same runtime host at most once after independent first-pass cleanup.
-
-All three are closed completed with permanent PR CI and exact-main acceptance.
+- #88 — verification HTTP grammar hardening, closed completed.
+- #89 — reject ambiguous exact-owner CNAME/A and multiple-CNAME RRsets, closed completed.
+- #92 — reject non-QUERY DNS OPCODE and malformed exact-owner A/IN RDATA, closed completed in production `f0763ec9337a0758c45a0add65e27d4b8f689482`.
+- RAS x64 native-layout audit: Windows SDK C++ and managed probe matched all 12 checked size/offset values; run `33164715623` green, so no native production change was justified.
 
 ## Current engineering priority
 
-Continue broad deterministic review rather than cosmetic churn. Highest-value blocks:
-1. proxy/session shutdown, cancellation and response-commit ownership after #75/#77/#79/#80/#85;
-2. RAS/native interop lifetime, helper-process termination, fixed-width/buffer boundaries and exact generation ownership;
-3. verification HTTP response parser/framing and pooled response ownership;
-4. DNS response binding, failover/deadline composition, CNAME/cache/time semantics;
-5. process-wide bounded retention, metrics/logging and #11 performance/memory invariants.
+### #94 — complete DNS message sections
 
-For each new finding: open an issue first with explicit acceptance criteria; implement deterministic production/tests; preserve fail-closed routing and the existing 1.25x timing policy; require permanent Windows PR CI; merge only green; then require exact-main build + handoff and record SHA/run/artifact evidence.
+Issue is open. Development branch `dev/issue94-dns-complete-message` head `525216f0c8b1470638d989affbffd6d3e0b89e17`.
+
+Run `33165671844` failed before source build: the transform expected exactly one `generic DNS section parser helper` anchor and found zero. Exact-base/blob guards had passed. Treat this as validation transport only. Fix the anchor against actual post-#92 source, preserve policy/tests, rerun Release build + full aggregate.
+
+### #95 — unique PPP IPv4 interface ownership
+
+Issue is open. Development branch `dev/issue95-unique-interface` head `4e8f5e4d3a2625b76730d917b7fc293a4dc01476`.
+
+Run `33165867074` applied/staged the intended source/tests successfully, then Release compile failed with CS0019 in `VpnInterfaceResolver.cs:52`: null-coalescing operands were `List<VpnInterfaceInfo>` and `VpnInterfaceInfo[]`. Fix only the type composition while preserving exactly-one-candidate semantics and zero/multiple fail-closed tests; rerun the full aggregate.
+
+For each after a green dev run: collect validated source blobs -> reconstruct clean production commit on exact live main -> verify expected source/test surface only -> permanent Windows PR CI -> rebase merge -> exact-main build + handoff -> lineage comment -> close completed.
+
+## Continue broad audit after #94/#95
+
+Highest-value independent blocks remain proxy/session shutdown and response commitment, RAS generation/callback/projection ownership, DNS TCP/cache/deadline framing, and process-wide bounded state under #11. Create a new issue only for a concrete reproducible defect.
 
 ## External acceptance remains separate
 
-Open live issues: #2/#4/#5/#6/#7/#11/#13. Do not close #2/#4/#5/#6/#7 without real Windows/L2TP/operator evidence. Do not close #13 without representative 12–24 h exact-binary soak evidence. #11 remains permanently open as the latency/throughput/memory architecture requirement.
+Open live issues: #2/#4/#5/#6/#7/#11/#13/#94/#95. Do not close #2/#4/#5/#6/#7 without real Windows/L2TP/operator evidence. Do not close #13 without representative 12–24 h exact-binary soak evidence. #11 remains permanently open as the latency/throughput/memory architecture requirement.
