@@ -1,40 +1,41 @@
-# Audit snapshot — 2026-08-28
+# Audit snapshot — 2026-09-13
 
 Live production source and issue comments remain authoritative.
 
-## Accepted hardening state
+## Accepted deterministic coverage
 
-The current deterministic audit chain now covers:
-- strict request-line/header/framing/Host/authority parsing and canonical routing;
-- no post-commit proxy-generated HTTP response for CONNECT or plain HTTP;
-- explicit 408 client-header and 504 outbound deadline semantics with owner/VPN cancellation precedence;
-- canonical verification request target/authority and strict HTTP response framing;
-- DNS exact question/owner binding, canonical CNAME/IPv4 identity, monotonic TTL and bounded context-scoped cache;
-- DPAPI managed/unmanaged cleanup, acquisition-failure cleanup and fixed-width RAS field limits;
-- reparse-safe CustomEphemeral/log filesystem ownership;
-- fail-closed monitor invalidation before cleanup joins;
-- exact residual VPN ownership retention across reconfigure and terminal shutdown;
-- one bounded top-level retry of the same runtime host during application exit;
-- pooled 32 KiB proxy transfer path, bounded state and unchanged performance policy.
+Current accepted hardening covers:
+- strict proxy request-line/header/framing/Host/authority parsing and canonical routing;
+- no post-commit proxy-generated HTTP response for CONNECT/plain HTTP;
+- explicit 408 client-header and 504 outbound deadline semantics with lifecycle/VPN cancellation precedence;
+- canonical verification authority/request target and strict verification response framing;
+- DNS exact transaction/question/owner binding, canonical CNAME/IPv4 identity, ambiguous CNAME RRset rejection, non-QUERY OPCODE rejection, exact-owner A RDATA length validation, monotonic TTL and bounded context cache;
+- DPAPI managed/unmanaged cleanup, fixed-width RAS field guards and secret-carrier release;
+- reparse-safe CustomEphemeral/log ownership;
+- fail-closed monitor invalidation before cleanup joins and exact residual native ownership retention;
+- pooled 32 KiB proxy transfer path, bounded process state and unchanged 1.25x performance policy.
 
-## Clean audit results immediately around #85
+## Clean audit results from the latest pass
 
-- DNS failover/deadline composition: each DNS attempt retains its lower-level timeout, while the whole outbound acquisition is now bounded by #79; no unbounded admitted-session path found.
-- Windows VPN PowerShell helper: `-EncodedCommand` + `ArgumentList`, process-tree termination, independent stdout/stderr drain and bounded cleanup are coherent; no concrete new defect found.
-- ICMP async native lifetime: documentation does not prove `IcmpCloseHandle` joins arbitrary pending I/O, so an existing comment is stronger than the public contract; however no deterministic post-timeout write/UAF path was established. Treat as documentation-risk, not a production issue, unless future evidence makes it reproducible.
-- Proxy lease/session terminal ownership: residual native VPN ownership is retained by the VPN manager/coordinator path after #85; no separate proxy-owner retry issue was justified.
+- RAS x64 ABI/layout: Windows SDK C++ vs managed probe matched all 12 checked size/offset values in run `33164715623`; no production change warranted.
+- Proxy accepted-session shutdown/lease drain after #79/#80/#85: no new exact ownership gap established.
+- Verification response-read ownership/framing after #88: pooled owner/cap/Content-Length/chunked/EOF boundaries remained fail-closed; no new issue established.
+- `VpnContext` reference lifetime and monitor invalidation: exact context is invalidated before slow sibling cleanup; no new defect established.
 
-## Next audit directions
+## Active findings
 
-Prioritize new reproducible defects only:
-1. response/deadline/cancellation precedence under mixed failures after #79/#80;
-2. RAS/native interop size/version/output-buffer boundaries and callback/helper ownership;
-3. verification parser edge cases that could alter Ready-state evidence;
-4. DNS TCP fallback/CNAME/cache/failover exactness under cancellation;
-5. bounded diagnostics/logging/metrics and process-wide #11 memory/latency behavior.
+### #94 — incomplete whole-message DNS framing
 
-Any new finding must be issue-first, deterministic, permanent-Windows-CI green, then exact-main build/handoff. Never widen the 1.25x policy merely for hosted-runner noise.
+`ParseResponse` reads answer evidence but, before the proposed fix, does not structurally validate every declared authority/additional RR or exact message exhaustion. Issue #94 is open. First dev run `33165671844` failed only in transform transport before build because the helper anchor was too brittle. No behavioral verdict yet.
+
+### #95 — enumeration-order-dependent interface ownership
+
+`VpnInterfaceResolver.ResolveByAddress` currently returns the first adapter owning the PPP local IPv4. Duplicate ownership can make `InterfaceIndex` selection enumeration-order dependent even though that index later governs L2TP-bound DNS/socket routing. Issue #95 is open. First dev transform applied, but compile run `33165867074` failed only on a C# null-coalescing operand type mismatch before aggregate tests.
+
+## Next audit directions after #94/#95
+
+Continue only on reproducible findings: RAS projection/interface-generation identity, DNS TCP/failover/deadline exactness, proxy response/cancellation ownership under mixed failures, and bounded logging/metrics/process state under #11. Do not churn already accepted boundaries without a concrete failure.
 
 ## Remaining evidence boundary
 
-#2/#4/#5/#6/#7 require real Windows 11/L2TP/operator runs; #13 requires representative 12–24 h exact-binary soak; #11 remains an ongoing performance/memory constraint.
+#2/#4/#5/#6/#7 require real Windows 11/L2TP/operator runs; #13 requires representative 12–24 h exact-binary soak; #11 remains an ongoing performance/memory constraint. Hosted Actions cannot substitute for that evidence.
