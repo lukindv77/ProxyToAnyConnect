@@ -1,11 +1,13 @@
-# Handoff manifest — 2026-08-28
+# Handoff manifest — 2026-09-13
 
 The `handoff` workflow archives the full handoff-relevant repository surface from exact `main`: `src/`, `tests/`, `tools/`, `docs/`, `.github/`, README, solution, `.gitignore`, and root `START_NEW_CHAT_PROMPT.md`. It also writes exact commit/ref/workflow metadata, recent commits and `START_HERE.txt`.
 
 Canonical prompt: `docs/handoff/NEW_CHAT_PROMPT.md`.
 
-Last accepted production baseline before this docs commit: `2e56f8f76efda9047ec83f3cd0e58aee395de322`.
+Current transition record: `docs/handoff/SESSION_2026-09-13.md`.
 
-Dev-green #49/#50 source is intentionally **not overlaid** on production main; it remains in `dev/issue49-probe-target` at source commit `1684718295944ecdb28216ae02c32365ff7b2b0c` until clean permanent acceptance.
+Last production-changing baseline before these handoff docs: `f0763ec9337a0758c45a0add65e27d4b8f689482`, tree `e6928be6d0134330cf8b7637e475e69ff159cdd5`, with exact build #624 / run `33165692687` and handoff #397 / run `33165692716` green.
 
-Always use live GitHub plus the handoff artifact whose embedded commit matches the current head being discussed.
+Active deterministic development is intentionally **not overlaid** on production main. Resume #94 from `dev/issue94-dns-complete-message` and #95 from `dev/issue95-unique-interface`; each must obtain a green dev validation and then be reconstructed cleanly on the exact live main before permanent acceptance.
+
+Always use live GitHub plus the handoff artifact whose embedded commit matches the exact head being discussed. Never use hosted smoke as a substitute for the real Windows/L2TP or 12–24 h soak evidence required by external acceptance issues.
