@@ -1,15 +1,23 @@
-# Chat transfer checkpoint — 2026-08-28
+# Chat transfer checkpoint — 2026-09-13
 
 Canonical startup prompt: `docs/handoff/NEW_CHAT_PROMPT.md`.
 
-Accepted production code baseline before this docs commit:
-- main `5811900dfbf7488bd8ac53af20348c462681eeef`;
-- tree `e44bf16408da3abade0c0f4d04708e6fd5ccd4ac`;
-- exact build #616 / `33152272544` green, artifact `9678213447`, digest `sha256:bd31b7f143d11c56cfc6794e55760e156341ca07bdd8fcbb52691d5010e9c1e7`;
-- exact handoff #393 / `33152272516` green, artifact `9678172387`, digest `sha256:bef544b5997914274001b50fce35684dcdd633d44c6230de654c0769db0a77c9`.
+## Production checkpoint
 
-Latest completed blocks: #79 outbound deadline/504; #80 client-header 408; #85 terminal exact cleanup owner retention + one real application-shutdown retry. Earlier deterministic hardening through #52–#77 is also closed completed; live issue comments are authoritative lineage.
+Last production-changing main: `f0763ec9337a0758c45a0add65e27d4b8f689482`, tree `e6928be6d0134330cf8b7637e475e69ff159cdd5`.
 
-Open external/architecture boundaries are exactly #2/#4/#5/#6/#7/#11/#13 at this checkpoint.
+Exact production-tree acceptance:
+- build #624 / `33165692687` green; artifact `9683511938`, digest `sha256:38bde53b760ceeb045d985058d7c5627f7275d189422c70fb277a45b5cab8247`;
+- handoff #397 / `33165692716` green; artifact `9683470928`, digest `sha256:2bd3366dd24a68e3dd3911438055ade9e9e51f13d235b0bb7f0b1c832e45368c`.
 
-This docs commit moves `main`. A new chat must fetch live main/tree and exact-head `build`/`handoff` first, then continue broad deterministic audit/development without fabricating real Windows/L2TP or soak evidence.
+#88/#89/#92 are completed. RAS native layout audit run `33164715623` is green and found no managed/SDK ABI mismatch.
+
+## Work to resume first
+
+1. #94: branch `dev/issue94-dns-complete-message`, head `525216f0c8b1470638d989affbffd6d3e0b89e17`; run `33165671844` failed before build because transform anchor `generic DNS section parser helper` matched zero times. Repair validation transport only, preserving complete-message acceptance/tests.
+2. #95: branch `dev/issue95-unique-interface`, head `4e8f5e4d3a2625b76730d917b7fc293a4dc01476`; transform passed, Release build in run `33165867074` failed CS0019 at `VpnInterfaceResolver.cs:52` (`List<VpnInterfaceInfo> ?? VpnInterfaceInfo[]`). Fix the type composition only and rerun full aggregate.
+3. For each green dev result: collect validated blobs, clean reconstruction on exact then-current main, permanent PR CI, rebase merge, exact-main build + handoff, issue lineage, close completed.
+
+Open live issues: #2/#4/#5/#6/#7/#11/#13/#94/#95.
+
+Transition docs themselves move `main`. A new chat must fetch live main/tree and exact-head `build`/`handoff` before continuing. Never fabricate real Windows/L2TP or 12–24 h soak evidence.
